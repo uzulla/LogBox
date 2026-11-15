@@ -18,7 +18,11 @@ config LOGBO_CPU_MIN_MHZ
         One of 40, 80, 160, 240. The maximum is the default CPU frequency.
 
 config LOGBO_CONFIG_WINDOW_S
-    int "Seconds after boot during which the BLE config service is advertised"
-    default 60
+    int "Seconds after boot during which the BLE config service is advertised (0 = always)"
+    default 0
+    help
+        0 (the default) keeps the config service advertised all the time, so the Web Bluetooth page and
+        tools/ble-config.py can connect whenever. A positive value stops advertising that long after boot
+        (a client connected by then may stay until it disconnects).
 
 endmenu

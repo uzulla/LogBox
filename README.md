@@ -108,19 +108,26 @@ ESP32 on Linux, so the tool waits for it to boot first.
 
 ### BLE config service
 
-For `CONFIG_LOGBO_CONFIG_WINDOW_S` (60) seconds after boot the ESP32 advertises as `logbo-XXXX` with a config
-service. The link is encrypted (Just Works pairing, no bond stored), so macOS asks to confirm ("接続") on each connection.
+The ESP32 advertises as `logbo-XXXX` with a config service all the time (`CONFIG_LOGBO_CONFIG_WINDOW_S` > 0
+limits it to that many seconds after boot; the screen's top bar shows `BT` while it advertises). The link is encrypted (Just Works pairing, no bond stored), so macOS asks to confirm ("接続") on each connection.
+
+**Web page** (`docs/index.html`, Web Bluetooth: Chrome / Edge on Android or a PC, over HTTPS or as a local file;
+not iPhone Safari): status, SD recording start / stop, Wi-Fi credentials, magnetometer calibration (live coverage bars
+while you rotate the unit), reboot. Published with GitHub Pages from `docs/` on `main`.
 
 ```sh
 uv run tools/ble-config.py status      # GNSS, SD state / file, configured SSID, Wi-Fi connected?, IP
 uv run tools/ble-config.py wifi-set    # prompts for SSID/password, saved to NVS and applied
+uv run tools/ble-config.py mag         # magnetometer calibration state
+uv run tools/ble-config.py ctrl rec=0  # a command (see the ctrl characteristic below)
 ```
 
 | Characteristic | UUID | |
 |---|---|---|
 | service | `9b3c0001-4e5f-4a2b-8c6d-2f1e0a7b5c3d` | |
-| status | `9b3c0002-…` | read: `{"gnss":{"configured":true,"messages":1234},"rec":"rec","log":"log_0012_01.csv","wifi_ssid":"…","wifi_connected":true,"ip":"192.168.11.38"}` |
+| status | `9b3c0002-…` | read: `{"device":"logbo-CD0E","uptime_s":120,"free_heap":45000,"gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01.csv","records":3000,"imu":true,"mag":true,"baro":true,"wifi_ssid":"…","wifi_connected":true,"ip":"192.168.11.38","rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0}` (`rec`: off / rec / saving / safe / failed; `fix` 0 when no fix or no GNSS for 2 s) |
 | wifi | `9b3c0003-…` | write with response: `<ssid>\t<password>` (SSID 1–32 bytes, password ≤ 64); rejected with ATT error 0x13 if invalid |
+| ctrl | `9b3c0004-…` | read: magnetometer calibration `{"calibrated":true,"field":34.4,"collecting":false,"session":3,"samples":0,"coverage":[0.00,0.00,0.00],"complete":false,"result":1}` (`result` 0 none yet, 1 ok, 2 too short, 3 not rotated, 4 bad fit, 5 not running, 6 not saved). write with response, one command: `rec=1` / `rec=0` (as holding B), `mag=start` / `mag=done` / `mag=cancel` / `mag=clear`, `wifi=clear`, `reboot=1`; an unknown command or a failed `mag=done` gets ATT error 0x13 |
 
 If the macOS pairing dialog shows an old device name after the firmware renamed the device:
 macOS records the device in `/Library/Bluetooth/com.apple.MobileBluetooth.ledevices.paired.db`

@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>logbo BLE 設定</title>
+<style>
+  :root { --fg: #1c1c1e; --bg: #f5f5f7; --card: #fff; --line: #d9d9de; --accent: #0a66c2; --warn: #b3261e; --ok: #1b7f3a; --muted: #6e6e73; --track: #e5e5ea; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #f2f2f7; --bg: #121214; --card: #1e1e22; --line: #3a3a40; --accent: #5aa9ff; --warn: #ff6b60; --ok: #4cc26a; --muted: #9a9aa2; --track: #2c2c32; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; font: 16px/1.5 system-ui, -apple-system, "Hiragino Sans", sans-serif; color: var(--fg); background: var(--bg); max-width: 720px; margin-inline: auto; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 8px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.danger { color: var(--warn); }
+  button:disabled { opacity: .45; cursor: default; }
+  input[type=text], input[type=password] { font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); width: 100%; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 8px 0 2px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 15px; }
+  .kv b { color: var(--muted); font-weight: 500; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .muted { color: var(--muted); }
+  .hint { color: var(--muted); font-size: 14px; margin: 0 0 8px; }
+  .bars { display: grid; grid-template-columns: max-content 1fr 3.5em; gap: 6px 10px; align-items: center; margin: 8px 0; font-variant-numeric: tabular-nums; }
+  .bar { height: 12px; border-radius: 6px; background: var(--track); overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: #e6a100; transition: width .3s; }
+  .bar i.full { background: var(--ok); }
+  pre#log { font-size: 12px; max-height: 160px; overflow: auto; margin: 0; white-space: pre-wrap; color: var(--muted); }
+  #unsupported { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>logbo BLE 設定</h1>
+  <button id="connect" class="primary">接続</button>
+  <button id="disconnect" disabled>切断</button>
+  <span id="connstate" class="muted">未接続</span>
+</header>
+
+<section id="unsupported">
+  <p class="warn">このブラウザは Web Bluetooth に対応していません。Android または PC の Chrome / Edge で、HTTPS のページとして開いてください（iPhone の Safari は非対応です）。</p>
+</section>
+
+<section>
+  <p class="hint" style="margin:0">logbo の電源が入っていれば、いつでも「接続」から BLE で見つかります（同時に繋げるのは 1 台です）。接続時に OS がペアリングの確認を出したら許可してください（暗号化した接続で Wi-Fi のパスワードを送ります。登録は残りません）。</p>
+</section>
+
+<section>
+  <div class="row" style="justify-content:space-between;margin-bottom:8px">
+    <h2 style="margin:0">状態</h2>
+    <div class="row">
+      <label style="margin:0;display:flex;gap:6px;align-items:center"><input type="checkbox" id="auto" checked> 自動更新</label>
+      <button id="refresh" disabled>更新</button>
+    </div>
+  </div>
+  <div class="kv" id="status_kv"><span class="muted">—</span></div>
+</section>
+
+<section>
+  <h2>SD カードの記録</h2>
+  <p class="hint">本体の B ボタン長押しと同じです。止めると「SAFE」になってからカードを抜けます。</p>
+  <div class="row">
+    <button id="rec_start" disabled>記録を始める</button>
+    <button id="rec_stop" disabled>止めてカードを外せる状態にする</button>
+    <span id="rec_msg" class="muted"></span>
+  </div>
+</section>
+
+<section>
+  <h2>Wi-Fi 接続先</h2>
+  <p class="hint">2.4 GHz のネットワークだけ使えます。保存するとすぐ接続し直し、本体に保存されます（書き込み直しても残ります）。</p>
+  <label for="ssid">SSID</label>
+  <input id="ssid" type="text" autocapitalize="off" autocomplete="off" maxlength="32" placeholder="HomeAP">
+  <label for="pass">パスワード（なしなら空）</label>
+  <input id="pass" type="password" autocapitalize="off" autocomplete="off" maxlength="64">
+  <div class="row" style="margin-top:10px">
+    <button id="setwifi" class="primary" disabled>保存して接続を待つ</button>
+    <button id="clearwifi" class="danger" disabled>消す</button>
+    <span id="wifi_msg" class="muted"></span>
+  </div>
+</section>
+
+<section>
+  <h2>地磁気キャリブレーション</h2>
+  <p class="hint">台座の磁石によるずれを測ります。「開始」を押したら、本体をゆっくりあらゆる向きに回してください（裏返しも）。机・PC・車体など鉄や磁石から離れた場所で。3 本のバーがそろって十分たまると本体が自動で終わります。途中で「終了」を押しても構いません。</p>
+  <div class="kv" id="mag_kv"><span class="muted">—</span></div>
+  <div class="bars" id="mag_bars">
+    <span>X</span><div class="bar"><i id="cov0"></i></div><span id="covt0">--</span>
+    <span>Y</span><div class="bar"><i id="cov1"></i></div><span id="covt1">--</span>
+    <span>Z</span><div class="bar"><i id="cov2"></i></div><span id="covt2">--</span>
+  </div>
+  <div class="row">
+    <button id="mag_start" class="primary" disabled>開始</button>
+    <button id="mag_done" disabled>終了して保存</button>
+    <button id="mag_cancel" disabled>中止</button>
+    <button id="mag_clear" class="danger" disabled>補正を消す</button>
+    <span id="mag_msg" class="muted"></span>
+  </div>
+</section>
+
+<section>
+  <h2>本体</h2>
+  <div class="row">
+    <button id="reboot" disabled>再起動</button>
+    <span id="dev_msg" class="muted"></span>
+  </div>
+</section>
+
+<section>
+  <h2>ログ</h2>
+  <pre id="log"></pre>
+</section>
+
+<script>
+'use strict';
+// firmware/main/main.cpp の BLE config service
+const SVC    = '9b3c0001-4e5f-4a2b-8c6d-2f1e0a7b5c3d';
+const STATUS = '9b3c0002-4e5f-4a2b-8c6d-2f1e0a7b5c3d'; // read: JSON
+const WIFI   = '9b3c0003-4e5f-4a2b-8c6d-2f1e0a7b5c3d'; // write: "<ssid>\t<password>"
+const CTRL   = '9b3c0004-4e5f-4a2b-8c6d-2f1e0a7b5c3d'; // read: キャリブレーション JSON / write: コマンド
+
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+let device = null, ch = {}, busy = Promise.resolve(), timer = null, lastMag = null;
+
+function log(msg) { $('log').textContent = `${new Date().toLocaleTimeString()} ${msg}\n` + $('log').textContent; }
+
+// GATT の操作は同時に 1 つだけ(重なると "GATT operation already in progress" になる)。順番に流す
+function gatt(fn) { const p = busy.then(fn, fn); busy = p.catch(() => {}); return p; }
+const readJson = c => gatt(async () => JSON.parse(dec.decode(await c.readValue())));
+const write = (c, text) => gatt(() => c.writeValueWithResponse(enc.encode(text)));
+
+const CONTROLS = ['disconnect', 'refresh', 'rec_start', 'rec_stop', 'setwifi', 'clearwifi', 'mag_start', 'mag_done', 'mag_cancel', 'mag_clear', 'reboot'];
+function setConnected(on) {
+  for (const id of CONTROLS) $(id).disabled = !on;
+  $('connect').disabled = on || !navigator.bluetooth;
+  $('connstate').textContent = on ? `接続中: ${device.name || ''}` : '未接続';
+  $('connstate').className = on ? 'ok' : 'muted';
+  if (!on) { clearTimeout(timer); timer = null; }
+}
+
+if (!navigator.bluetooth) { $('unsupported').style.display = 'block'; $('connect').disabled = true; }
+
+// ---- 接続 ----
+$('connect').onclick = async () => {
+  try {
+    // 広告にサービス UUID を載せているので、それで探す(名前は logbo-XXXX)
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }, { namePrefix: 'logbo-' }], optionalServices: [SVC] });
+    device.addEventListener('gattserverdisconnected', () => { log('切断されました'); setConnected(false); ch = {}; });
+    log(`接続中: ${device.name}`);
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    ch.status = await svc.getCharacteristic(STATUS);
+    ch.wifi = await svc.getCharacteristic(WIFI);
+    try { ch.ctrl = await svc.getCharacteristic(CTRL); } catch (e) { ch.ctrl = null; log('このファームウェアには操作用の characteristic がありません(状態と Wi-Fi だけ使えます)'); }
+    setConnected(true);
+    for (const id of ['rec_start', 'rec_stop', 'clearwifi', 'mag_start', 'mag_done', 'mag_cancel', 'mag_clear', 'reboot']) $(id).disabled = !ch.ctrl;
+    log('接続しました');
+    await tick();
+  } catch (e) {
+    log(`接続失敗: ${e.message}`);
+  }
+};
+$('disconnect').onclick = () => device?.gatt?.disconnect();
+
+// ---- 状態(自動更新: 2 秒ごと。キャリブレーション中は 0.5 秒ごと) ----
+async function tick() {
+  clearTimeout(timer); timer = null;
+  if (!device?.gatt?.connected) return;
+  try {
+    await refreshStatus();
+    if (ch.ctrl) await refreshMag();
+  } catch (e) {
+    log(`状態の取得に失敗: ${e.message}`);
+  }
+  if ($('auto').checked && device?.gatt?.connected) timer = setTimeout(tick, lastMag?.collecting ? 500 : 2000);
+}
+$('refresh').onclick = tick;
+$('auto').onchange = () => { if ($('auto').checked) tick(); };
+
+const REC = { off: ['記録していない', 'muted'], rec: ['記録中', 'ok'], saving: ['保存中(抜かないで)', 'warn'], safe: ['外してよい', 'ok'], failed: ['エラー / カードなし', 'warn'] };
+async function refreshStatus() {
+  const s = await readJson(ch.status);
+  $('connstate').textContent = `接続中: ${s.device || device.name}`;
+  const span = (t, c) => `<span class="${c}">${esc(t)}</span>`;
+  const g = s.gnss || {};
+  const fix = g.fix >= 3 ? span(`3D FIX ${g.sats} 衛星`, 'ok') : g.fix === 2 ? span(`2D FIX ${g.sats} 衛星`, 'warn') : span('FIX なし', 'warn');
+  const [recText, recCls] = REC[s.rec] || [s.rec, 'muted'];
+  let wifi;
+  if (!s.wifi_ssid) wifi = span('未設定', 'warn');
+  else if (s.wifi_connected) wifi = `${span(s.ip, 'ok')} <span class="muted">${esc(s.wifi_ssid)}  ${s.rssi ?? ''} dBm</span>`;
+  else wifi = span(`"${s.wifi_ssid}" に接続中…`, 'warn');
+  const rows = [
+    ['GNSS', g.configured ? `${fix} <span class="muted">${esc(g.baud ?? '')} bps</span>` : span('受信機が見つからない', 'warn')],
+    ['SD', `${span(recText, recCls)} <span class="muted">${esc(s.log || '')}</span>`],
+    ['Wi-Fi', wifi],
+  ];
+  if (s.ap_ssid !== undefined) rows.push(['本体の AP', `${esc(s.ap_ssid)} <span class="muted">192.168.4.1  接続 ${s.ap_clients} 台</span>`]);
+  if (s.imu !== undefined) rows.push(['センサー', ['imu', 'mag', 'baro'].map(k => span(`${{ imu: 'IMU', mag: '地磁気', baro: '気圧' }[k]} ${s[k] ? 'OK' : 'なし'}`, s[k] ? 'ok' : 'warn')).join('  ')]);
+  if (s.uptime_s !== undefined) rows.push(['稼働', esc(`${Math.floor(s.uptime_s / 3600)}h${String(Math.floor(s.uptime_s / 60) % 60).padStart(2, '0')}m  記録 ${s.records} 行  空きヒープ ${Math.round(s.free_heap / 1024)} KiB`)]);
+  $('status_kv').innerHTML = rows.map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join('');
+  return s;
+}
+
+// ---- SD ----
+async function ctrl(cmd, okMsg, msgId) {
+  try {
+    await write(ch.ctrl, cmd);
+    log(okMsg); if (msgId) $(msgId).textContent = okMsg;
+    return true;
+  } catch (e) {
+    const m = `失敗: ${e.message}`;
+    log(`${cmd}: ${m}`); if (msgId) $(msgId).textContent = m;
+    return false;
+  } finally {
+    tick();
+  }
+}
+$('rec_start').onclick = () => ctrl('rec=1', '記録の開始を指示しました', 'rec_msg');
+$('rec_stop').onclick = () => ctrl('rec=0', '記録の停止を指示しました(「外してよい」になるまで待ってください)', 'rec_msg');
+
+// ---- Wi-Fi ----
+$('setwifi').onclick = async () => {
+  const ssid = $('ssid').value, pass = $('pass').value;
+  if (!ssid) { $('wifi_msg').textContent = 'SSID を入れてください'; return; }
+  if ((ssid + pass).includes('\t')) { $('wifi_msg').textContent = 'タブ文字は使えません'; return; }
+  if (enc.encode(ssid).length > 32 || enc.encode(pass).length > 64) { $('wifi_msg').textContent = 'SSID は 32 バイト、パスワードは 64 バイトまでです'; return; }
+  $('setwifi').disabled = true;
+  try {
+    await write(ch.wifi, `${ssid}\t${pass}`);
+    log(`"${ssid}" を保存しました`);
+    $('pass').value = '';
+    for (let i = 0; i < 15; i++) { // 接続できるまで状態を読む(最長 45 秒)
+      $('wifi_msg').textContent = `接続待ち… (${i * 3}s)`;
+      await new Promise(r => setTimeout(r, 3000));
+      const s = await refreshStatus();
+      if (s.wifi_connected && s.wifi_ssid === ssid) { $('wifi_msg').textContent = `接続しました: ${s.ip}`; log(`Wi-Fi ${s.ip}`); return; }
+    }
+    $('wifi_msg').textContent = 'まだ接続できていません(パスワード違い、5 GHz のみ、電波が届かない可能性)。「更新」で再確認できます';
+  } catch (e) {
+    const m = `失敗: ${e.message}(SSID は 1〜32 バイト、パスワードは 64 バイトまで)`;
+    log(m); $('wifi_msg').textContent = m;
+  } finally {
+    $('setwifi').disabled = !device?.gatt?.connected;
+  }
+};
+$('clearwifi').onclick = () => {
+  if (!confirm('保存されている Wi-Fi の接続先を消します。よろしいですか？')) return;
+  ctrl('wifi=clear', 'Wi-Fi の接続先を消しました', 'wifi_msg');
+};
+
+// ---- 地磁気キャリブレーション ----
+const RESULT = ['', '成功しました', '失敗: 回した時間が短すぎます', '失敗: 回し方が足りません(裏返しも含めて全方向に)', '失敗: 値が安定しません(鉄や磁石から離れて、もう一度)', '収集していません', '補正は効いていますが、本体への保存に失敗しました(再起動すると消えます)'];
+async function refreshMag() {
+  const m = await readJson(ch.ctrl);
+  const prev = lastMag; lastMag = m;
+  const span = (t, c) => `<span class="${c}">${esc(t)}</span>`;
+  $('mag_kv').innerHTML = [
+    ['補正', m.calibrated ? span(`あり(磁場の強さ ${m.field} µT)`, 'ok') : span('なし(生の値)', 'warn')],
+    ['状態', m.collecting ? span(`収集中 ${m.samples} サンプル${m.complete ? '(十分です)' : ''}`, 'ok') : span('待機', 'muted')],
+  ].map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join('');
+  m.coverage.forEach((c, k) => {
+    const pct = Math.round(Math.min(1, c) * 100);
+    $(`cov${k}`).style.width = `${pct}%`;
+    $(`cov${k}`).className = pct >= 100 ? 'full' : '';
+    $(`covt${k}`).textContent = m.collecting || pct ? `${pct}%` : '--';
+  });
+  $('mag_start').disabled = m.collecting;
+  $('mag_done').disabled = $('mag_cancel').disabled = !m.collecting;
+  // 本体が自動で終えた / 画面やシリアルから終えた時も結果を出す
+  if (prev?.collecting && !m.collecting && m.result) {
+    $('mag_msg').textContent = RESULT[m.result] || `結果 ${m.result}`;
+    $('mag_msg').className = m.result === 1 ? 'ok' : 'warn';
+    log(`地磁気キャリブレーション: ${RESULT[m.result] || m.result}`);
+  }
+  return m;
+}
+$('mag_start').onclick = async () => {
+  $('mag_msg').textContent = ''; $('mag_msg').className = 'muted';
+  if (await ctrl('mag=start', '地磁気キャリブレーションを開始しました。本体を回してください', 'mag_msg')) $('auto').checked = true;
+};
+$('mag_done').onclick = async () => {
+  try {
+    await write(ch.ctrl, 'mag=done');
+  } catch (e) {
+    log(`mag=done: ${e.message}`); // 失敗の理由は ctrl の読み出し(result)にある
+  }
+  await tick();
+  const r = lastMag?.result;
+  $('mag_msg').textContent = RESULT[r] || '';
+  $('mag_msg').className = r === 1 ? 'ok' : 'warn';
+};
+$('mag_cancel').onclick = () => ctrl('mag=cancel', '中止しました', 'mag_msg');
+$('mag_clear').onclick = () => {
+  if (!confirm('保存されている地磁気の補正を消します(次にキャリブレーションするまで生の値になります)。よろしいですか？')) return;
+  ctrl('mag=clear', '補正を消しました', 'mag_msg');
+};
+
+// ---- 本体 ----
+$('reboot').onclick = async () => {
+  if (!confirm('logbo を再起動します。BLE は切断されるので、数秒後に「接続」から繋ぎ直してください。')) return;
+  try {
+    await write(ch.ctrl, 'reboot=1');
+    log('再起動を指示しました');
+    $('dev_msg').textContent = '再起動中… 数秒後に「接続」で繋ぎ直してください';
+  } catch (e) {
+    log(`再起動の指示に失敗: ${e.message}`);
+  }
+};
+</script>
+</body>
+</html>
