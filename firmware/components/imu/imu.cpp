@@ -10,6 +10,7 @@
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 namespace imu {
 namespace {
@@ -110,6 +111,12 @@ int16_t gLastA[3], gLastG[3];
 bool gHaveAg;
 float gMag[3];
 bool gMagValid;
+bool gMagCalApplied;  // gMag is calibrated
+// Magnetometer calibration (also under gLock)
+MagCal gCalib;
+bool gHaveCalib;
+bool gCollecting;
+MagCalFit gFit;
 float gPressure, gTemp;
 bool gBaroValid;
 
@@ -413,7 +420,15 @@ void readMag() {
   float m[3];
   bool ok = readRegs(gBmi, bmi::ERR_REG, d, sizeof(d)) && !(d[0] & bmi::kErrAux) && compensateMag(d + 2, m);
   taskENTER_CRITICAL(&gLock);
-  if (ok) memcpy(gMag, m, sizeof(gMag));
+  if (ok) {
+    if (gCollecting) gFit.add(m);
+    if (gHaveCalib) {
+      gCalib.apply(m, gMag);
+    } else {
+      memcpy(gMag, m, sizeof(gMag));
+    }
+    gMagCalApplied = gHaveCalib;
+  }
   gMagValid = ok;
   taskEXIT_CRITICAL(&gLock);
 }
@@ -451,6 +466,7 @@ void fillMagBaro(Sample& out) {
   out.my = gMag[1];
   out.mz = gMag[2];
   out.magValid = gMagValid;
+  out.magCal = gMagCalApplied;
   out.pressureHpa = gPressure;
   out.tempC = gTemp;
   out.baroValid = gBaroValid;
@@ -463,6 +479,45 @@ void fillLast(Sample& out) {
   out.gx = gLastG[0] / bmi::kGyrLsbPerDps;
   out.gy = gLastG[1] / bmi::kGyrLsbPerDps;
   out.gz = gLastG[2] / bmi::kGyrLsbPerDps;
+}
+
+// NVS: namespace "imu", key "magcal" = MagCal as a blob, prefixed by a version byte.
+constexpr char kNvsNs[] = "imu", kNvsKey[] = "magcal";
+constexpr uint8_t kCalVersion = 1;
+
+void loadCalib() {
+  nvs_handle_t h;
+  if (nvs_open(kNvsNs, NVS_READONLY, &h) != ESP_OK) return;
+  uint8_t blob[1 + sizeof(MagCal)];
+  size_t len = sizeof(blob);
+  if (nvs_get_blob(h, kNvsKey, blob, &len) == ESP_OK && len == sizeof(blob) && blob[0] == kCalVersion) {
+    memcpy(&gCalib, blob + 1, sizeof(MagCal));
+    gHaveCalib = true;
+    ESP_LOGI(TAG, "mag calibration: offset %.1f %.1f %.1f uT, scale %.3f %.3f %.3f, field %.1f uT",
+             gCalib.offset[0], gCalib.offset[1], gCalib.offset[2], gCalib.scale[0], gCalib.scale[1],
+             gCalib.scale[2], gCalib.field);
+  }
+  nvs_close(h);
+}
+
+// Writes (cal != nullptr) or erases the stored calibration.
+void storeCalib(const MagCal* cal) {
+  nvs_handle_t h;
+  esp_err_t err = nvs_open(kNvsNs, NVS_READWRITE, &h);
+  if (err == ESP_OK) {
+    if (cal) {
+      uint8_t blob[1 + sizeof(MagCal)];
+      blob[0] = kCalVersion;
+      memcpy(blob + 1, cal, sizeof(MagCal));
+      err = nvs_set_blob(h, kNvsKey, blob, sizeof(blob));
+    } else {
+      err = nvs_erase_key(h, kNvsKey);
+      if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+    }
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+  }
+  if (err != ESP_OK) ESP_LOGE(TAG, "mag calibration not saved: %s", esp_err_to_name(err));
 }
 
 }  // namespace
@@ -485,6 +540,7 @@ Status init() {
     if (!startBmi270(gStatus.bmm150)) gStatus.bmi270 = gStatus.bmm150 = false;
   }
   gStatus.bmp280 = initBmp280();
+  if (gStatus.bmm150) loadCalib();
   ESP_LOGI(TAG, "BMI270 %s, BMM150 %s, BMP280 %s", gStatus.bmi270 ? "ok" : "--", gStatus.bmm150 ? "ok" : "--",
            gStatus.bmp280 ? "ok" : "--");
   if (gStatus.bmi270 || gStatus.bmp280) xTaskCreate(sampleTask, "imu", kTaskStack, nullptr, kTaskPrio, nullptr);
@@ -521,6 +577,66 @@ void latest(Sample& out) {
   fillMagBaro(out);
   out.n = gHaveAg ? 1 : 0;
   taskEXIT_CRITICAL(&gLock);
+}
+
+void magCalStart() {
+  taskENTER_CRITICAL(&gLock);
+  gFit.reset();
+  gCollecting = true;
+  taskEXIT_CRITICAL(&gLock);
+  ESP_LOGI(TAG, "mag calibration: collecting");
+}
+
+MagCalError magCalFinish() {
+  // Solve on a copy, outside the critical section (the fit takes a while; readMag() must not wait for it).
+  static MagCalFit fit;
+  taskENTER_CRITICAL(&gLock);
+  fit = gFit;
+  gCollecting = false;
+  taskEXIT_CRITICAL(&gLock);
+  MagCal cal;
+  const MagCalError err = fit.solve(cal);
+  if (err != MagCalError::kNone) {
+    ESP_LOGW(TAG, "mag calibration failed (%d) after %lu samples, coverage %.2f %.2f %.2f", static_cast<int>(err),
+             static_cast<unsigned long>(fit.samples()), fit.coverage(0), fit.coverage(1), fit.coverage(2));
+    return err;
+  }
+  taskENTER_CRITICAL(&gLock);
+  gCalib = cal;
+  gHaveCalib = true;
+  taskEXIT_CRITICAL(&gLock);
+  storeCalib(&cal);
+  ESP_LOGI(TAG, "mag calibration: offset %.1f %.1f %.1f uT, scale %.3f %.3f %.3f, field %.1f uT (%lu samples)",
+           cal.offset[0], cal.offset[1], cal.offset[2], cal.scale[0], cal.scale[1], cal.scale[2], cal.field,
+           static_cast<unsigned long>(fit.samples()));
+  return MagCalError::kNone;
+}
+
+void magCalCancel() {
+  taskENTER_CRITICAL(&gLock);
+  gCollecting = false;
+  taskEXIT_CRITICAL(&gLock);
+}
+
+void magCalClear() {
+  taskENTER_CRITICAL(&gLock);
+  gHaveCalib = false;
+  taskEXIT_CRITICAL(&gLock);
+  storeCalib(nullptr);
+  ESP_LOGI(TAG, "mag calibration cleared");
+}
+
+MagCalInfo magCalInfo() {
+  MagCalInfo info = {};
+  taskENTER_CRITICAL(&gLock);
+  info.calibrated = gHaveCalib;
+  info.cal = gCalib;
+  info.collecting = gCollecting;
+  info.samples = gFit.samples();
+  for (int k = 0; k < 3; k++) info.coverage[k] = gFit.coverage(k);
+  info.complete = gFit.complete();
+  taskEXIT_CRITICAL(&gLock);
+  return info;
 }
 
 }  // namespace imu

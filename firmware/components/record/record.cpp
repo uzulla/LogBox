@@ -70,9 +70,9 @@ size_t csvHeader(char* buf, size_t size, unsigned session, unsigned seq) {
       "t_ms = ms since this file was opened\n"
       "# lat/lon: deg, alt: m (MSL), speed: km/h, heading: deg (of motion), hacc: m, "
       "acc: G and gyro: deg/s (BMI270 axes, mean over the epoch), batt/charging: not available (empty), "
-      "mag: uT, press: hPa, temp: C (BMP280)\n"
+      "mag: uT (BMM150 axes; mag_cal 1 = hard / soft iron calibrated, 0 = raw), press: hPa, temp: C (BMP280)\n"
       "t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,"
-      "batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c\n",
+      "batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c,mag_cal\n",
       session, seq);
   return n > 0 && static_cast<size_t>(n) < size ? static_cast<size_t>(n) : 0;
 }
@@ -87,11 +87,12 @@ size_t csvRow(const Record& r, int64_t startUs, char* buf, size_t size) {
   char mag[32] = ",,";
   if (s.magValid) snprintf(mag, sizeof(mag), "%.1f,%.1f,%.1f", s.mx, s.my, s.mz);
   char baro[24] = ",";
+  const char* magCal = s.magValid ? (s.magCal ? "1" : "0") : "";
   if (s.baroValid) snprintf(baro, sizeof(baro), "%.2f,%.2f", s.pressureHpa, s.tempC);
-  const int n = snprintf(buf, size, "%ld,%s,%u,%u,%.7f,%.7f,%.1f,%.2f,%.2f,%.1f,%s,,,%s,%s\n",
+  const int n = snprintf(buf, size, "%ld,%s,%u,%u,%.7f,%.7f,%.1f,%.2f,%.2f,%.1f,%s,,,%s,%s,%s\n",
                          static_cast<long>((r.atUs - startUs) / 1000), utc, p.fixType, p.numSV, p.lat / 1e7,
                          p.lon / 1e7, p.hMSL / 1000.0, p.gSpeed * 0.0036, p.headMot / 1e5, p.hAcc / 1000.0, acc,
-                         mag, baro);
+                         mag, baro, magCal);
   return n > 0 && static_cast<size_t>(n) < size ? static_cast<size_t>(n) : 0;
 }
 
@@ -142,12 +143,12 @@ size_t toJson(const Record& r, uint32_t seq, char* buf, size_t size) {
       "\"alt_wgs_m\":%.3f,\"alt_msl_m\":%.3f,\"h_acc_m\":%.3f,\"v_acc_m\":%.3f,"
       "\"speed_mps\":%.3f,\"speed_acc_mps\":%.3f,\"vel_ned_mps\":{\"n\":%.3f,\"e\":%.3f,\"d\":%.3f},"
       "\"heading_deg\":%.5f,\"heading_acc_deg\":%.5f,\"heading_valid\":%s,\"pdop\":%.2f,"
-      "%s,\"mag_ut\":%s,\"press_hpa\":%s,\"temp_c\":%s}",
+      "%s,\"mag_ut\":%s,\"mag_cal\":%s,\"press_hpa\":%s,\"temp_c\":%s}",
       static_cast<unsigned long>(seq), r.hasPvt ? t : f, static_cast<unsigned long>(p.iTOW), time,
       static_cast<unsigned long>(p.tAcc), p.fixType, p.fixOk() ? t : f, p.numSV, p.lat / 1e7, p.lon / 1e7,
       p.height / 1e3, p.hMSL / 1e3, p.hAcc / 1e3, p.vAcc / 1e3, p.gSpeed / 1e3, p.sAcc / 1e3, p.velN / 1e3,
       p.velE / 1e3, p.velD / 1e3, p.headMot / 1e5, p.headAcc / 1e5, p.headingValid() ? t : f, p.pDOP / 100.0,
-      imuJson, mag, press, temp);
+      imuJson, mag, s.magValid && s.magCal ? t : f, press, temp);
   return n > 0 && static_cast<size_t>(n) < size ? static_cast<size_t>(n) : 0;
 }
 

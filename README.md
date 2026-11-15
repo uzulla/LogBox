@@ -26,7 +26,7 @@ The battery gauge (IP5306) of this unit does not answer on I2C, so `batt` / `cha
 | component | |
 |---|---|
 | `gnss` | finds the receiver's baud, configures it with UBX-CFG-VALSET (115200, UBX only, NAV-PVT every epoch, `LOGBO_GNSS_RATE_HZ` = 25 Hz, automotive model), recovers by itself after a receiver reset; falls back to 10 Hz if 25 Hz is rejected or not sustained |
-| `imu` | BMI270 FIFO at 200 Hz (±8 g, ±2000 dps), BMM150 at 25 Hz through the BMI270 aux interface (Bosch compensation), BMP280 at ~26 Hz |
+| `imu` | BMI270 FIFO at 200 Hz (±8 g, ±2000 dps), BMM150 at 25 Hz through the BMI270 aux interface (Bosch compensation, then hard / soft iron calibration from NVS), BMP280 at ~26 Hz |
 | `record` | one record = NAV-PVT + IMU mean over the epoch; CSV row and UDP JSON formatting (host-tested) |
 | `sdlog` | writes the records to `log_<session>_<seq>.csv` on the card |
 | `display` | LCD UI and buttons |
@@ -37,14 +37,15 @@ While the GNSS is silent (no message for 1 s) records are still made at the conf
 ```sh
 mise run fw:flash       # sync to $BUILD_HOST (wvx), build, flash $SERIAL_PORT (/dev/ttyUSB0)
 mise run fw:monitor
-mise run fw:test        # host unit tests (UBX parser / CFG-VALSET builder / NAV-PVT / CSV / JSON)
+mise run fw:test        # host unit tests (UBX parser / CFG-VALSET builder / NAV-PVT / mag calibration / CSV / JSON)
 mise run fw:ap          # soft-AP SSID / password of the last build
 ```
 
 ### Screen and buttons
 
 - A / C: previous / next page. Pages: **SPEED** (km/h, total horizontal G bar), **G** (G circle with a 2 s trail and peaks;
-  short press B resets the peaks), **STATUS** (GNSS fix / satellites / rate, position, accel, baro, mag, SD, Wi-Fi).
+  short press B resets the peaks), **STATUS** (GNSS fix / satellites / rate, position, accel, baro, mag and its
+  calibration, SD, Wi-Fi; short press B starts the magnetometer calibration, below).
 - **Hold B for 1.5 s** to stop recording: the top bar shows `SAVING` then `SAFE`; only then pull the card. Holding B again
   (from `SAFE`, `SD ERR` or `NO SD` after inserting a card) records to the next file.
 - Top bar: SD state (blinking dot while recording), GNSS fix and satellites, Wi-Fi bars (`BT` while the BLE config
@@ -54,6 +55,22 @@ mise run fw:ap          # soft-AP SSID / password of the last build
   the driver feels, like a ball in a bowl: braking moves the ball up (forward), a left turn to the right, and tilting
   the unit rolls it towards the side that goes down. The CSV / UDP keep the raw sensor values.
 
+### Magnetometer calibration
+
+The magnets in the M5Stack's base move with the sensor and add a large constant offset (~200 uT) to the BMM150's
+readings; the field itself is ~45 uT. To remove it (hard iron, plus a scale per axis for soft iron):
+
+1. On the **STATUS** page press B. The calibration page shows how far each axis has swung.
+2. Rotate the unit slowly in every direction, turning it over too, away from steel and magnets (desk frames, cars'
+   bodies count: do it where it will be used, or at least outside).
+3. When all three bars are full it finishes by itself after about 15 s of samples, or press B. A / C cancel; it gives up
+   after 2 minutes.
+
+The result shows on the STATUS page (`CAL ON 46UT NOW 47`: field strength of the calibration and of the current
+reading, which should stay close to it in any orientation). It is saved to NVS (kept across reboots and reflashing) and
+applied to every reading; the CSV column `mag_cal` / JSON `mag_cal` say whether a reading is calibrated. Redo it after
+changing the stack (another base, battery, module). Serial console: `mag-cal`, `mag-cal-done`, `mag-clear`, `mag`.
+
 ### SD log
 
 A FAT32 microSD card present at boot is recorded to at once. The session number counts up per boot (NVS) and skips
@@ -61,12 +78,12 @@ numbers already on the card; flushed every second. No card, an unreadable card, 
 recording, and nothing is retried by itself (hold B).
 
 ```
-t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c
+t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c,mag_cal
 ```
 
 The columns up to `charging` are those of the RaceBox logs, so [`log-viewer/`](log-viewer/README.md) reads both. acc is
-in G and gyro in deg/s, BMI270 axes (mean over the epoch); mag in uT (raw BMM150 axes, not calibrated: the M5Stack's base
-magnets add a large offset); press in hPa, temp in °C (BMP280, warmed by the stack).
+in G and gyro in deg/s, BMI270 axes (mean over the epoch); mag in uT (BMM150 axes; calibrated when `mag_cal` is 1, raw
+with the base magnets' offset when 0, see above); press in hPa, temp in °C (BMP280, warmed by the stack).
 
 ### Soft AP
 
@@ -129,7 +146,7 @@ record is checked by a unit test to fit 1000 bytes. Lost datagrams are not retra
  "speed_mps":27.778,"speed_acc_mps":0.208,"vel_ned_mps":{"n":0.000,"e":27.778,"d":0.000},
  "heading_deg":90.00000,"heading_acc_deg":0.50000,"heading_valid":true,"pdop":1.20,
  "g":{"x":0.100,"y":-0.250,"z":0.980},"gyro_dps":{"x":1.50,"y":-2.00,"z":30.25},
- "mag_ut":{"x":20.0,"y":-5.0,"z":40.0},"press_hpa":1013.25,"temp_c":21.50}
+ "mag_ut":{"x":20.0,"y":-5.0,"z":40.0},"mag_cal":true,"press_hpa":1013.25,"temp_c":21.50}
 ```
 
 - `gnss` is false for IMU-only records (receiver silent); `time` is `null` unless date, time and "fully resolved" are valid.

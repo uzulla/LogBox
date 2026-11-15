@@ -226,6 +226,7 @@ void test_nmea_detector() {
 }
 
 void runRecordTests();
+void runMagCalTests();
 
 int main() {
   UNITY_BEGIN();
@@ -239,5 +240,6 @@ int main() {
   RUN_TEST(test_length_error);
   RUN_TEST(test_nmea_detector);
   runRecordTests();
+  runMagCalTests();
   return UNITY_END();
 }

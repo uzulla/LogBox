@@ -25,7 +25,7 @@ record::Record sample() {
   r.imu.n = 8;
   r.imu.ax = 0.1f, r.imu.ay = -0.25f, r.imu.az = 0.98f;
   r.imu.gx = 1.5f, r.imu.gy = -2.0f, r.imu.gz = 30.25f;
-  r.imu.magValid = true, r.imu.mx = 20, r.imu.my = -5, r.imu.mz = 40;
+  r.imu.magValid = true, r.imu.magCal = true, r.imu.mx = 20, r.imu.my = -5, r.imu.mz = 40;
   r.imu.baroValid = true, r.imu.pressureHpa = 1013.25f, r.imu.tempC = 21.5f;
   return r;
 }
@@ -76,6 +76,7 @@ void test_csv_row() {
   TEST_ASSERT_EQUAL_STRING("30.25", f[15].c_str());
   TEST_ASSERT_EQUAL_STRING("", f[16].c_str());  // batt
   TEST_ASSERT_EQUAL_STRING("1013.25", f[21].c_str());
+  TEST_ASSERT_EQUAL_STRING("1", f[23].c_str());  // mag_cal
 }
 
 void test_csv_row_without_gnss_and_sensors() {
@@ -89,6 +90,7 @@ void test_csv_row_without_gnss_and_sensors() {
   TEST_ASSERT_EQUAL_STRING("", f[1].c_str());   // no UTC
   TEST_ASSERT_EQUAL_STRING("0", f[2].c_str());  // no fix
   TEST_ASSERT_EQUAL_STRING("", f[10].c_str());  // no IMU
+  TEST_ASSERT_EQUAL_STRING("", f[23].c_str());  // no mag
 }
 
 void test_json_fits_and_fields() {
@@ -98,6 +100,7 @@ void test_json_fits_and_fields() {
   TEST_ASSERT_TRUE(strstr(buf, "\"type\":\"sample\",\"seq\":7,\"gnss\":true") != nullptr);
   TEST_ASSERT_TRUE(strstr(buf, "\"time\":\"2026-11-15T05:06:06.999000Z\"") != nullptr);
   TEST_ASSERT_TRUE(strstr(buf, "\"press_hpa\":1013.25") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"mag_cal\":true") != nullptr);
   // Widest values still fit one datagram.
   record::Record w = sample();
   w.pvt.lat = -900'000'000, w.pvt.lon = -1'800'000'000;
