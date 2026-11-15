@@ -34,16 +34,19 @@ class Lock {
 };
 
 // Older firmware kept one network as "ssid" / "pass": copy it into slot 0 (priority 0) and only then delete the old
-// keys, in one commit. If anything fails the old keys stay, and the next call tries again (slot 0 written by an
-// interrupted earlier attempt is simply written again).
-void migrate(nvs_handle_t h) {
+// keys, in one commit. If anything fails the old keys stay, false is returned (set / remove then refuse to change
+// anything, so slot 0 can't be taken by another network before the migration is done), and the next call tries again
+// (slot 0 written by an interrupted earlier attempt is simply written again). True when there was nothing to do.
+bool migrate(nvs_handle_t h) {
   char ssid[33];
   size_t len = sizeof(ssid);
-  if (nvs_get_str(h, "ssid", ssid, &len) != ESP_OK) return;
+  const esp_err_t ssidErr = nvs_get_str(h, "ssid", ssid, &len);
+  if (ssidErr == ESP_ERR_NVS_NOT_FOUND) return true;
+  if (ssidErr != ESP_OK) return false;
   char pass[65] = "";
   len = sizeof(pass);
   const esp_err_t passErr = nvs_get_str(h, "pass", pass, &len);
-  if (passErr != ESP_OK && passErr != ESP_ERR_NVS_NOT_FOUND) return;
+  if (passErr != ESP_OK && passErr != ESP_ERR_NVS_NOT_FOUND) return false;
   if (ssid[0]) {
     char k[12], existing[33];
     key(k, "ssid", 0);
@@ -56,9 +59,9 @@ void migrate(nvs_handle_t h) {
       if (err == ESP_OK) err = nvs_set_str(h, k, pass);
       key(k, "prio", 0);
       if (err == ESP_OK) err = nvs_set_i32(h, k, 0);
-      if (err != ESP_OK) return;  // keep the old keys
+      if (err != ESP_OK) return false;  // keep the old keys
     } else if (slotErr != ESP_OK) {
-      return;
+      return false;
     }
     // else slot 0 holds another network (new firmware already in use): the old pair is just dropped
   }
@@ -67,7 +70,8 @@ void migrate(nvs_handle_t h) {
     const esp_err_t e2 = nvs_erase_key(h, "pass");
     if (e2 != ESP_OK && e2 != ESP_ERR_NVS_NOT_FOUND) err = e2;
   }
-  if (err == ESP_OK) nvs_commit(h);
+  if (err == ESP_OK) err = nvs_commit(h);
+  return err == ESP_OK;
 }
 
 }  // namespace
@@ -76,7 +80,7 @@ int load(Entry* out) {
   Lock lock;
   nvs_handle_t h;
   if (nvs_open(kNs, NVS_READWRITE, &h) != ESP_OK) return 0;
-  migrate(h);
+  migrate(h);  // reading goes on regardless: the old pair is not listed until it has moved
   int n = 0;
   for (int i = 0; i < kMax; i++) {
     Entry& e = out[n];
@@ -100,7 +104,7 @@ int count() {
   Lock lock;
   nvs_handle_t h;
   if (nvs_open(kNs, NVS_READWRITE, &h) != ESP_OK) return 0;
-  migrate(h);
+  migrate(h);  // counting goes on regardless
   int n = 0;
   for (int i = 0; i < kMax; i++) {
     char k[12], v[33];
@@ -116,7 +120,10 @@ StoreError set(const Entry& e) {
   Lock lock;
   nvs_handle_t h;
   if (nvs_open(kNs, NVS_READWRITE, &h) != ESP_OK) return StoreError::kNvs;
-  migrate(h);
+  if (!migrate(h)) {
+    nvs_close(h);
+    return StoreError::kNvs;
+  }
   int slot = -1, freeSlot = -1;
   for (int i = 0; i < kMax; i++) {
     char k[12], v[33];
@@ -149,7 +156,10 @@ StoreError remove(const char* ssid) {
   Lock lock;
   nvs_handle_t h;
   if (nvs_open(kNs, NVS_READWRITE, &h) != ESP_OK) return StoreError::kNvs;
-  migrate(h);
+  if (!migrate(h)) {
+    nvs_close(h);
+    return StoreError::kNvs;
+  }
   StoreError result = StoreError::kNotFound;
   for (int i = 0; i < kMax; i++) {
     char k[12], v[33];

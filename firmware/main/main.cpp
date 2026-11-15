@@ -104,6 +104,9 @@ constexpr TickType_t kWifiJoinTimeout = pdMS_TO_TICKS(30000);  // association + 
 constexpr TickType_t kWifiRetryIdle = pdMS_TO_TICKS(10000);    // after every network failed
 static std::atomic<int> wifiCount{0};                           // networks in NVS
 static bool radioApOn = true, radioStaOn = true;                // this boot (see the radio switches below)
+// The list is read in pages of at most 512 bytes (the ATT limit): a client writes "list=<next>" and reads again.
+// Back to the top on a change of the list (from anywhere) and when the BLE client disconnects.
+static std::atomic<int> wifiListStart{0};
 static std::atomic<bool> staAssociated{false};                  // between STA_CONNECTED and STA_DISCONNECTED
 static portMUX_TYPE wifiLock = portMUX_INITIALIZER_UNLOCKED;
 static char wifiTarget[33];  // network being tried or joined, "" if none (guarded by wifiLock)
@@ -120,9 +123,11 @@ static void wifiTargetCopy(char (&out)[33]) {
   taskEXIT_CRITICAL(&wifiLock);
 }
 
-// The list changed (BLE, console): count it (also while the STA is off) and reconnect from the top of the new list.
+// The list changed (BLE, console): count it (also while the STA is off), read it from the top again, and reconnect from
+// the top of the new list.
 static void wifiListChanged() {
   wifiCount = wifinets::count();
+  wifiListStart = 0;
   if (wifiEvents) xEventGroupSetBits(wifiEvents, kWifiChanged);
 }
 
@@ -555,13 +560,11 @@ static int onConfigAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*)
 // wifi characteristic. read: one page of the list JSON (no passwords). write: one wifinets text command, or
 // "list=<index>" to read the list from that entry on; refused with ATT error 0x80 (invalid), 0x81 (8 networks
 // already), 0x82 (no such network to delete).
-// The list is read in pages of at most 512 bytes (the ATT limit): a client writes "list=<next>" and reads again.
-static int wifiListStart = 0;  // BLE host task only
 static int onWifiAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
     static wifinets::Entry list[wifinets::kMax];
     static char json[512];  // BLE host task only
-    const size_t n = wifinets::listJson(list, wifinets::load(list), wifiListStart, json, sizeof(json));
+    const size_t n = wifinets::listJson(list, wifinets::load(list), wifiListStart.load(), json, sizeof(json));
     return n && os_mbuf_append(ctxt->om, json, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
   if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
@@ -569,8 +572,11 @@ static int onWifiAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
     uint16_t len = 0;
     if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf) - 1, &len) != 0) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     buf[len] = '\0';
-    if (wifinets::parseListRequest(buf, &wifiListStart)) return 0;
-    wifiListStart = 0;  // a change: the next read starts from the top again
+    int start;
+    if (wifinets::parseListRequest(buf, &start)) {
+      wifiListStart = start;
+      return 0;
+    }
     bool full = false, notFound = false;
     if (const char* err = applyWifiText(buf, &full, &notFound)) {
       ESP_LOGW(TAG, "Wi-Fi write over BLE rejected: %s", err);
@@ -650,6 +656,7 @@ static int onConfigGapEvent(ble_gap_event* ev, void*) {
       break;
     case BLE_GAP_EVENT_DISCONNECT:
       configConnHandle = BLE_HS_CONN_HANDLE_NONE;
+      wifiListStart = 0;  // the next client reads the Wi-Fi list from the top
       ESP_LOGI(TAG, "Config client disconnected, reason=0x%x", ev->disconnect.reason);
       startConfigAdvertising();
       break;

@@ -203,7 +203,13 @@ async function tick() {
   }
   if ($('auto').checked && device?.gatt?.connected) timer = setTimeout(tick, lastMag?.collecting ? 500 : 2000);
 }
-$('refresh').onclick = tick;
+// 「更新」は状態に加えて、接続先の一覧と無線の設定も読み直す
+$('refresh').onclick = async () => {
+  await tick();
+  try { await refreshWifi(); wifiListStale = false; } catch (e) { log(`接続先の一覧を読めません: ${e.message}`); }
+  if (ch.ctrl) await refreshRadio().catch(e => log(`無線設定を読めません: ${e.message}`));
+};
+let wifiListStale = false; // 保存後に一覧を読み直せなかった(「更新」で読み直すまで警告を残す)
 $('auto').onchange = () => { if ($('auto').checked) tick(); };
 
 const REC = { off: ['記録していない', 'muted'], rec: ['記録中', 'ok'], saving: ['保存中(抜かないで)', 'warn'], safe: ['外してよい', 'ok'], failed: ['エラー / カードなし', 'warn'] };
@@ -279,6 +285,7 @@ async function refreshWifi() {
   return j;
 }
 
+const STALE = '(一覧を読み直せませんでした。上の「更新」で読み直してください)';
 async function wifiWrite(q, okMsg) {
   try {
     await write(ch.wifi, q);
@@ -289,8 +296,8 @@ async function wifiWrite(q, okMsg) {
     return false;
   }
   log(okMsg); $('wifi_msg').textContent = okMsg;
-  // 保存はできている。一覧を読み直せなくても失敗扱いにはしない
-  try { await refreshWifi(); } catch (e) { log(`保存しましたが、一覧を読み直せませんでした: ${e.message}`); $('wifi_msg').textContent = `${okMsg}(一覧の更新に失敗。「更新」で読み直せます)`; }
+  // 保存はできている。一覧を読み直せなくても失敗扱いにはしない(警告は「更新」で読み直すまで残す)
+  try { await refreshWifi(); wifiListStale = false; } catch (e) { wifiListStale = true; log(`保存しましたが、一覧を読み直せませんでした: ${e.message}`); $('wifi_msg').textContent = `${okMsg}${STALE}`; }
   return true;
 }
 
@@ -310,11 +317,11 @@ $('setwifi').onclick = async () => {
       $('wifi_msg').textContent = `接続待ち… (${i * 3}s)`;
       await new Promise(r => setTimeout(r, 3000));
       s = await refreshStatus();
-      if (s.wifi_connected && s.wifi_ssid === ssid) { $('wifi_msg').textContent = `接続しました: ${s.wifi_ssid} ${s.ip}`; log(`Wi-Fi ${s.wifi_ssid} ${s.ip}`); return; }
+      if (s.wifi_connected && s.wifi_ssid === ssid) { $('wifi_msg').textContent = `接続しました: ${s.wifi_ssid} ${s.ip}${wifiListStale ? STALE : ''}`; log(`Wi-Fi ${s.wifi_ssid} ${s.ip}`); return; }
     }
-    $('wifi_msg').textContent = s?.wifi_connected
+    $('wifi_msg').textContent = (s?.wifi_connected
       ? `"${ssid}" には接続していません(優先度の高い "${s.wifi_ssid}" に接続中です)`
-      : 'まだ接続できていません(パスワード違い、5 GHz のみ、電波が届かない可能性)。「更新」で再確認できます';
+      : 'まだ接続できていません(パスワード違い、5 GHz のみ、電波が届かない可能性)。「更新」で再確認できます') + (wifiListStale ? STALE : '');
   } catch (e) {
     log(`失敗: ${e.message}`);
   } finally {
@@ -348,8 +355,12 @@ $('radio_save').onclick = async () => {
     if (confirm('保存しました。いま再起動して反映しますか？')) $('reboot').onclick(true);
   } catch (e) {
     log(`無線設定の保存に失敗: ${e.message}`);
-    await refreshRadio().catch(() => {}); // 途中まで保存されたかもしれないので、本体の保存値を表示し直す
-    $('radio_msg').textContent = `失敗: ${e.message}(一部だけ保存された可能性があります。上のチェックが本体に保存されている値です)`;
+    // 途中まで保存されたかもしれないので、本体の保存値を読み直して表示する
+    let reread = true;
+    await refreshRadio().catch(() => { reread = false; });
+    $('radio_msg').textContent = reread
+      ? `失敗: ${e.message}(一部だけ保存された可能性があります。上のチェックは本体に保存されている値です)`
+      : `失敗: ${e.message}(本体に保存された値を確認できませんでした。上のチェックは本体の値と違う可能性があります。「更新」で読み直してください)`;
   }
 };
 
