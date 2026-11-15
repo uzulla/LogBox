@@ -30,6 +30,10 @@
   .bar { height: 12px; border-radius: 6px; background: var(--track); overflow: hidden; }
   .bar i { display: block; height: 100%; width: 0; background: #e6a100; transition: width .3s; }
   .bar i.full { background: var(--ok); }
+  ul.nets { list-style: none; padding: 0; margin: 0 0 8px; }
+  ul.nets li { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  ul.nets li:last-child { border-bottom: 0; }
+  input[type=number] { font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); width: 8em; }
   pre#log { font-size: 12px; max-height: 160px; overflow: auto; margin: 0; white-space: pre-wrap; color: var(--muted); }
   #unsupported { display: none; }
 </style>
@@ -73,15 +77,31 @@
 
 <section>
   <h2>Wi-Fi 接続先</h2>
-  <p class="hint">2.4 GHz のネットワークだけ使えます。保存するとすぐ接続し直し、本体に保存されます（書き込み直しても残ります）。</p>
+  <p class="hint">最大 8 件まで登録でき、優先度の大きい順に試して、つながらなければ次へ切り替えます（1 件あたり最長 30 秒）。2.4 GHz のネットワークだけ使えます。同じ SSID を保存すると上書きします。本体に保存されます（書き込み直しても残ります）。</p>
+  <ul class="nets" id="nets"><li class="muted">—</li></ul>
   <label for="ssid">SSID</label>
   <input id="ssid" type="text" autocapitalize="off" autocomplete="off" maxlength="32" placeholder="HomeAP">
   <label for="pass">パスワード（なしなら空）</label>
   <input id="pass" type="password" autocapitalize="off" autocomplete="off" maxlength="64">
+  <label for="prio">優先度（大きいほど先に試す）</label>
+  <input id="prio" type="number" value="10" inputmode="numeric">
   <div class="row" style="margin-top:10px">
-    <button id="setwifi" class="primary" disabled>保存して接続を待つ</button>
-    <button id="clearwifi" class="danger" disabled>消す</button>
+    <button id="setwifi" class="primary" disabled>登録して接続を待つ</button>
+    <button id="clearwifi" class="danger" disabled>全部消す</button>
     <span id="wifi_msg" class="muted"></span>
+  </div>
+</section>
+
+<section>
+  <h2>無線（AP / STA）</h2>
+  <p class="hint">保存すると次の起動から有効です。AP は本体が出す Wi-Fi（スマホや PC から直接つなぐ用）、STA は上の接続先につなぐ機能です。両方オフにすると Wi-Fi は止まり、BLE（このページ）だけになります。</p>
+  <div class="row">
+    <label style="margin:0;display:flex;gap:6px;align-items:center;color:var(--fg)"><input type="checkbox" id="radio_ap"> AP（<span id="ap_name">LOGBO-…</span> / 192.168.4.1）</label>
+    <label style="margin:0;display:flex;gap:6px;align-items:center;color:var(--fg)"><input type="checkbox" id="radio_sta"> STA（Wi-Fi に接続）</label>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button id="radio_save" class="primary" disabled>保存</button>
+    <span id="radio_msg" class="muted"></span>
   </div>
 </section>
 
@@ -121,8 +141,8 @@
 // firmware/main/main.cpp の BLE config service
 const SVC    = '9b3c0001-4e5f-4a2b-8c6d-2f1e0a7b5c3d';
 const STATUS = '9b3c0002-4e5f-4a2b-8c6d-2f1e0a7b5c3d'; // read: JSON
-const WIFI   = '9b3c0003-4e5f-4a2b-8c6d-2f1e0a7b5c3d'; // write: "<ssid>\t<password>"
-const CTRL   = '9b3c0004-4e5f-4a2b-8c6d-2f1e0a7b5c3d'; // read: キャリブレーション JSON / write: コマンド
+const WIFI   = '9b3c0003-4e5f-4a2b-8c6d-2f1e0a7b5c3d'; // read: 登録一覧 JSON / write: "ssid=..&pass=..&prio=.." か "ssid=..&del=1"
+const CTRL   = '9b3c0004-4e5f-4a2b-8c6d-2f1e0a7b5c3d'; // read: {"magcal":..,"radio":..} / write: コマンド
 
 const $ = id => document.getElementById(id);
 const enc = new TextEncoder(), dec = new TextDecoder();
@@ -136,7 +156,7 @@ function gatt(fn) { const p = busy.then(fn, fn); busy = p.catch(() => {}); retur
 const readJson = c => gatt(async () => JSON.parse(dec.decode(await c.readValue())));
 const write = (c, text) => gatt(() => c.writeValueWithResponse(enc.encode(text)));
 
-const CONTROLS = ['disconnect', 'refresh', 'rec_start', 'rec_stop', 'setwifi', 'clearwifi', 'mag_start', 'mag_done', 'mag_cancel', 'mag_clear', 'reboot'];
+const CONTROLS = ['disconnect', 'refresh', 'rec_start', 'rec_stop', 'setwifi', 'clearwifi', 'radio_save', 'mag_start', 'mag_done', 'mag_cancel', 'mag_clear', 'reboot'];
 function setConnected(on) {
   for (const id of CONTROLS) $(id).disabled = !on;
   $('connect').disabled = on || !navigator.bluetooth;
@@ -160,9 +180,11 @@ $('connect').onclick = async () => {
     ch.wifi = await svc.getCharacteristic(WIFI);
     try { ch.ctrl = await svc.getCharacteristic(CTRL); } catch (e) { ch.ctrl = null; log('このファームウェアには操作用の characteristic がありません(状態と Wi-Fi だけ使えます)'); }
     setConnected(true);
-    for (const id of ['rec_start', 'rec_stop', 'clearwifi', 'mag_start', 'mag_done', 'mag_cancel', 'mag_clear', 'reboot']) $(id).disabled = !ch.ctrl;
+    for (const id of ['rec_start', 'rec_stop', 'clearwifi', 'radio_save', 'mag_start', 'mag_done', 'mag_cancel', 'mag_clear', 'reboot']) $(id).disabled = !ch.ctrl;
     log('接続しました');
     await tick();
+    await refreshWifi().catch(e => log(`接続先の一覧を読めません(古いファームウェア?): ${e.message}`));
+    if (ch.ctrl) await refreshRadio().catch(e => log(`無線設定を読めません: ${e.message}`));
   } catch (e) {
     log(`接続失敗: ${e.message}`);
   }
@@ -201,7 +223,7 @@ async function refreshStatus() {
     ['SD', `${span(recText, recCls)} <span class="muted">${esc(s.log || '')}</span>`],
     ['Wi-Fi', wifi],
   ];
-  if (s.ap_ssid !== undefined) rows.push(['本体の AP', `${esc(s.ap_ssid)} <span class="muted">192.168.4.1  接続 ${s.ap_clients} 台</span>`]);
+  if (s.ap_ssid !== undefined) { rows.push(['本体の AP', `${esc(s.ap_ssid)} <span class="muted">192.168.4.1  接続 ${s.ap_clients} 台</span>`]); $('ap_name').textContent = s.ap_ssid; }
   if (s.imu !== undefined) rows.push(['センサー', ['imu', 'mag', 'baro'].map(k => span(`${{ imu: 'IMU', mag: '地磁気', baro: '気圧' }[k]} ${s[k] ? 'OK' : 'なし'}`, s[k] ? 'ok' : 'warn')).join('  ')]);
   if (s.uptime_s !== undefined) rows.push(['稼働', esc(`${Math.floor(s.uptime_s / 3600)}h${String(Math.floor(s.uptime_s / 60) % 60).padStart(2, '0')}m  記録 ${s.records} 行  空きヒープ ${Math.round(s.free_heap / 1024)} KiB`)]);
   $('status_kv').innerHTML = rows.map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join('');
@@ -226,39 +248,93 @@ $('rec_start').onclick = () => ctrl('rec=1', '記録の開始を指示しまし�
 $('rec_stop').onclick = () => ctrl('rec=0', '記録の停止を指示しました(「外してよい」になるまで待ってください)', 'rec_msg');
 
 // ---- Wi-Fi ----
+async function refreshWifi() {
+  const j = await readJson(ch.wifi);
+  const ul = $('nets');
+  ul.innerHTML = '';
+  if (!j.networks.length) ul.innerHTML = '<li class="muted">登録なし</li>';
+  for (const n of [...j.networks].sort((a, b) => b.prio - a.prio)) {
+    const li = document.createElement('li');
+    li.innerHTML = `<span>${esc(n.ssid)} <span class="muted">優先度 ${n.prio}${n.secured ? '' : ' / パスワードなし'}</span></span>`;
+    const del = document.createElement('button');
+    del.textContent = '削除';
+    del.onclick = () => wifiWrite(`ssid=${encodeURIComponent(n.ssid)}&del=1`, `"${n.ssid}" を削除しました`);
+    li.appendChild(del);
+    ul.appendChild(li);
+  }
+  return j;
+}
+
+async function wifiWrite(q, okMsg) {
+  try {
+    await write(ch.wifi, q);
+    log(okMsg); $('wifi_msg').textContent = okMsg;
+    await refreshWifi();
+    return true;
+  } catch (e) {
+    // 本体はアプリ固有の ATT エラー(0x80 不正 / 0x81 8 件超 / 0x82 見つからない)を返すが、ブラウザでは区別できない
+    const m = `失敗: ${e.message}(SSID は 1〜32 バイト、パスワードは 64 バイトまで。最大 8 件)`;
+    log(m); $('wifi_msg').textContent = m;
+    return false;
+  }
+}
+
 $('setwifi').onclick = async () => {
-  const ssid = $('ssid').value, pass = $('pass').value;
+  const ssid = $('ssid').value, pass = $('pass').value, prio = parseInt($('prio').value || '0', 10) || 0;
   if (!ssid) { $('wifi_msg').textContent = 'SSID を入れてください'; return; }
-  if ((ssid + pass).includes('\t')) { $('wifi_msg').textContent = 'タブ文字は使えません'; return; }
   if (enc.encode(ssid).length > 32 || enc.encode(pass).length > 64) { $('wifi_msg').textContent = 'SSID は 32 バイト、パスワードは 64 バイトまでです'; return; }
   $('setwifi').disabled = true;
   try {
-    await write(ch.wifi, `${ssid}\t${pass}`);
-    log(`"${ssid}" を保存しました`);
+    const ok = await wifiWrite(`ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}&prio=${prio}`, `"${ssid}" を保存しました`);
+    if (!ok) return;
     $('pass').value = '';
-    for (let i = 0; i < 15; i++) { // 接続できるまで状態を読む(最長 45 秒)
+    for (let i = 0; i < 20; i++) { // どれかにつながるまで状態を読む(最長 60 秒)
       $('wifi_msg').textContent = `接続待ち… (${i * 3}s)`;
       await new Promise(r => setTimeout(r, 3000));
       const s = await refreshStatus();
-      if (s.wifi_connected && s.wifi_ssid === ssid) { $('wifi_msg').textContent = `接続しました: ${s.ip}`; log(`Wi-Fi ${s.ip}`); return; }
+      if (s.wifi_connected) { $('wifi_msg').textContent = `接続しました: ${s.wifi_ssid} ${s.ip}`; log(`Wi-Fi ${s.wifi_ssid} ${s.ip}`); return; }
     }
-    $('wifi_msg').textContent = 'まだ接続できていません(パスワード違い、5 GHz のみ、電波が届かない可能性)。「更新」で再確認できます';
+    $('wifi_msg').textContent = 'まだ接続できていません(パスワード違い、5 GHz のみ、電波が届かない、STA がオフ の可能性)。「更新」で再確認できます';
   } catch (e) {
-    const m = `失敗: ${e.message}(SSID は 1〜32 バイト、パスワードは 64 バイトまで)`;
-    log(m); $('wifi_msg').textContent = m;
+    log(`失敗: ${e.message}`);
   } finally {
     $('setwifi').disabled = !device?.gatt?.connected;
   }
 };
-$('clearwifi').onclick = () => {
-  if (!confirm('保存されている Wi-Fi の接続先を消します。よろしいですか？')) return;
-  ctrl('wifi=clear', 'Wi-Fi の接続先を消しました', 'wifi_msg');
+$('clearwifi').onclick = async () => {
+  if (!confirm('登録されている Wi-Fi の接続先をすべて消します。よろしいですか？')) return;
+  await ctrl('wifi=clear', 'Wi-Fi の接続先をすべて消しました', 'wifi_msg');
+  refreshWifi().catch(() => {});
+};
+
+// ---- 無線(AP / STA) ----
+async function refreshRadio() {
+  const r = (await readJson(ch.ctrl)).radio;
+  if (!r) { $('radio_msg').textContent = 'このファームウェアは AP / STA の切り替えに対応していません'; $('radio_save').disabled = true; return; }
+  $('radio_ap').checked = r.ap;
+  $('radio_sta').checked = r.sta;
+  const pending = r.ap !== r.active.ap || r.sta !== r.active.sta;
+  $('radio_msg').textContent = pending ? '保存済み。再起動すると反映されます' : `現在: AP ${r.active.ap ? 'オン' : 'オフ'} / STA ${r.active.sta ? 'オン' : 'オフ'}`;
+}
+$('radio_save').onclick = async () => {
+  const ap = $('radio_ap').checked ? 1 : 0, sta = $('radio_sta').checked ? 1 : 0;
+  if (!ap && !sta && !confirm('AP と STA を両方オフにします。次の起動から Wi-Fi は止まり(UDP の送信も止まります)、BLE(このページ)だけになります。よろしいですか？')) return;
+  try {
+    await write(ch.ctrl, `ap=${ap}`);
+    await write(ch.ctrl, `sta=${sta}`);
+    log(`無線設定を保存: AP ${ap ? 'オン' : 'オフ'} / STA ${sta ? 'オン' : 'オフ'}(次の起動から)`);
+    await refreshRadio();
+    if (confirm('保存しました。いま再起動して反映しますか？')) $('reboot').onclick(true);
+  } catch (e) {
+    $('radio_msg').textContent = `失敗: ${e.message}`; log(`無線設定の保存に失敗: ${e.message}`);
+  }
 };
 
 // ---- 地磁気キャリブレーション ----
 const RESULT = ['', '成功しました', '失敗: 回した時間が短すぎます', '失敗: 回し方が足りません(裏返しも含めて全方向に)', '失敗: 値が安定しません(鉄や磁石から離れて、もう一度)', '収集していません', '補正は効いていますが、本体への保存に失敗しました(再起動すると消えます)'];
 async function refreshMag() {
-  const m = await readJson(ch.ctrl);
+  const j = await readJson(ch.ctrl);
+  const m = j.magcal || j; // 古いファームウェアはキャリブレーションの JSON をそのまま返す
   const prev = lastMag; lastMag = m;
   const span = (t, c) => `<span class="${c}">${esc(t)}</span>`;
   $('mag_kv').innerHTML = [
@@ -303,8 +379,8 @@ $('mag_clear').onclick = () => {
 };
 
 // ---- 本体 ----
-$('reboot').onclick = async () => {
-  if (!confirm('logbo を再起動します。BLE は切断されるので、数秒後に「接続」から繋ぎ直してください。')) return;
+$('reboot').onclick = async (confirmed) => {
+  if (confirmed !== true && !confirm('logbo を再起動します。BLE は切断されるので、数秒後に「接続」から繋ぎ直してください。')) return;
   try {
     await write(ch.ctrl, 'reboot=1');
     log('再起動を指示しました');

@@ -94,17 +94,30 @@ connect directly when there is no router (IP 192.168.4.1, DHCP). While a station
 broadcast to `192.168.4.255`. The SSID suffix and the WPA2 password are random and **change on every build**: they are
 generated into `build/esp-idf/main/ap_credentials.h` (never committed) and logged at boot.
 
-### Wi-Fi credentials
+### Wi-Fi networks
 
-Saved to NVS (they survive reflashing; `idf.py erase-flash` removes them), never in the source or the image:
+Up to 8 networks (SSID, password, priority), tried from the highest priority down; a network that does not give an IP
+within 30 s (or fails: wrong password, not found) hands over to the next one, and after all failed the list is tried
+again 10 s later. While joined, a disconnect or a change of the list starts over from the top. Saved to NVS (they
+survive reflashing; `idf.py erase-flash` removes them) as `ssid<i>` / `pass<i>` / `prio<i>` in namespace `wifi`
+(`components/wifinets`; the single network of older firmware moves into slot 0), never in the source or the image.
+Set them from the Web page or BLE (below), or over USB serial:
 
 ```sh
-uv run tools/set-wifi.py              # on the host the M5Stack is plugged into; prompts for SSID and password
-uv run tools/set-wifi.py --clear
+uv run tools/set-wifi.py --prio 10    # on the host the M5Stack is plugged into; prompts for SSID and password
+uv run tools/set-wifi.py --list
+uv run tools/set-wifi.py --delete HomeAP
+uv run tools/set-wifi.py --clear      # all of them
 ```
 
-This sends `wifi-set<TAB>ssid<TAB>password` (or `wifi-clear`) to the serial console. Opening the port resets the
-ESP32 on Linux, so the tool waits for it to boot first.
+This sends `wifi-set<TAB>ssid<TAB>password<TAB>priority`, `wifi-list`, `wifi-del<TAB>ssid` or `wifi-clear` to the
+serial console. Opening the port resets the ESP32 on Linux, so the tool waits for it to boot first.
+
+### AP / STA switches
+
+The soft AP and the STA can each be turned off (Web page, `ctrl` characteristic `ap=0|1` / `sta=0|1`, or the console:
+`radio`, `radio ap=0`, `radio sta=1`, `reboot`). Saved to NVS (namespace `radio`) and applied at the next boot. Both
+off: Wi-Fi is not started (no UDP), BLE stays so they can be turned back on.
 
 ### BLE config service
 
@@ -112,22 +125,24 @@ The ESP32 advertises as `logbo-XXXX` with a config service all the time (`CONFIG
 limits it to that many seconds after boot; the screen's top bar shows `BT` while it advertises). The link is encrypted (Just Works pairing, no bond stored), so macOS asks to confirm ("接続") on each connection.
 
 **Web page** (`docs/index.html`, Web Bluetooth: Chrome / Edge on Android or a PC, over HTTPS or as a local file;
-not iPhone Safari): status, SD recording start / stop, Wi-Fi credentials, magnetometer calibration (live coverage bars
-while you rotate the unit), reboot. Published with GitHub Pages from `docs/` on `main`.
+not iPhone Safari): status, SD recording start / stop, Wi-Fi networks (list, add with a priority, delete), AP / STA
+switches, magnetometer calibration (live coverage bars while you rotate the unit), reboot. Published with GitHub Pages from `docs/` on `main`.
 
 ```sh
 uv run tools/ble-config.py status      # GNSS, SD state / file, configured SSID, Wi-Fi connected?, IP
-uv run tools/ble-config.py wifi-set    # prompts for SSID/password, saved to NVS and applied
-uv run tools/ble-config.py mag         # magnetometer calibration state
+uv run tools/ble-config.py wifi-set    # prompts for SSID / password / priority; adds or updates a network
+uv run tools/ble-config.py wifi-list   # the networks
+uv run tools/ble-config.py wifi-del HomeAP
+uv run tools/ble-config.py mag         # magnetometer calibration state and the AP / STA switches
 uv run tools/ble-config.py ctrl rec=0  # a command (see the ctrl characteristic below)
 ```
 
 | Characteristic | UUID | |
 |---|---|---|
 | service | `9b3c0001-4e5f-4a2b-8c6d-2f1e0a7b5c3d` | |
-| status | `9b3c0002-…` | read: `{"device":"logbo-CD0E","uptime_s":120,"free_heap":45000,"gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01.csv","records":3000,"imu":true,"mag":true,"baro":true,"wifi_ssid":"…","wifi_connected":true,"ip":"192.168.11.38","rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0}` (`rec`: off / rec / saving / safe / failed; `fix` 0 when no fix or no GNSS for 2 s) |
-| wifi | `9b3c0003-…` | write with response: `<ssid>\t<password>` (SSID 1–32 bytes, password ≤ 64); rejected with ATT error 0x13 if invalid |
-| ctrl | `9b3c0004-…` | read: magnetometer calibration `{"calibrated":true,"field":34.4,"collecting":false,"session":3,"samples":0,"coverage":[0.00,0.00,0.00],"complete":false,"result":1}` (`result` 0 none yet, 1 ok, 2 too short, 3 not rotated, 4 bad fit, 5 not running, 6 not saved). write with response, one command: `rec=1` / `rec=0` (as holding B), `mag=start` / `mag=done` / `mag=cancel` / `mag=clear`, `wifi=clear`, `reboot=1`; an unknown command or a failed `mag=done` gets ATT error 0x13 |
+| status | `9b3c0002-…` | read: `{"device":"logbo-CD0E","uptime_s":120,"free_heap":45000,"gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01.csv","records":3000,"imu":true,"mag":true,"baro":true,"wifi_ssid":"…","wifi_connected":true,"wifi_networks":2,"ip":"192.168.11.38","rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0}` (`rec`: off / rec / saving / safe / failed; `fix` 0 when no fix or no GNSS for 2 s; `wifi_ssid`: the network being tried or joined, `wifi_networks`: how many are saved) |
+| wifi | `9b3c0003-…` | read: `{"networks":[{"ssid":"HomeAP","prio":10,"secured":true},...]}` (no passwords). write with response: `ssid=HomeAP&pass=secret&prio=10` (URL-encoded; adds, or updates the same SSID; `pass` may be left out for an open network) or `ssid=HomeAP&del=1`; the older `<ssid>\t<password>` adds with priority 0. Refused with ATT error 0x80 (invalid: SSID 1–32 bytes, password ≤ 64), 0x81 (8 networks already), 0x82 (no such network) |
+| ctrl | `9b3c0004-…` | read: `{"magcal":{…},"radio":{"ap":true,"sta":true,"active":{"ap":true,"sta":true}}}` (radio: saved switches, and those of this boot), magcal = `{"calibrated":true,"field":34.4,"collecting":false,"session":3,"samples":0,"coverage":[0.00,0.00,0.00],"complete":false,"result":1}` (`result` 0 none yet, 1 ok, 2 too short, 3 not rotated, 4 bad fit, 5 not running, 6 not saved). write with response, one command: `rec=1` / `rec=0` (as holding B), `mag=start` / `mag=done` / `mag=cancel` / `mag=clear`, `wifi=clear` (all networks), `ap=0` / `ap=1` / `sta=0` / `sta=1` (next boot), `reboot=1`; an unknown command or a failed `mag=done` gets ATT error 0x13 |
 
 If the macOS pairing dialog shows an old device name after the firmware renamed the device:
 macOS records the device in `/Library/Bluetooth/com.apple.MobileBluetooth.ledevices.paired.db`

@@ -228,6 +228,7 @@ void test_nmea_detector() {
 void runRecordTests();
 void runMagCalTests();
 void runCarframeTests();
+void runWifinetsTests();
 
 int main() {
   UNITY_BEGIN();
@@ -243,5 +244,6 @@ int main() {
   runRecordTests();
   runMagCalTests();
   runCarframeTests();
+  runWifinetsTests();
   return UNITY_END();
 }

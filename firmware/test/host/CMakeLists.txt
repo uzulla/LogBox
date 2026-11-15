@@ -10,14 +10,17 @@ add_executable(test_gnss
     test_record.cpp
     test_magcal.cpp
     test_carframe.cpp
+    test_wifinets.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../../components/record/record.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../../components/gnss/ubx.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../../components/imu/magcal.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../../components/carframe/carframe.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../../components/wifinets/wifinets.cpp
     ${UNITY_DIR}/unity.c)
 target_include_directories(test_gnss PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../../components/gnss/include
     ${CMAKE_CURRENT_LIST_DIR}/../../components/imu/include
     ${CMAKE_CURRENT_LIST_DIR}/../../components/carframe/include
+    ${CMAKE_CURRENT_LIST_DIR}/../../components/wifinets/include
     ${CMAKE_CURRENT_LIST_DIR}/../../components/record/include ${UNITY_DIR})
 target_compile_options(test_gnss PRIVATE -Wall -Wextra)

@@ -7,6 +7,7 @@
 // Wi-Fi credentials are set over the serial console or the BLE config service (advertised for a while after boot).
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <atomic>
@@ -22,6 +23,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "host/ble_hs.h"
@@ -38,6 +40,7 @@
 #include "logger_status.h"
 #include "record.h"
 #include "sdlog.h"
+#include "wifinets.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
@@ -60,8 +63,6 @@ static std::atomic<uint32_t> broadcastAddr{0};
 static uint32_t apBroadcastAddr = 0;
 static std::atomic<int> apClients{0};
 static std::atomic<uint32_t> udpErrors{0};
-static bool wifiConfigured = false;
-static char wifiSsid[33];  // configured SSID, "" if none
 static char deviceName[16];  // "logbo-XXXX" (BLE name, UDP "device")
 
 static imu::Status imuStatus;
@@ -94,54 +95,117 @@ static void sendUdp(const char* buf, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// Wi-Fi (credentials in NVS namespace "wifi", keys "ssid"/"pass")
+// Wi-Fi STA: the networks in wifinets (NVS), tried from the highest priority down until one gives an IP.
+// While joined, a disconnect or a change of the list starts over from the top.
 
-// Validates and stores credentials. Returns an error message, or nullptr.
-static const char* saveWifiCredentials(const char* ssid, const char* pass) {
-  const size_t ssidLen = strlen(ssid);
-  const size_t passLen = strlen(pass);
-  if (ssidLen == 0 || ssidLen > 32) return "SSID must be 1-32 bytes";
-  if (passLen > 64) return "password must be at most 64 bytes";
-  nvs_handle_t h;
-  if (nvs_open("wifi", NVS_READWRITE, &h) != ESP_OK) return "nvs open failed";
-  const bool ok = nvs_set_str(h, "ssid", ssid) == ESP_OK && nvs_set_str(h, "pass", pass) == ESP_OK &&
-                  nvs_commit(h) == ESP_OK;
-  nvs_close(h);
-  return ok ? nullptr : "nvs write failed";
+static EventGroupHandle_t wifiEvents;
+constexpr EventBits_t kWifiGotIp = 1 << 0, kWifiDisconnected = 1 << 1, kWifiChanged = 1 << 2;
+constexpr TickType_t kWifiJoinTimeout = pdMS_TO_TICKS(30000);  // association + DHCP, per network
+constexpr TickType_t kWifiRetryIdle = pdMS_TO_TICKS(10000);    // after every network failed
+static std::atomic<int> wifiCount{0};                           // networks in NVS
+static std::atomic<bool> staAssociated{false};                  // between STA_CONNECTED and STA_DISCONNECTED
+static portMUX_TYPE wifiLock = portMUX_INITIALIZER_UNLOCKED;
+static char wifiTarget[33];  // network being tried or joined, "" if none (guarded by wifiLock)
+
+static void setWifiTarget(const char* ssid) {
+  taskENTER_CRITICAL(&wifiLock);
+  strlcpy(wifiTarget, ssid, sizeof(wifiTarget));
+  taskEXIT_CRITICAL(&wifiLock);
 }
 
-static void clearWifiCredentials() {
-  nvs_handle_t h;
-  if (nvs_open("wifi", NVS_READWRITE, &h) == ESP_OK) {
-    nvs_erase_all(h);
-    nvs_commit(h);
-    nvs_close(h);
-  }
+static void wifiTargetCopy(char (&out)[33]) {
+  taskENTER_CRITICAL(&wifiLock);
+  memcpy(out, wifiTarget, sizeof(out));
+  taskEXIT_CRITICAL(&wifiLock);
 }
 
-static void applyWifiConfig() {
-  wifi_config_t cfg = {};
-  nvs_handle_t h;
-  size_t ssidLen = sizeof(cfg.sta.ssid);
-  size_t passLen = sizeof(cfg.sta.password);
-  wifiConfigured = false;
-  if (nvs_open("wifi", NVS_READONLY, &h) == ESP_OK) {
-    wifiConfigured =
-        nvs_get_str(h, "ssid", reinterpret_cast<char*>(cfg.sta.ssid), &ssidLen) == ESP_OK && cfg.sta.ssid[0];
-    if (nvs_get_str(h, "pass", reinterpret_cast<char*>(cfg.sta.password), &passLen) != ESP_OK) {
-      cfg.sta.password[0] = '\0';
-    }
-    nvs_close(h);
+// The list changed (BLE, console): reconnect from the top of the new list.
+static void wifiListChanged() {
+  if (wifiEvents) xEventGroupSetBits(wifiEvents, kWifiChanged);
+}
+
+// Adds / updates / deletes a network from one of the wifinets text formats. Returns nullptr on success, else
+// an error message; *full / *notFound tell the BLE side which ATT error to give.
+static const char* applyWifiText(const char* text, bool* full = nullptr, bool* notFound = nullptr) {
+  wifinets::Command cmd;
+  switch (wifinets::parse(text, cmd)) {
+    case wifinets::ParseError::kNoSsid: return "no SSID";
+    case wifinets::ParseError::kTooLong: return "SSID must be 1-32 bytes, password at most 64";
+    default: break;
   }
-  snprintf(wifiSsid, sizeof(wifiSsid), "%s", wifiConfigured ? (const char*)cfg.sta.ssid : "");
-  esp_wifi_disconnect();
-  if (!wifiConfigured) {
-    ESP_LOGW(TAG, "Wi-Fi not configured; run tools/set-wifi.py or tools/ble-config.py");
+  const wifinets::StoreError err =
+      cmd.op == wifinets::Op::kDelete ? wifinets::remove(cmd.entry.ssid) : wifinets::set(cmd.entry);
+  if (full) *full = err == wifinets::StoreError::kFull;
+  if (notFound) *notFound = err == wifinets::StoreError::kNotFound;
+  switch (err) {
+    case wifinets::StoreError::kFull: return "already 8 networks; delete one first";
+    case wifinets::StoreError::kNotFound: return "no such network";
+    case wifinets::StoreError::kNvs: return "NVS write failed";
+    default: break;
+  }
+  ESP_LOGI(TAG, "Wi-Fi network \"%s\" %s", cmd.entry.ssid, cmd.op == wifinets::Op::kDelete ? "deleted" : "saved");
+  wifiListChanged();
+  return nullptr;
+}
+
+// Leaves the current network and waits for its disconnect event, so that event is not taken for the failure of
+// the next attempt.
+static void staLeave() {
+  if (!staAssociated) {
+    esp_wifi_disconnect();
     return;
   }
-  ESP_LOGI(TAG, "Wi-Fi connecting to \"%s\"", cfg.sta.ssid);
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
-  esp_wifi_connect();
+  xEventGroupClearBits(wifiEvents, kWifiDisconnected);
+  esp_wifi_disconnect();
+  xEventGroupWaitBits(wifiEvents, kWifiDisconnected, pdFALSE, pdFALSE, pdMS_TO_TICKS(2000));
+}
+
+static void staTask(void*) {
+  static wifinets::Entry list[wifinets::kMax];
+  for (;;) {
+    xEventGroupClearBits(wifiEvents, kWifiChanged);
+    const int n = wifinets::load(list);
+    wifiCount = n;
+    if (!n) {
+      setWifiTarget("");
+      staLeave();
+      ESP_LOGW(TAG, "Wi-Fi not configured; set a network over BLE (docs/index.html, tools/ble-config.py) or "
+                    "tools/set-wifi.py");
+      xEventGroupWaitBits(wifiEvents, kWifiChanged, pdFALSE, pdFALSE, portMAX_DELAY);
+      continue;
+    }
+    wifinets::sortByPriority(list, n);
+    bool joined = false, changed = false;
+    for (int i = 0; i < n && !joined && !changed; i++) {
+      ESP_LOGI(TAG, "Wi-Fi trying \"%s\" (priority %ld)", list[i].ssid, static_cast<long>(list[i].prio));
+      setWifiTarget(list[i].ssid);
+      wifi_config_t cfg = {};
+      strlcpy(reinterpret_cast<char*>(cfg.sta.ssid), list[i].ssid, sizeof(cfg.sta.ssid));
+      strlcpy(reinterpret_cast<char*>(cfg.sta.password), list[i].pass, sizeof(cfg.sta.password));
+      cfg.sta.threshold.authmode = list[i].pass[0] ? WIFI_AUTH_WPA_PSK : WIFI_AUTH_OPEN;
+      staLeave();
+      xEventGroupClearBits(wifiEvents, kWifiGotIp | kWifiDisconnected);
+      esp_wifi_set_config(WIFI_IF_STA, &cfg);
+      esp_wifi_connect();
+      // An IP, a failure (disconnect event: wrong password, not found, ...), a new list, or the timeout
+      const EventBits_t bits = xEventGroupWaitBits(wifiEvents, kWifiGotIp | kWifiDisconnected | kWifiChanged,
+                                                   pdFALSE, pdFALSE, kWifiJoinTimeout);
+      joined = bits & kWifiGotIp;
+      changed = bits & kWifiChanged;
+      if (!joined) ESP_LOGW(TAG, "Wi-Fi \"%s\" failed", list[i].ssid);
+    }
+    if (changed) continue;
+    if (!joined) {
+      staLeave();
+      ESP_LOGW(TAG, "Wi-Fi: no network joined; retrying in %lu s",
+               static_cast<unsigned long>(pdTICKS_TO_MS(kWifiRetryIdle) / 1000));
+      xEventGroupWaitBits(wifiEvents, kWifiChanged, pdFALSE, pdFALSE, kWifiRetryIdle);
+      continue;
+    }
+    // Joined: wait for a disconnect or a new list, then start over from the highest priority
+    xEventGroupWaitBits(wifiEvents, kWifiDisconnected | kWifiChanged, pdFALSE, pdFALSE, portMAX_DELAY);
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
 }
 
 static void refreshApClients() {
@@ -153,23 +217,78 @@ static void onWifiEvent(void*, esp_event_base_t base, int32_t id, void* data) {
   if (base == WIFI_EVENT && (id == WIFI_EVENT_AP_STACONNECTED || id == WIFI_EVENT_AP_STADISCONNECTED)) {
     refreshApClients();
     ESP_LOGI(TAG, "AP: %d station(s) connected", apClients.load());
+  } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+    staAssociated = true;
   } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    staAssociated = false;
     broadcastAddr = 0;
-    if (wifiConfigured) esp_wifi_connect();
+    xEventGroupClearBits(wifiEvents, kWifiGotIp);
+    // Only a disconnect from the network being tried counts: a failed attempt can report more than once, and
+    // the late reports must not fail the next network.
+    const auto* ev = static_cast<wifi_event_sta_disconnected_t*>(data);
+    char target[33];
+    wifiTargetCopy(target);
+    const size_t len = strnlen(reinterpret_cast<const char*>(ev->ssid), sizeof(ev->ssid));
+    if (len == strlen(target) && !memcmp(ev->ssid, target, len)) {
+      xEventGroupSetBits(wifiEvents, kWifiDisconnected);  // staTask decides what to try next
+    }
   } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
     const auto* ev = static_cast<ip_event_got_ip_t*>(data);
     const uint32_t bcast = ev->ip_info.ip.addr | ~ev->ip_info.netmask.addr;
     broadcastAddr = bcast;
+    xEventGroupSetBits(wifiEvents, kWifiGotIp);
     ESP_LOGI(TAG, "Wi-Fi connected: " IPSTR ", broadcast " IPSTR ":%d", IP2STR(&ev->ip_info.ip),
              IP2STR(reinterpret_cast<const esp_ip4_addr_t*>(&bcast)), CONFIG_LOGBO_UDP_PORT);
   }
 }
 
+// ---------------------------------------------------------------------------
+// Radio switches: the soft AP and the STA can each be turned off. Saved in NVS namespace "radio" (u8 "ap" /
+// "sta", missing = on) and applied at the next boot. Both off: Wi-Fi is not started at all; BLE stays, so the
+// Web page / tools/ble-config.py can turn them back on.
+
+static bool radioApOn = true, radioStaOn = true;  // this boot
+
+static void radioSaved(bool* ap, bool* sta) {
+  *ap = *sta = true;
+  nvs_handle_t h;
+  if (nvs_open("radio", NVS_READONLY, &h) != ESP_OK) return;
+  uint8_t v;
+  if (nvs_get_u8(h, "ap", &v) == ESP_OK) *ap = v != 0;
+  if (nvs_get_u8(h, "sta", &v) == ESP_OK) *sta = v != 0;
+  nvs_close(h);
+}
+
+static bool radioSave(const char* key, bool on) {
+  nvs_handle_t h;
+  if (nvs_open("radio", NVS_READWRITE, &h) != ESP_OK) return false;
+  const bool ok = nvs_set_u8(h, key, on) == ESP_OK && nvs_commit(h) == ESP_OK;
+  nvs_close(h);
+  if (ok) ESP_LOGI(TAG, "radio: %s %s from the next boot", key, on ? "on" : "off");
+  return ok;
+}
+
+// {"ap":true,"sta":false,"active":{"ap":true,"sta":true}}: saved (next boot) and this boot
+static size_t radioJson(char* buf, size_t size) {
+  bool ap, sta;
+  radioSaved(&ap, &sta);
+  const int n = snprintf(buf, size, "{\"ap\":%s,\"sta\":%s,\"active\":{\"ap\":%s,\"sta\":%s}}",
+                         ap ? "true" : "false", sta ? "true" : "false", radioApOn ? "true" : "false",
+                         radioStaOn ? "true" : "false");
+  return n > 0 && static_cast<size_t>(n) < size ? n : 0;
+}
+
 static void initWifi() {
+  wifiEvents = xEventGroupCreate();
+  radioSaved(&radioApOn, &radioStaOn);
+  if (!radioApOn && !radioStaOn) {
+    ESP_LOGW(TAG, "Wi-Fi off (AP and STA both turned off); BLE only");
+    return;
+  }
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
-  esp_netif_create_default_wifi_sta();
-  esp_netif_t* apNetif = esp_netif_create_default_wifi_ap();
+  if (radioStaOn) esp_netif_create_default_wifi_sta();
+  esp_netif_t* apNetif = radioApOn ? esp_netif_create_default_wifi_ap() : nullptr;
   wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&init));
   // The credentials already live in our own NVS namespace; don't copy them.
@@ -178,20 +297,30 @@ static void initWifi() {
   ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, onWifiEvent, nullptr));
   // AP + STA: the STA joins the configured network, the AP lets a phone or PC connect directly
   // (no router at the track). The radio has one channel, so the AP follows the STA's channel.
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-  wifi_config_t ap = {};
-  strlcpy(reinterpret_cast<char*>(ap.ap.ssid), LOGBO_AP_SSID, sizeof(ap.ap.ssid));
-  strlcpy(reinterpret_cast<char*>(ap.ap.password), LOGBO_AP_PASSWORD, sizeof(ap.ap.password));
-  ap.ap.ssid_len = strlen(LOGBO_AP_SSID);
-  ap.ap.channel = 1;
-  ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
-  ap.ap.max_connection = 4;
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
+  ESP_ERROR_CHECK(esp_wifi_set_mode(radioApOn && radioStaOn ? WIFI_MODE_APSTA : radioApOn ? WIFI_MODE_AP : WIFI_MODE_STA));
+  if (radioApOn) {
+    wifi_config_t ap = {};
+    strlcpy(reinterpret_cast<char*>(ap.ap.ssid), LOGBO_AP_SSID, sizeof(ap.ap.ssid));
+    strlcpy(reinterpret_cast<char*>(ap.ap.password), LOGBO_AP_PASSWORD, sizeof(ap.ap.password));
+    ap.ap.ssid_len = strlen(LOGBO_AP_SSID);
+    ap.ap.channel = 1;
+    ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ap.ap.max_connection = 4;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
+  }
   esp_netif_ip_info_t apIp = {};
-  if (esp_netif_get_ip_info(apNetif, &apIp) == ESP_OK) apBroadcastAddr = apIp.ip.addr | ~apIp.netmask.addr;
+  if (apNetif && esp_netif_get_ip_info(apNetif, &apIp) == ESP_OK) apBroadcastAddr = apIp.ip.addr | ~apIp.netmask.addr;
   ESP_ERROR_CHECK(esp_wifi_start());
-  ESP_LOGI(TAG, "AP \"%s\" password \"%s\" at " IPSTR, LOGBO_AP_SSID, LOGBO_AP_PASSWORD, IP2STR(&apIp.ip));
-  applyWifiConfig();
+  if (radioApOn) {
+    ESP_LOGI(TAG, "AP \"%s\" password \"%s\" at " IPSTR, LOGBO_AP_SSID, LOGBO_AP_PASSWORD, IP2STR(&apIp.ip));
+  } else {
+    ESP_LOGI(TAG, "AP off");
+  }
+  if (radioStaOn) {
+    xTaskCreate(staTask, "wifi_sta", 4096, nullptr, 4, nullptr);
+  } else {
+    ESP_LOGI(TAG, "STA off");
+  }
 
   udpSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   const int yes = 1;
@@ -204,8 +333,8 @@ static void initWifi() {
 // link (Just Works pairing, no bonding), so the password is not sent in the clear. Used by tools/ble-config.py
 // and the Web Bluetooth page docs/index.html.
 //   status (read):  JSON, see statusJson()
-//   wifi   (write): "<ssid>\t<password>", saved to NVS and applied at once
-//   ctrl   (read):  magnetometer calibration state, see magCalJson()
+//   wifi   (read):  the Wi-Fi networks (no passwords); (write): add / update / delete one, see wifinets.h
+//   ctrl   (read):  magnetometer calibration state and the radio switches, see ctrlJson()
 //          (write): one command, see onCtrlWrite()
 
 // 128-bit UUIDs are stored little-endian.
@@ -238,8 +367,10 @@ static std::atomic<uint16_t> configConnHandle{BLE_HS_CONN_HANDLE_NONE};
 // SSID of 32 characters that all need escaping, below the 512 bytes an attribute may have.
 static size_t statusJson(char* buf, size_t size) {
   static const char* const kRec[] = {"off", "rec", "saving", "safe", "failed"};
-  char ssid[sizeof(wifiSsid) * 6];
-  record::jsonEscape(wifiSsid, ssid, sizeof(ssid));
+  char target[33];
+  wifiTargetCopy(target);
+  char ssid[sizeof(target) * 6];
+  record::jsonEscape(target, ssid, sizeof(ssid));
   const bool connected = broadcastAddr != 0;
   char ip[24] = "null";
   esp_netif_ip_info_t info = {};
@@ -257,19 +388,21 @@ static size_t statusJson(char* buf, size_t size) {
       "{\"device\":\"%s\",\"uptime_s\":%lu,\"free_heap\":%lu,"
       "\"gnss\":{\"configured\":%s,\"messages\":%lu,\"baud\":%lu,\"fix\":%u,\"sats\":%u},"
       "\"rec\":\"%s\",\"log\":\"%s\",\"records\":%lu,\"imu\":%s,\"mag\":%s,\"baro\":%s,"
-      "\"wifi_ssid\":\"%s\",\"wifi_connected\":%s,\"ip\":%s,\"rssi\":%d,\"ap_ssid\":\"%s\",\"ap_clients\":%d}",
+      "\"wifi_ssid\":\"%s\",\"wifi_connected\":%s,\"wifi_networks\":%d,\"ip\":%s,\"rssi\":%d,"
+      "\"ap_ssid\":\"%s\",\"ap_clients\":%d}",
       deviceName, static_cast<unsigned long>(esp_timer_get_time() / 1000000),
       static_cast<unsigned long>(esp_get_free_heap_size()), gs.configured ? t : f,
       static_cast<unsigned long>(gs.pvt), static_cast<unsigned long>(gs.baud), fresh ? lastFix.load() : 0,
       fresh ? lastSats.load() : 0, kRec[static_cast<int>(sdlog::state())], sdlog::fileName(),
       static_cast<unsigned long>(records.load()), imuStatus.bmi270 ? t : f, imuStatus.bmm150 ? t : f,
-      imuStatus.bmp280 ? t : f, ssid, connected ? t : f, ip, rssi, LOGBO_AP_SSID, apClients.load());
+      imuStatus.bmp280 ? t : f, ssid, connected ? t : f, wifiCount.load(), ip, rssi, LOGBO_AP_SSID,
+      apClients.load());
   return n > 0 && static_cast<size_t>(n) < size ? n : 0;
 }
 
 // {"calibrated":true,"field":34.4,"collecting":false,"session":3,"samples":0,"coverage":[0.00,0.00,0.00],
 //  "complete":false,"result":1}   result: as logger::Status::magCalResult (0 none, 1 ok, 2.. failures)
-static size_t magCalJson(char* buf, size_t size) {
+static size_t magCalJsonOnly(char* buf, size_t size) {
   const imu::MagCalInfo mc = imu::magCalInfo();
   const char* t = "true";
   const char* f = "false";
@@ -279,6 +412,14 @@ static size_t magCalJson(char* buf, size_t size) {
                          mc.calibrated ? t : f, mc.calibrated ? mc.cal.field : 0.0f, mc.collecting ? t : f,
                          static_cast<unsigned long>(mc.session), static_cast<unsigned long>(mc.samples),
                          mc.coverage[0], mc.coverage[1], mc.coverage[2], mc.complete ? t : f, magCalResult.load());
+  return n > 0 && static_cast<size_t>(n) < size ? n : 0;
+}
+
+// ctrl read: {"magcal":{...magCalJsonOnly},"radio":{...radioJson}}
+static size_t ctrlJson(char* buf, size_t size) {
+  char mag[256], radio[96];
+  if (!magCalJsonOnly(mag, sizeof(mag)) || !radioJson(radio, sizeof(radio))) return 0;
+  const int n = snprintf(buf, size, "{\"magcal\":%s,\"radio\":%s}", mag, radio);
   return n > 0 && static_cast<size_t>(n) < size ? n : 0;
 }
 
@@ -295,10 +436,11 @@ static void rebootSoon() {
 // ctrl commands (ASCII, no newline):
 //   rec=1 / rec=0                      start / stop the SD recording (as holding B)
 //   mag=start / done / cancel / clear  magnetometer calibration (as the STATUS page and the serial console)
-//   wifi=clear                         forget the Wi-Fi credentials
+//   wifi=clear                         forget all Wi-Fi networks
+//   ap=0 / ap=1, sta=0 / sta=1         turn the soft AP / the STA off or on from the next boot
 //   reboot=1
 // Unknown commands, and a calibration finish that fails, are refused with ATT error 0x13 (value not allowed);
-// the calibration's result is in the ctrl read (magCalJson) either way.
+// the calibration's result is in the ctrl read (ctrlJson) either way.
 static int onCtrlWrite(const char* cmd) {
   if (strcmp(cmd, "rec=1") == 0) {
     sdlog::requestStart();
@@ -314,8 +456,12 @@ static int onCtrlWrite(const char* cmd) {
   } else if (strcmp(cmd, "mag=clear") == 0) {
     if (!imu::magCalClear()) return BLE_ATT_ERR_UNLIKELY;
   } else if (strcmp(cmd, "wifi=clear") == 0) {
-    clearWifiCredentials();
-    applyWifiConfig();
+    if (wifinets::clear() != wifinets::StoreError::kNone) return BLE_ATT_ERR_UNLIKELY;
+    wifiListChanged();
+  } else if (!strncmp(cmd, "ap=", 3) || !strncmp(cmd, "sta=", 4)) {
+    const char* v = strchr(cmd, '=') + 1;
+    if (strcmp(v, "0") && strcmp(v, "1")) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+    if (!radioSave(cmd[0] == 'a' ? "ap" : "sta", v[0] == '1')) return BLE_ATT_ERR_UNLIKELY;
   } else if (strcmp(cmd, "reboot=1") == 0) {
     rebootSoon();
   } else {
@@ -327,8 +473,8 @@ static int onCtrlWrite(const char* cmd) {
 
 static int onCtrlAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-    char json[256];
-    const size_t n = magCalJson(json, sizeof(json));
+    char json[384];
+    const size_t n = ctrlJson(json, sizeof(json));
     return n && os_mbuf_append(ctxt->om, json, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
   if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
@@ -347,22 +493,28 @@ static int onConfigAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*)
     const size_t n = statusJson(json, sizeof(json));
     return n && os_mbuf_append(ctxt->om, json, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
+  return BLE_ATT_ERR_UNLIKELY;
+}
+
+// wifi characteristic. read: the list JSON (no passwords). write: one wifinets text command; refused with
+// ATT error 0x80 (invalid), 0x81 (8 networks already), 0x82 (no such network to delete).
+static int onWifiAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
+  if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+    static wifinets::Entry list[wifinets::kMax];
+    char json[wifinets::kMax * (33 * 6 + 48) + 16];
+    const size_t n = wifinets::listJson(list, wifinets::load(list), json, sizeof(json));
+    return n && os_mbuf_append(ctxt->om, json, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+  }
   if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-    char buf[32 + 1 + 64 + 1];
+    char buf[352];  // "ssid=...&pass=...&prio=..." with every byte URL-encoded
     uint16_t len = 0;
-    if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf) - 1, &len) != 0) {
-      return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-    }
+    if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf) - 1, &len) != 0) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     buf[len] = '\0';
-    char* tab = strchr(buf, '\t');
-    if (!tab) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
-    *tab = '\0';
-    if (const char* err = saveWifiCredentials(buf, tab + 1)) {
+    bool full = false, notFound = false;
+    if (const char* err = applyWifiText(buf, &full, &notFound)) {
       ESP_LOGW(TAG, "Wi-Fi write over BLE rejected: %s", err);
-      return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+      return full ? 0x81 : notFound ? 0x82 : 0x80;
     }
-    ESP_LOGI(TAG, "Wi-Fi credentials updated over BLE");
-    applyWifiConfig();
     return 0;
   }
   return BLE_ATT_ERR_UNLIKELY;
@@ -373,8 +525,8 @@ static const ble_gatt_chr_def kConfigChrs[] = {
      .access_cb = onConfigAccess,
      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC},
     {.uuid = &kConfigWifi.u,
-     .access_cb = onConfigAccess,
-     .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC},
+     .access_cb = onWifiAccess,
+     .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC},
     {.uuid = &kConfigCtrl.u,
      .access_cb = onCtrlAccess,
      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC},
@@ -510,7 +662,9 @@ static void publishStatus(const record::Record* r) {
   ds.magCalResult = magCalResult;
   ds.magCalResultAtUs = magCalResultAtUs;
   ds.configWindow = configWindowOpen;
-  ds.wifiConfigured = wifiConfigured;
+  ds.wifiConfigured = wifiCount > 0;
+  ds.apOn = radioApOn;
+  ds.staOn = radioStaOn;
   ds.wifiUp = broadcastAddr != 0;
   ds.apClients = apClients;
   ds.udpErrors = udpErrors;
@@ -558,7 +712,9 @@ static void publishStatus(const record::Record* r) {
     esp_netif_ip_info_t ip = {};
     esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip);
     snprintf(copy.ip, sizeof(copy.ip), IPSTR, IP2STR(&ip.ip));
-    snprintf(copy.ssid, sizeof(copy.ssid), "%s", wifiSsid);
+    char target[33];
+    wifiTargetCopy(target);
+    snprintf(copy.ssid, sizeof(copy.ssid), "%s", target);
     snprintf(copy.logName, sizeof(copy.logName), "%s", sdlog::fileName());
     taskENTER_CRITICAL(&lock);
     ds.rssi = copy.rssi;
@@ -633,7 +789,7 @@ static void sendStatus() {
       imuStatus.bmm150 ? "true" : "false", imu::magCalInfo().calibrated ? "true" : "false",
       imuStatus.bmp280 ? "true" : "false",
       static_cast<int>(sdlog::state()), sdlog::fileName(), static_cast<unsigned long>(udpErrors.load()),
-      wifiConfigured ? "true" : "false", rssi, IP2STR(&ip.ip), static_cast<unsigned long>(esp_get_free_heap_size()));
+      wifiCount > 0 ? "true" : "false", rssi, IP2STR(&ip.ip), static_cast<unsigned long>(esp_get_free_heap_size()));
   if (n > 0 && static_cast<size_t>(n) < sizeof(json)) sendUdp(json, n);
   ESP_LOGI(TAG, "%s", json);
 }
@@ -661,8 +817,12 @@ static void watchdogTask(void*) {
 
 // ---------------------------------------------------------------------------
 // Serial console (UART0, the M5Stack's USB port), one command per line:
-//   wifi-set<TAB><ssid><TAB><password>   save credentials to NVS and reconnect
-//   wifi-clear                           erase credentials
+//   wifi-set<TAB><ssid><TAB><password>[<TAB><priority>]   add / update a Wi-Fi network (priority: higher first)
+//   wifi-del<TAB><ssid>                  delete a network
+//   wifi-list                            the networks (JSON, no passwords)
+//   wifi-clear                           delete all networks
+//   radio                                the AP / STA switches (JSON); radio ap=0, radio sta=1, ... to change
+//                                        them (from the next boot), reboot to restart
 //   mag-cal                              start the magnetometer calibration (rotate the unit in every
 //                                        direction), mag-cal-done to finish it
 //   mag-clear                            forget the magnetometer calibration
@@ -673,20 +833,58 @@ static void handleCommand(char* line) {
     char* ssid = line + 9;
     char* tab = strchr(ssid, '\t');
     if (!tab || tab == ssid) {
-      printf("ERR usage: wifi-set<TAB>ssid<TAB>password\n");
+      printf("ERR usage: wifi-set<TAB>ssid<TAB>password[<TAB>priority]\n");
       return;
     }
-    *tab = '\0';
-    if (const char* err = saveWifiCredentials(ssid, tab + 1)) {
-      printf("ERR %s\n", err);
+    // Priority as an optional third field; the rest goes through the "<ssid>\t<password>" format
+    char* prioField = strchr(tab + 1, '\t');
+    int prio = 0;
+    if (prioField) {
+      *prioField = '\0';
+      prio = atoi(prioField + 1);
+    }
+    wifinets::Command cmd;
+    if (wifinets::parse(ssid, cmd) != wifinets::ParseError::kNone) {
+      printf("ERR SSID must be 1-32 bytes, password at most 64\n");
       return;
     }
+    cmd.entry.prio = prio;
+    const wifinets::StoreError err = wifinets::set(cmd.entry);
+    if (err != wifinets::StoreError::kNone) {
+      printf("ERR %s\n", err == wifinets::StoreError::kFull ? "already 8 networks; wifi-del one first" : "NVS write failed");
+      return;
+    }
+    wifiListChanged();
     printf("OK wifi saved\n");
-    applyWifiConfig();
+  } else if (strncmp(line, "wifi-del\t", 9) == 0) {
+    const wifinets::StoreError err = wifinets::remove(line + 9);
+    if (err == wifinets::StoreError::kNone) wifiListChanged();
+    printf("%s\n", err == wifinets::StoreError::kNone       ? "OK wifi deleted"
+                   : err == wifinets::StoreError::kNotFound ? "ERR no such network"
+                                                             : "ERR NVS write failed");
+  } else if (strcmp(line, "wifi-list") == 0) {
+    static wifinets::Entry list[wifinets::kMax];
+    char json[wifinets::kMax * (33 * 6 + 48) + 16];
+    if (wifinets::listJson(list, wifinets::load(list), json, sizeof(json))) printf("%s\n", json);
   } else if (strcmp(line, "wifi-clear") == 0) {
-    clearWifiCredentials();
+    wifinets::clear();
+    wifiListChanged();
     printf("OK wifi cleared\n");
-    applyWifiConfig();
+  } else if (strcmp(line, "radio") == 0) {
+    char json[96];
+    if (radioJson(json, sizeof(json))) printf("%s\n", json);
+  } else if (!strncmp(line, "radio ap=", 9) || !strncmp(line, "radio sta=", 10)) {
+    const char* cmd = line + 6;
+    const char* v = strchr(cmd, '=') + 1;
+    if (strcmp(v, "0") && strcmp(v, "1")) {
+      printf("ERR usage: radio ap=0|1 / radio sta=0|1\n");
+    } else {
+      printf(radioSave(cmd[0] == 'a' ? "ap" : "sta", v[0] == '1') ? "OK saved; takes effect after reboot\n"
+                                                                  : "ERR NVS write failed\n");
+    }
+  } else if (strcmp(line, "reboot") == 0) {
+    printf("OK rebooting\n");
+    rebootSoon();
   } else if (strcmp(line, "mag-cal") == 0) {
     logger::onMagCalStart();
     printf("OK rotate the unit slowly in every direction, then mag-cal-done\n");

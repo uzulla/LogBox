@@ -431,7 +431,11 @@ void drawStatusPage(const Status& s, int64_t now, int rate) {
   row("SD", b, s.rec == 1 ? kGreen : s.rec == 4 ? kRed : s.rec == 3 ? kCyan : kAmber);
 
   // Wi-Fi
-  if (!s.wifiConfigured) {
+  if (!s.staOn) {
+    if (s.apOn) snprintf(b, sizeof(b), "STA OFF  AP %d", s.apClients);
+    else snprintf(b, sizeof(b), "OFF");
+    row("WIFI", b, kDim);
+  } else if (!s.wifiConfigured) {
     snprintf(b, sizeof(b), "NOT SET  AP %d", s.apClients);
     row("WIFI", b, kAmber);
   } else if (!s.wifiUp) {
