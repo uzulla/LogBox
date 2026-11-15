@@ -28,7 +28,8 @@ let marker = null;
 
 // ---- データ ----
 let D = null; // {n, t, speed, ..., posIdx, duration}
-const COLS = ['t_ms', 'utc', 'fix', 'sats', 'lat', 'lon', 'alt_m', 'speed_kmh', 'heading_deg', 'hacc_m', 'acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z', 'batt', 'charging'];
+const COLS = ['t_ms', 'utc', 'fix', 'sats', 'lat', 'lon', 'alt_m', 'speed_kmh', 'heading_deg', 'hacc_m', 'acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z', 'batt', 'charging', 'head_acc_deg'];
+// head_acc_deg(進行方向の精度)は logbo のログだけにある。無い列は NaN になる
 
 function parseCsv(text) {
   const lines = text.split(/\r?\n/);
@@ -180,6 +181,26 @@ function estimateYawSign(d) {
     S += rc * w; cnt++;
   }
   return cnt < 25 ? 0 : (S < 0 ? 1 : -1); // rc ≈ -σ·w
+}
+
+// ---- 車体の向き・スリップアングル(heading.js) ----
+// ジャイロのヨー(上向き軸まわり、静止区間のバイアスを引いたもの)を、GPS の方位変化と比べた符号で「方位の変化(時計回り +)」に直して渡す
+function computeHeading(d) {
+  d.hdg = null;
+  d.hdgWhy = '';
+  if (!d.hasG) { d.hdgWhy = '静止区間が無い(ジャイロの軸が決まらない)'; return; }
+  const sigma = estimateYawSign(d);
+  if (!sigma) { d.hdgWhy = '曲がった区間が足りない(ジャイロの向きが決まらない)'; return; }
+  const rate = Float64Array.from({ length: d.n }, (_, i) => -sigma * yawRate(d, i));
+  const r = Heading.estimate({
+    n: d.n, t: d.t, valid: d.valid, speed_kmh: d.speed_kmh, heading_deg: d.heading_deg,
+    head_acc: d.head_acc_deg.some((v) => isFinite(v)) ? d.head_acc_deg : null, rate, lr: d.hasAxes ? d.lr : null,
+  });
+  if (!r.ok) { d.hdgWhy = '速度があってまっすぐ走った区間が無い'; return; }
+  d.hdg = r;
+  let m = 5;
+  for (let i = 0; i < d.n; i++) if (isFinite(r.slip[i]) && Math.abs(r.slip[i]) > m) m = Math.abs(r.slip[i]);
+  d.slipMax = Math.min(45, m);
 }
 
 function inertialGap(d, a, b, sigma) {
@@ -466,6 +487,7 @@ function build(rows, name) {
   const firstHd = d.hd.find((v) => isFinite(v)) ?? 0;
   for (let i = 0; i < n && !isFinite(d.hd[i]); i++) d.hd[i] = firstHd;
   computeG(d);
+  computeHeading(d); // 停止の判定(applyStill)で速度を 0 にする前の値で推定する
   computeStill(d);
   applyStill(d, stillOn);
   analyzeGaps(d);
@@ -769,10 +791,15 @@ function drawTrack() {
   if (marker) { map.removeLayer(marker); marker = null; }
   if (!D.nvalid) { $('notice').textContent = '位置(3D FIX)が取れていないログです。地図は表示できません'; return; }
   drawPath();
+  // 車体(オレンジの箱 + 前へ伸ばした黄色の線、推定できたときだけ)と進行方向(緑の線)。
+  // 線を長く伸ばして、2 本の開き(= スリップアングル)が見えるようにする。方位が無いログは、向きを持たない丸で出す
+  const car = D.hdg ? '<svg class="arrow car" viewBox="-60 -60 120 120"><path d="M0-12 L0-58" stroke="#ffd400" stroke-width="1" stroke-linecap="round"/>' +
+    '<path d="M0-13 L6-7 L6 12 L-6 12 L-6-7 Z" fill="rgba(255,150,40,.9)" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/></svg>' : '';
+  const course = D.hasHd ? '<path d="M0 0 L0-58" stroke="#32e678" stroke-width="1" stroke-linecap="round"/><circle r="3" fill="#32e678"/>'
+    : '<circle r="7" fill="#00cdff" stroke="#fff" stroke-width="2"/>';
   const icon = L.divIcon({
-    className: '', iconSize: [28, 28], iconAnchor: [14, 14],
-    // 方位が無いログは、向きを持たない丸で出す
-    html: `<svg class="arrow" viewBox="-14 -14 28 28">${D.hasHd ? '<path d="M0-11 L8 9 L0 5 L-8 9 Z"' : '<circle r="7"'} fill="#00cdff" stroke="#fff" stroke-width="2" stroke-linejoin="round"/></svg>`,
+    className: '', iconSize: [120, 120], iconAnchor: [60, 60],
+    html: `<div class="arrows">${car}<svg class="arrow course" viewBox="-60 -60 120 120">${course}</svg></div>`,
   });
   marker = L.marker([D.lat[D.firstValid], D.lon[D.firstValid]], { icon, interactive: false, keyboard: false, zIndexOffset: 1000 }).addTo(map);
   fitTrack();
@@ -781,7 +808,7 @@ function drawTrack() {
 function clearView() {
   trackLayer.clearLayers(); lapLayer.clearLayers();
   if (marker) { map.removeLayer(marker); marker = null; }
-  for (const id of ['delta', 'g', 'acc', 'hdg', 'alt', 'gps', 'hacc', 'yaw', 'batt', 'clock']) $(id).textContent = '--';
+  for (const id of ['delta', 'g', 'acc', 'hdg', 'alt', 'gps', 'hacc', 'yaw', 'batt', 'clock', 'body', 'slip', 'crate']) $(id).textContent = '--';
   $('speed').firstChild.nodeValue = '--';
   $('gbar').style.width = '0';
   $('dist').textContent = '--'; $('fblr').textContent = '--'; $('gapinfo').textContent = '--'; $('stillinfo').textContent = '--';
@@ -816,6 +843,7 @@ function jst(utc) {
 function upperBound(arr, x) { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] <= x) lo = m + 1; else hi = m; } return lo; }
 
 let arrowRot = 0; // 矢印の累積角度(北をまたいでも逆回りに一周しないよう、差を ±180° に畳んで足す)
+let bodyRot = 0;  // 車体の向き(同上)
 function show(T) {
   if (!D) return;
   syncCurLap(T);
@@ -837,7 +865,18 @@ function show(T) {
   const sats = Number.isFinite(D.sats[i]) ? D.sats[i] : '--';
   $('gps').textContent = fix3 ? `3D FIX ${sats} 衛星` : D.fix[i] === 2 ? `2D FIX ${sats} 衛星` : 'FIX なし';
   $('hacc').textContent = fix3 ? fnum(D.hacc_m[i], 1, ' m') : '--';
-  $('yaw').textContent = fnum(D.gyro_z[i], 1, ' °/s');
+  // ヨーレート: 車体の向きが推定できたら、その変化(バイアス補正済み、時計回り = 右 +)。できなければ生の gyro_z
+  const H = D.hdg;
+  $('yaw').textContent = H ? fnum(H.bodyRate[i], 1, ' °/s') : fnum(D.gyro_z[i], 1, ' °/s(生)');
+  $('crate').textContent = H ? fnum(H.courseRate[i], 1, ' °/s') : '--';
+  $('body').textContent = H && isFinite(H.body[i]) ? `${Math.round(H.body[i])}°` : '--';
+  if (H && isFinite(H.slip[i])) {
+    const sl = H.slip[i], cr = H.courseRate[i];
+    // コーナー中(進行方向が 3°/s 以上変化)は、車体がコーナーの内側 / 外側どちらを向いているかも出す
+    const side = isFinite(cr) && Math.abs(cr) >= 3 ? (Math.sign(sl) === Math.sign(cr) ? ' 内向き' : ' 外向き') : '';
+    $('slip').textContent = `${sl >= 0 ? '右' : '左'} ${Math.abs(sl).toFixed(1)}°${side}`;
+  } else $('slip').textContent = '--';
+  $('slip').title = H ? '' : D.hdgWhy;
   const braw = D.battRaw[i];
   $('batt').textContent = braw === '' || !isFinite(+braw) ? '--' : braw.includes('.') ? `${(+braw).toFixed(1)} V` : `${braw} %` + (D.charging[i] ? ' 充電中' : '');
   const heading = D.hd[i];
@@ -847,9 +886,16 @@ function show(T) {
   if (marker && pi >= 0) {
     const ll = [D.lat[pi], D.lon[pi]];
     marker.setLatLng(ll);
-    const el = marker.getElement()?.firstChild;
+    const el = marker.getElement();
     arrowRot += ((heading - arrowRot) % 360 + 540) % 360 - 180;
-    if (el) el.style.transform = `rotate(${arrowRot}deg)`;
+    const course = el?.querySelector('.course');
+    if (course) course.style.transform = `rotate(${arrowRot}deg)`;
+    const car = el?.querySelector('.car');
+    if (car) {
+      const b = D.hdg ? D.hdg.body[i] : NaN;
+      car.style.display = isFinite(b) ? '' : 'none';
+      if (isFinite(b)) { bodyRot += ((b - bodyRot) % 360 + 540) % 360 - 180; car.style.transform = `rotate(${bodyRot}deg)`; }
+    }
     if ($('follow').checked && !map.getBounds().pad(-0.3).contains(ll)) map.panTo(ll, { animate: false });
   }
   drawCursor(T);
@@ -922,7 +968,8 @@ function layoutChart() {
   const padL = 40, padR = 8, sw = w - padL - padR, span = Math.max(1e-6, R.t1 - R.t0);
   const xOf = (t) => padL + ((t - R.t0) / span) * sw;
   const delta = circuitOn ? ensureDelta() : null;
-  const np = delta ? 3 : 2, ph = h / np;
+  const slipRow = delta ? 3 : 2;
+  const np = slipRow + (D.hdg ? 1 : 0), ph = h / np;
   const yTop = (k) => k * ph + 4, yBot = (k) => (k + 1) * ph - 4;
   const i0 = Math.max(0, upperBound(D.t, R.t0) - 1), i1 = Math.min(D.n, upperBound(D.t, R.t1) + 1);
   const stepV = Math.max(1, Math.floor((i1 - i0) / (w * 2)));
@@ -972,6 +1019,22 @@ function layoutChart() {
       if (px !== null) { c.strokeStyle = v >= 0 ? '#ff7a7a' : '#5ee08a'; c.beginPath(); c.moveTo(px, py); c.lineTo(x, y); c.stroke(); }
       px = x; py = y;
     }
+  }
+  if (D.hdg) { // スリップアングル(車体 − 進行方向)。上 = 車体が右を向く、下 = 左
+    const y0 = yTop(slipRow), y1 = yBot(slipRow), ym = (y0 + y1) / 2, sc = Math.ceil(D.slipMax / 5) * 5, half = (y1 - y0) / 2;
+    frame(y0, y1, 'β', `右${sc}°`, `左${sc}°`);
+    c.strokeStyle = '#4a526e'; c.lineWidth = 1; c.beginPath(); c.moveTo(padL, ym); c.lineTo(w - padR, ym); c.stroke();
+    c.strokeStyle = '#ff9628'; c.lineWidth = 1.5; c.beginPath();
+    let started = false;
+    for (let i = i0; i < i1; i += stepV) {
+      let lo = Infinity, hi = -Infinity; // 間引いても短いピークを残す
+      for (let j = i; j < Math.min(i1, i + stepV); j++) { const v = D.hdg.slip[j]; if (isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; } }
+      if (lo === Infinity) { started = false; continue; }
+      const x = xOf(D.t[i]), yOf = (v) => ym - Math.max(-1, Math.min(1, v / sc)) * half;
+      if (!started) { c.moveTo(x, yOf(lo)); started = true; } else c.lineTo(x, yOf(lo));
+      if (hi !== lo) c.lineTo(x, yOf(hi));
+    }
+    c.stroke();
   }
   if (R.t0 < V.c0 || R.t1 > V.c1) { // 範囲外(グレーアウト)の背景
     c.fillStyle = 'rgba(133,145,176,.12)';
@@ -1080,6 +1143,9 @@ function load(text, name) {
   $('meta').textContent = `${name}  ${D.n} 行 / ${fmtT(D.duration)} / 最高 ${Math.round(D.vmax)} km/h / ${fmtKm(D.distance)}` + (skipped ? ` / 位置なし ${skipped} 行` : '');
   if (!D.hasG) $('notice').textContent = '静止区間が無いため、G は表示しません';
   else if (!D.hasAxes) $('notice').textContent = '直進での加減速が足りないため、前後 / 左右には分けません(合成 G のみ)';
+  const hn = !D.hdg ? `車体の向き・スリップアングルは出せません: ${D.hdgWhy}`
+    : D.hdg.breaks.length ? `機器が車内で動いたとみなした箇所が ${D.hdg.breaks.length} つあります(その前後はスリップアングルを出しません)` : '';
+  if (hn) $('notice').textContent = ($('notice').textContent ? $('notice').textContent + ' / ' : '') + hn;
   $('vmax').textContent = `${Math.round(D.vmax)} km/h`;
   updateGapInfo();
   updateStillInfo();
@@ -1087,6 +1153,7 @@ function load(text, name) {
   updateView();
   CZ = null;
   arrowRot = D.hd[0];
+  bodyRot = arrowRot;
   T = circuitOn && D.lap ? V.c0 : V.t0; // サーキットモードは現在のラップしか描かないので、最初のラップの頭から始める
   curLap = circuitOn && D.lap ? lapIndexAt(T) : -1;
   drawTrack();
