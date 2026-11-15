@@ -227,6 +227,7 @@ void test_nmea_detector() {
 
 void runRecordTests();
 void runMagCalTests();
+void runCarframeTests();
 
 int main() {
   UNITY_BEGIN();
@@ -241,5 +242,6 @@ int main() {
   RUN_TEST(test_nmea_detector);
   runRecordTests();
   runMagCalTests();
+  runCarframeTests();
   return UNITY_END();
 }

@@ -15,21 +15,22 @@ type xyz struct{ X, Y, Z float64 }
 type message struct {
 	Type string `json:"type"`
 
-	// type=sample
-	Seq      uint32   `json:"seq"`
-	GNSS     bool     `json:"gnss"`
-	Time     *string  `json:"time"`
-	Fix      int      `json:"fix"`
-	FixOK    bool     `json:"fix_ok"`
-	Sats     int      `json:"sats"`
-	Lat      float64  `json:"lat"`
-	Lon      float64  `json:"lon"`
-	HAcc     float64  `json:"h_acc_m"`
-	SpeedMps float64  `json:"speed_mps"`
-	Heading  float64  `json:"heading_deg"`
-	G        *xyz     `json:"g"`
-	Gyro     *xyz     `json:"gyro_dps"`
-	PressHPa *float64 `json:"press_hpa"`
+	// type=racebox (the esp32-racebox-bridge format; logbo adds gnss, g_sensor, ...)
+	Seq      uint32          `json:"seq"`
+	Device   string          `json:"device"`
+	GNSS     json.RawMessage `json:"gnss"` // bool in racebox, an object in status
+	Time     *string         `json:"time"`
+	Fix      int             `json:"fix"`
+	FixOK    bool            `json:"fix_ok"`
+	Sats     int             `json:"sats"`
+	Lat      float64         `json:"lat"`
+	Lon      float64         `json:"lon"`
+	HAcc     float64         `json:"h_acc_m"`
+	SpeedMps float64         `json:"speed_mps"`
+	Heading  float64         `json:"heading_deg"`
+	G        *xyz            `json:"g"`
+	Gyro     *xyz            `json:"gyro_dps"`
+	PressHPa *float64        `json:"press_hpa"`
 
 	// type=status
 	Records  uint32 `json:"records"`
@@ -79,7 +80,7 @@ func main() {
 			continue
 		}
 		switch m.Type {
-		case "sample":
+		case "racebox":
 			if haveSeq && m.Seq != lastSeq+1 && m.Seq != 0 {
 				log.Printf("lost %d datagram(s) (seq %d -> %d)", m.Seq-lastSeq-1, lastSeq, m.Seq)
 			}
@@ -99,8 +100,8 @@ func main() {
 			if m.PressHPa != nil {
 				p = fmt.Sprintf("%.2fhPa", *m.PressHPa)
 			}
-			fmt.Printf("%s #%d %s gnss=%v fix=%d ok=%v sats=%d lat=%.7f lon=%.7f hacc=%.2fm speed=%.2fkm/h hdg=%.1f g=(%.2f,%.2f,%.2f) gyro=(%.1f,%.1f,%.1f) %s\n",
-				now, m.Seq, t, m.GNSS, m.Fix, m.FixOK, m.Sats, m.Lat, m.Lon, m.HAcc,
+			fmt.Printf("%s %s #%d %s gnss=%s fix=%d ok=%v sats=%d lat=%.7f lon=%.7f hacc=%.2fm speed=%.2fkm/h hdg=%.1f g=(%.2f,%.2f,%.2f) gyro=(%.1f,%.1f,%.1f) %s\n",
+				now, m.Device, m.Seq, t, m.GNSS, m.Fix, m.FixOK, m.Sats, m.Lat, m.Lon, m.HAcc,
 				m.SpeedMps*3.6, m.Heading, g.X, g.Y, g.Z, gy.X, gy.Y, gy.Z, p)
 		case "status":
 			var st statusGNSS

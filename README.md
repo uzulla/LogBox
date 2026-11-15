@@ -139,20 +139,35 @@ UDP port 5005 (`CONFIG_LOGBO_UDP_PORT`), one JSON object per datagram, sent to t
 `MSG_DONTWAIT` (a datagram that can't go out immediately is dropped). Datagrams are never fragmented: the widest
 record is checked by a unit test to fit 1000 bytes. Lost datagrams are not retransmitted.
 
-`type: "sample"`: one per record (25/s).
+`type: "racebox"`: one per record (25/s), in the format of
+[esp32-racebox-bridge](https://github.com/uzulla/esp32-racebox-bridge) (same members, units and axes), so receivers
+written for it work unchanged, e.g. lapcam's `osd-feed` (G ball, track map, speed: it matches `"type":"racebox"`).
+logbo's extras follow `gyro_dps`.
 
 ```json
-{"type":"sample","seq":7,"gnss":true,"itow":118286240,"time":"2026-11-15T05:06:06.999000Z","time_acc_ns":25,
- "fix":3,"fix_ok":true,"sats":14,"lat":35.6812360,"lon":139.7671250,
+{"type":"racebox","seq":7,"device":"logbo-06FA","itow":118286240,
+ "time":"2026-11-15T05:06:07.123456789Z","time_valid":true,"time_confirmed":true,"time_acc_ns":25,
+ "fix":3,"fix_ok":true,"sats":14,"lat":35.6812360,"lon":139.7671250,"latlon_valid":true,
  "alt_wgs_m":79.761,"alt_msl_m":40.500,"h_acc_m":1.200,"v_acc_m":1.836,
- "speed_mps":27.778,"speed_acc_mps":0.208,"vel_ned_mps":{"n":0.000,"e":27.778,"d":0.000},
- "heading_deg":90.00000,"heading_acc_deg":0.50000,"heading_valid":true,"pdop":1.20,
- "g":{"x":0.100,"y":-0.250,"z":0.980},"gyro_dps":{"x":1.50,"y":-2.00,"z":30.25},
+ "speed_mps":27.778,"speed_acc_mps":0.208,"heading_deg":90.00000,"heading_acc_deg":0.50000,"heading_valid":true,
+ "pdop":1.20,"battery":null,
+ "g":{"x":-0.300,"y":0.250,"z":0.980},"gyro_dps":{"x":1.00,"y":2.00,"z":-15.50},
+ "gnss":true,"vel_ned_mps":{"n":0.000,"e":27.778,"d":0.000},
+ "g_sensor":{"x":0.100,"y":-0.250,"z":0.980},"gyro_sensor":{"x":1.50,"y":-2.00,"z":30.25},
  "mag_ut":{"x":20.0,"y":-5.0,"z":40.0},"mag_cal":true,"press_hpa":1013.25,"temp_c":21.50}
 ```
 
-- `gnss` is false for IMU-only records (receiver silent); `time` is `null` unless date, time and "fully resolved" are valid.
-- `heading_valid`: fix OK and moving faster than 0.5 m/s. `g` / `gyro_dps` / `mag_ut` / `press_hpa` are `null` when the sensor is missing.
+- `g` / `gyro_dps` are in the car's axes like a RaceBox: x forward, y left, z up (gravity included, so ~1 on z at
+  rest; yaw counter-clockwise +). Up is the gravity learnt while standing still (GNSS < 1 km/h, or the IMU calm
+  without a fix, for ~1 s), right is the screen's right edge (mount the unit with the screen facing the driver, upright
+  or tilted). Both are `null` until the unit has stood still once (`components/carframe`; the screen's G circle uses the
+  same). lapcam's `osd-feed` with `invert_lateral: true` (its default card config, set for the RaceBox Mini) shows the
+  ball the right way round.
+- `g_sensor` / `gyro_sensor`: the raw BMI270 axes (what the CSV logs).
+- `gnss` is false for IMU-only records (receiver silent); `time` is `null` unless date, time and "fully resolved" are
+  valid (nanoseconds, as the bridge); `time_confirmed`: the receiver also confirmed date and time.
+- `heading_valid`: fix OK and moving faster than 0.5 m/s. `battery` is always `null` (not measured).
+  `g_sensor` / `mag_ut` / `press_hpa` are `null` when the sensor is missing.
 - `seq` increments per datagram and restarts from 0 on reboot; gaps mean lost datagrams.
 
 `type: "status"`: once per second (GNSS link counters, sensors, SD state, Wi-Fi RSSI, free heap).

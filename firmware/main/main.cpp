@@ -33,6 +33,7 @@
 #include "nvs_flash.h"
 #include "ap_credentials.h"  // generated per build, see CMakeLists.txt
 #include "gnss.h"
+#include "carframe.h"
 #include "imu.h"
 #include "logger_status.h"
 #include "record.h"
@@ -61,6 +62,7 @@ static std::atomic<int> apClients{0};
 static std::atomic<uint32_t> udpErrors{0};
 static bool wifiConfigured = false;
 static char wifiSsid[33];  // configured SSID, "" if none
+static char deviceName[16];  // "logbo-XXXX" (BLE name, UDP "device")
 
 static imu::Status imuStatus;
 static std::atomic<uint32_t> records{0};
@@ -349,11 +351,7 @@ static int onConfigGapEvent(ble_gap_event* ev, void*) {
 static void onBleSync() {
   ESP_ERROR_CHECK(ble_hs_util_ensure_addr(0));
   ESP_ERROR_CHECK(ble_hs_id_infer_auto(0, &ownAddrType));
-  uint8_t mac[6];
-  esp_read_mac(mac, ESP_MAC_BT);
-  char name[32];
-  snprintf(name, sizeof(name), "logbo-%02X%02X", mac[4], mac[5]);
-  ble_svc_gap_device_name_set(name);
+  ble_svc_gap_device_name_set(deviceName);
   startConfigAdvertising();
 }
 
@@ -445,6 +443,8 @@ static void publishStatus(const record::Record* r) {
       ds.gx = s.gx, ds.gy = s.gy, ds.gz = s.gz;
     }
     if (s.magValid) ds.mx = s.mx, ds.my = s.my, ds.mz = s.mz;
+    ds.carValid = r->carValid;
+    if (r->carValid) for (int k = 0; k < 3; k++) ds.carG[k] = r->carG[k];
     if (s.baroValid) ds.pressureHpa = s.pressureHpa, ds.tempC = s.tempC;
   }
   logger::Status copy = ds;
@@ -479,13 +479,25 @@ static void emitRecord(const gnss::Pvt* pvt) {
   r.hasPvt = pvt != nullptr;
   if (pvt) r.pvt = *pvt;
   imu::takeAverage(r.imu);
+  // Car axes (gravity learnt while standing still): for the UDP "g" / "gyro_dps" and the display's G circle
+  static carframe::Estimator car;
+  if (r.imu.n) {
+    const float a[3] = {r.imu.ax, r.imu.ay, r.imu.az}, g[3] = {r.imu.gx, r.imu.gy, r.imu.gz};
+    const int gnssStill = pvt && pvt->fixOk() ? (pvt->gSpeed < 278 ? 1 : 0) : -1;  // 278 mm/s = 1 km/h
+    car.update(a, g, gnssStill);
+    r.carValid = car.ready();
+    if (r.carValid) {
+      car.toCar(a, r.carG);
+      car.toCar(g, r.carGyro);
+    }
+  }
   static uint32_t seq = 0;
   records++;
   sdlog::write(r);
   publishStatus(&r);
 
   static char json[record::kMaxUdpPayload + 1];
-  const size_t n = record::toJson(r, seq++, json, sizeof(json));
+  const size_t n = record::toJson(r, seq++, deviceName, json, sizeof(json));
   if (n) sendUdp(json, n);
   xSemaphoreGive(recordMutex);
 }
@@ -629,6 +641,9 @@ extern "C" void app_main() {
   gpio_set_level(kSpeaker, 0);
   gpio_set_direction(kLcdCs, GPIO_MODE_OUTPUT);
   gpio_set_level(kLcdCs, 1);
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_BT);
+  snprintf(deviceName, sizeof(deviceName), "logbo-%02X%02X", mac[4], mac[5]);
 
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {

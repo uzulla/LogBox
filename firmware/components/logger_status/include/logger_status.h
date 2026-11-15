@@ -42,6 +42,8 @@ struct Status {
   float ax, ay, az;      // G, BMI270 axes, mean over the epoch
   float gx, gy, gz;      // deg/s
   float mx, my, mz;      // uT (calibrated when magCalibrated)
+  bool carValid;         // carG is known (gravity learnt while standing still)
+  float carG[3];         // G in the car's axes: x forward, y left, z up (see carframe.h)
 
   // Magnetometer calibration
   bool magCalibrated;

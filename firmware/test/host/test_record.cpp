@@ -99,10 +99,30 @@ void test_csv_row_without_gnss_and_sensors() {
 
 void test_json_fits_and_fields() {
   char buf[record::kMaxUdpPayload + 1];
-  const size_t n = record::toJson(sample(), 7, buf, sizeof(buf));
+  record::Record r = sample();
+  r.carValid = true;
+  r.carG[0] = -0.3f, r.carG[1] = 0.25f, r.carG[2] = 0.98f;
+  r.carGyro[0] = 1, r.carGyro[1] = 2, r.carGyro[2] = -15.5f;
+  r.pvt.flags2 = 0xE0, r.pvt.nano = 123'456'789;
+  const size_t n = record::toJson(r, 7, "logbo-06FA", buf, sizeof(buf));
   TEST_ASSERT_GREATER_THAN(0, n);
-  TEST_ASSERT_TRUE(strstr(buf, "\"type\":\"sample\",\"seq\":7,\"gnss\":true") != nullptr);
-  TEST_ASSERT_TRUE(strstr(buf, "\"time\":\"2026-11-15T05:06:06.999000Z\"") != nullptr);
+  // Same leading members as esp32-racebox-bridge, so lapcam's osd-feed (match type=racebox, g_x / g_y,
+  // speed_mps, lat / lon / latlon_valid) and other receivers written for it work unchanged.
+  TEST_ASSERT_TRUE(strstr(buf, "{\"type\":\"racebox\",\"seq\":7,\"device\":\"logbo-06FA\",\"itow\":") == buf);
+  TEST_ASSERT_TRUE(strstr(buf, "\"time\":\"2026-11-15T05:06:07.123456789Z\",\"time_valid\":true,\"time_confirmed\":true") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"lat\":35.6812360,\"lon\":139.7671250,\"latlon_valid\":true") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"speed_mps\":27.778,") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"g\":{\"x\":-0.300,\"y\":0.250,\"z\":0.980},\"gyro_dps\":{\"x\":1.00,\"y\":2.00,\"z\":-15.50}") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"gnss\":true,\"vel_ned_mps\":{") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"g_sensor\":{\"x\":0.100,") != nullptr);
+  // Car axes unknown yet: null (osd-feed hides the ball)
+  r.carValid = false;
+  TEST_ASSERT_GREATER_THAN(0, record::toJson(r, 7, "logbo-06FA", buf, sizeof(buf)));
+  TEST_ASSERT_TRUE(strstr(buf, "\"g\":null,\"gyro_dps\":null") != nullptr);
+  // Negative nano rolls the second back
+  r = sample();
+  TEST_ASSERT_GREATER_THAN(0, record::toJson(r, 7, "x", buf, sizeof(buf)));
+  TEST_ASSERT_TRUE(strstr(buf, "\"time\":\"2026-11-15T05:06:06.999000000Z\"") != nullptr);
   TEST_ASSERT_TRUE(strstr(buf, "\"press_hpa\":1013.25") != nullptr);
   TEST_ASSERT_TRUE(strstr(buf, "\"mag_cal\":true") != nullptr);
   // Widest values still fit one datagram.
@@ -115,7 +135,13 @@ void test_json_fits_and_fields() {
   w.imu.ax = w.imu.ay = w.imu.az = -16.0f;
   w.imu.gx = w.imu.gy = w.imu.gz = -2000.0f;
   w.imu.mx = w.imu.my = w.imu.mz = -2500.0f;
-  TEST_ASSERT_GREATER_THAN(0, record::toJson(w, 4'000'000'000u, buf, sizeof(buf)));
+  w.carValid = true;
+  for (int k = 0; k < 3; k++) w.carG[k] = -16.0f, w.carGyro[k] = -2000.0f;
+  w.pvt.pDOP = 65535, w.pvt.fixType = 255, w.pvt.numSV = 255, w.pvt.tAcc = 4'000'000'000u;
+  w.imu.baroValid = true, w.imu.pressureHpa = -1000.0f, w.imu.tempC = -100.0f;
+  const size_t wn = record::toJson(w, 4'000'000'000u, "logbo-FFFF", buf, sizeof(buf));
+  printf("widest JSON: %zu bytes\n", wn);
+  TEST_ASSERT_GREATER_THAN(0, wn);
 }
 
 void runRecordTests() {

@@ -115,43 +115,65 @@ void jsonEscape(const char* s, char* out, size_t size) {
   if (size) out[o] = '\0';
 }
 
-size_t toJson(const Record& r, uint32_t seq, char* buf, size_t size) {
+// "2022-01-10T08:51:08.239971626Z" (nanoseconds, as esp32-racebox-bridge) from the PVT date / time / nano.
+static void formatPvtTime(const gnss::Pvt& p, char* out, size_t size) {
+  int64_t secs = daysFromCivil(p.year, p.month, p.day) * 86400 + p.hour * 3600 + p.min * 60 + p.sec;
+  int64_t nano = p.nano;
+  if (nano < 0) {
+    nano += 1000000000;
+    secs -= 1;
+  }
+  char head[32];
+  formatUtc(secs * 1000000, 6, head, sizeof(head));  // "....T..:..:..." + ".000000Z"
+  head[19] = '\0';                                     // keep "YYYY-MM-DDTHH:MM:SS"
+  snprintf(out, size, "\"%s.%09ldZ\"", head, static_cast<long>(nano));
+}
+
+size_t toJson(const Record& r, uint32_t seq, const char* device, char* buf, size_t size) {
   const gnss::Pvt& p = r.pvt;
   const imu::Sample& s = r.imu;
-  char time[40] = "null";
-  if (r.hasPvt && p.dateTimeValid()) {
-    char utc[32];
-    formatUtc(unixMicros(p), 6, utc, sizeof(utc));
-    snprintf(time, sizeof(time), "\"%s\"", utc);
+  const char* t = "true";
+  const char* f = "false";
+  const bool timeOk = r.hasPvt && p.dateTimeValid();
+  char time[48] = "null";
+  if (timeOk) formatPvtTime(p, time, sizeof(time));
+  char dev[64];
+  jsonEscape(device ? device : "", dev, sizeof(dev));
+  char car[128] = "\"g\":null,\"gyro_dps\":null";
+  if (r.carValid) {
+    snprintf(car, sizeof(car), "\"g\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},\"gyro_dps\":{\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}",
+             r.carG[0], r.carG[1], r.carG[2], r.carGyro[0], r.carGyro[1], r.carGyro[2]);
   }
-  char imuJson[160] = "\"g\":null,\"gyro_dps\":null";
+  char raw[128] = "\"g_sensor\":null,\"gyro_sensor\":null";
   if (s.n) {
-    snprintf(imuJson, sizeof(imuJson),
-             "\"g\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},\"gyro_dps\":{\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}", s.ax, s.ay,
-             s.az, s.gx, s.gy, s.gz);
+    snprintf(raw, sizeof(raw),
+             "\"g_sensor\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},\"gyro_sensor\":{\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}", s.ax,
+             s.ay, s.az, s.gx, s.gy, s.gz);
   }
-  char mag[80] = "null";
+  char mag[64] = "null";
   if (s.magValid) snprintf(mag, sizeof(mag), "{\"x\":%.1f,\"y\":%.1f,\"z\":%.1f}", s.mx, s.my, s.mz);
   char press[16] = "null", temp[16] = "null";
   if (s.baroValid) {
     snprintf(press, sizeof(press), "%.2f", s.pressureHpa);
     snprintf(temp, sizeof(temp), "%.2f", s.tempC);
   }
-  const char* t = "true";
-  const char* f = "false";
   const int n = snprintf(
       buf, size,
-      "{\"type\":\"sample\",\"seq\":%lu,\"gnss\":%s,\"itow\":%lu,\"time\":%s,\"time_acc_ns\":%lu,"
-      "\"fix\":%u,\"fix_ok\":%s,\"sats\":%u,\"lat\":%.7f,\"lon\":%.7f,"
+      "{\"type\":\"racebox\",\"seq\":%lu,\"device\":\"%s\","
+      "\"itow\":%lu,\"time\":%s,\"time_valid\":%s,\"time_confirmed\":%s,\"time_acc_ns\":%lu,"
+      "\"fix\":%u,\"fix_ok\":%s,\"sats\":%u,"
+      "\"lat\":%.7f,\"lon\":%.7f,\"latlon_valid\":%s,"
       "\"alt_wgs_m\":%.3f,\"alt_msl_m\":%.3f,\"h_acc_m\":%.3f,\"v_acc_m\":%.3f,"
-      "\"speed_mps\":%.3f,\"speed_acc_mps\":%.3f,\"vel_ned_mps\":{\"n\":%.3f,\"e\":%.3f,\"d\":%.3f},"
-      "\"heading_deg\":%.5f,\"heading_acc_deg\":%.5f,\"heading_valid\":%s,\"pdop\":%.2f,"
-      "%s,\"mag_ut\":%s,\"mag_cal\":%s,\"press_hpa\":%s,\"temp_c\":%s}",
-      static_cast<unsigned long>(seq), r.hasPvt ? t : f, static_cast<unsigned long>(p.iTOW), time,
-      static_cast<unsigned long>(p.tAcc), p.fixType, p.fixOk() ? t : f, p.numSV, p.lat / 1e7, p.lon / 1e7,
-      p.height / 1e3, p.hMSL / 1e3, p.hAcc / 1e3, p.vAcc / 1e3, p.gSpeed / 1e3, p.sAcc / 1e3, p.velN / 1e3,
-      p.velE / 1e3, p.velD / 1e3, p.headMot / 1e5, p.headAcc / 1e5, p.headingValid() ? t : f, p.pDOP / 100.0,
-      imuJson, mag, s.magValid && s.magCal ? t : f, press, temp);
+      "\"speed_mps\":%.3f,\"speed_acc_mps\":%.3f,"
+      "\"heading_deg\":%.5f,\"heading_acc_deg\":%.5f,\"heading_valid\":%s,"
+      "\"pdop\":%.2f,\"battery\":null,%s,"
+      "\"gnss\":%s,\"vel_ned_mps\":{\"n\":%.3f,\"e\":%.3f,\"d\":%.3f},%s,\"mag_ut\":%s,\"mag_cal\":%s,\"press_hpa\":%s,\"temp_c\":%s}",
+      static_cast<unsigned long>(seq), dev, static_cast<unsigned long>(p.iTOW), time, timeOk ? t : f,
+      timeOk && (p.flags2 & 0xC0) == 0xC0 ? t : f, static_cast<unsigned long>(p.tAcc), p.fixType, p.fixOk() ? t : f,
+      p.numSV, p.lat / 1e7, p.lon / 1e7, r.hasPvt && !(p.flags3 & 0x01) && p.fixType >= 2 ? t : f, p.height / 1e3,
+      p.hMSL / 1e3, p.hAcc / 1e3, p.vAcc / 1e3, p.gSpeed / 1e3, p.sAcc / 1e3, p.headMot / 1e5, p.headAcc / 1e5,
+      p.headingValid() ? t : f, p.pDOP / 100.0, car, r.hasPvt ? t : f, p.velN / 1e3, p.velE / 1e3, p.velD / 1e3, raw, mag, s.magValid && s.magCal ? t : f,
+      press, temp);
   return n > 0 && static_cast<size_t>(n) < size ? static_cast<size_t>(n) : 0;
 }
 

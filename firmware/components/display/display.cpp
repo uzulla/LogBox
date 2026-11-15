@@ -154,18 +154,10 @@ constexpr uint32_t kMagAutoFinishSamples = 375;  // 15 s at 25 Hz: finish by its
 
 int kmh10(int32_t mms) { return static_cast<int>(static_cast<int64_t>(mms) * 36 / 1000); }
 
-// Dynamic acceleration: the measured acceleration minus the gravity vector measured while standing still
-// (so it reads 0 at rest), split into the horizontal plane: lateral along the screen's left-right axis
-// and longitudinal perpendicular to it. "Still" is judged from the GNSS speed with a fix, otherwise from
-// the IMU alone (no rotation, steady acceleration for ~1 s).
-//
-// Screen axes in BMI270 axes, checked on the board: +Y points to the top of the screen, -Z out of the screen
-// (towards the viewer) and -X to the right (tilting the screen to the right makes acc_x positive).
-constexpr float kScreenRight[3] = {-1, 0, 0};
-
+// G circle: the car-axis G from the logger (carframe: gravity learnt while standing still, lateral along the
+// screen's left-right axis), shown as the G the driver feels.
 struct GState {
   bool haveRef = false;
-  float ref[3] = {};
   float lat = 0, lon = 0, total = 0;  // G
   static constexpr int kTrail = 50;   // 2 s at 25 Hz
   float trail[kTrail][2] = {};
@@ -175,34 +167,13 @@ struct GState {
 GState gv;  // display task's copy of gs
 
 void updateG(const Status& s) {
-  static float prev[3];
-  static int still = 0;
-  const float a[3] = {s.ax, s.ay, s.az};
-  float jerk = 0;
-  for (int i = 0; i < 3; i++) jerk = fmaxf(jerk, fabsf(a[i] - prev[i])), prev[i] = a[i];
-  const float rot = fmaxf(fabsf(s.gx), fmaxf(fabsf(s.gy), fabsf(s.gz)));
-  const bool calm = rot < 5 && (s.fixOk ? kmh10(s.speedMms) < 10 : jerk < 0.03f);
-  still = calm ? std::min(still + 1, 1000) : 0;
-  if (still >= 25) {
-    for (int i = 0; i < 3; i++) gs.ref[i] = gs.haveRef ? gs.ref[i] + (a[i] - gs.ref[i]) * 0.05f : a[i];
-    gs.haveRef = true;
-  }
-  if (!gs.haveRef) return;
-  const float n = sqrtf(gs.ref[0] * gs.ref[0] + gs.ref[1] * gs.ref[1] + gs.ref[2] * gs.ref[2]);
-  if (n < 0.5f) return;
-  const float up[3] = {gs.ref[0] / n, gs.ref[1] / n, gs.ref[2] / n};
-  // Lateral axis: screen-right projected onto the horizontal plane. Forward = up x right.
-  const float k = kScreenRight[0] * up[0] + kScreenRight[1] * up[1] + kScreenRight[2] * up[2];
-  float r[3] = {kScreenRight[0] - k * up[0], kScreenRight[1] - k * up[1], kScreenRight[2] - k * up[2]};
-  const float rn = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
-  if (rn < 0.3f) return;  // screen-right points up or down: lateral is undefined
-  for (float& v : r) v /= rn;
-  const float f[3] = {up[1] * r[2] - up[2] * r[1], up[2] * r[0] - up[0] * r[2], up[0] * r[1] - up[1] * r[0]};
-  const float d[3] = {a[0] - gs.ref[0], a[1] - gs.ref[1], a[2] - gs.ref[2]};
+  if (!s.carValid) return;  // until the unit has stood still once
+  gs.haveRef = true;
   // Shown as the G the driver feels (like a ball in a bowl): opposite to the acceleration. Braking moves it
   // forward (up), a left turn to the right, and tilting the unit moves it towards the side that goes down.
-  gs.lat = -(d[0] * r[0] + d[1] * r[1] + d[2] * r[2]);
-  gs.lon = -(d[0] * f[0] + d[1] * f[1] + d[2] * f[2]);
+  // carG: x forward, y left (z up), with gravity only on z.
+  gs.lat = s.carG[1];
+  gs.lon = -s.carG[0];
   gs.total = sqrtf(gs.lat * gs.lat + gs.lon * gs.lon);
   gs.trail[gs.trailPos][0] = gs.lat;
   gs.trail[gs.trailPos][1] = gs.lon;
