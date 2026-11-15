@@ -403,6 +403,7 @@ static void publishStatus(const record::Record* r) {
   ds.magCalibrated = mc.calibrated;
   ds.magField = mc.calibrated ? mc.cal.field : 0;
   ds.magCollecting = mc.collecting;
+  ds.magCalSession = mc.session;
   ds.magCalSamples = mc.samples;
   for (int k = 0; k < 3; k++) ds.magCoverage[k] = mc.coverage[k];
   ds.magCalComplete = mc.complete;
@@ -589,13 +590,21 @@ static void handleCommand(char* line) {
     printf("OK rotate the unit slowly in every direction, then mag-cal-done\n");
   } else if (strcmp(line, "mag-cal-done") == 0) {
     logger::onMagCalFinish();
-    static const char* const kResult[] = {"",           "OK", "ERR too few samples", "ERR not rotated enough",
-                                          "ERR bad fit", "ERR not collecting (run mag-cal first)"};
+    static const char* const kResult[] = {"",
+                                          "OK",
+                                          "ERR too few samples",
+                                          "ERR not rotated enough",
+                                          "ERR bad fit",
+                                          "ERR not collecting (run mag-cal first)",
+                                          "ERR applied but not saved (lost at the next reboot)"};
     const uint8_t res = magCalResult;
-    printf("%s\n", res < 6 ? kResult[res] : "ERR");
+    printf("%s\n", res < 7 ? kResult[res] : "ERR");
   } else if (strcmp(line, "mag-clear") == 0) {
-    imu::magCalClear();
-    printf("OK mag calibration cleared\n");
+    if (imu::magCalClear()) {
+      printf("OK mag calibration cleared\n");
+    } else {
+      printf("ERR cleared until the next reboot (NVS failed)\n");
+    }
   } else if (strcmp(line, "mag") == 0) {
     const imu::MagCalInfo mc = imu::magCalInfo();
     imu::Sample s;

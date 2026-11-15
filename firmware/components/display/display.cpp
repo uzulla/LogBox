@@ -413,8 +413,8 @@ void drawStatusPage(const Status& s, int64_t now, int rate) {
     const bool showResult = s.magCalResult && now - s.magCalResultAtUs < kMagResultUs;
     if (showResult && s.magCalResult != 1) {
       static const char* const kFail[] = {"",          "",           "FAILED: TOO SHORT", "FAILED: ROTATE MORE",
-                                          "FAILED: TRY AGAIN", "NOT RUNNING"};
-      row("CAL", kFail[s.magCalResult < 6 ? s.magCalResult : 4], kRed);
+                                          "FAILED: TRY AGAIN", "NOT RUNNING", "NOT SAVED"};
+      row("CAL", kFail[s.magCalResult < 7 ? s.magCalResult : 4], kRed);
     } else if (s.magCalibrated) {
       snprintf(b, sizeof(b), "%s %.0fUT NOW %.0f", showResult ? "DONE" : "ON", s.magField, now3);
       row("CAL", b, kGreen);
@@ -522,6 +522,10 @@ bool resetPeaks = false;
 // console can start and end it too).
 bool magCollecting = false;
 int64_t magStartAt = 0, magLocalAt = 0;
+// Collection session the display is following. After our own start it is unknown until the logger reports the
+// new session: until then the Status still holds the previous collection's counts.
+uint32_t magSession = 0;
+bool magSessionKnown = false;
 
 void magCalEnd(bool finish, int64_t now) {
   if (finish) {
@@ -568,6 +572,7 @@ void pollButtons(int64_t now) {
         onMagCalStart();
         magCollecting = true;
         magStartAt = magLocalAt = now;
+        magSessionKnown = false;
       }
     }
     downAt = 0;
@@ -593,15 +598,18 @@ void displayTask(void*) {
     gv = gs;
     portEXIT_CRITICAL(&stLock);
     // Calibration: finish by itself once there is plenty of rotation, give up after a while.
-    if (now - magLocalAt > 500000) {
-      if (s.magCollecting && !magCollecting) magStartAt = now;
-      magCollecting = s.magCollecting;
+    if (now - magLocalAt > 500000) magCollecting = s.magCollecting;
+    // A new session (ours, or a (re)start from the serial console): the 2 minutes count from now.
+    if (s.magCollecting && (!magSessionKnown || s.magCalSession != magSession)) {
+      magStartAt = now;
+      magSession = s.magCalSession;
+      magSessionKnown = true;
     }
     if (magCollecting) {
       page = 2;
-      // Not right after our own start: until the logger's next update the Status still holds the previous
-      // collection's counts (complete, hundreds of samples) and would finish the new one at once.
-      if (now - magLocalAt > 500000 && s.magCalComplete && s.magCalSamples >= kMagAutoFinishSamples) {
+      // Only on the counts of the session we follow (not the previous collection's, see magSession).
+      const bool current = magSessionKnown && s.magCalSession == magSession;
+      if (current && s.magCalComplete && s.magCalSamples >= kMagAutoFinishSamples) {
         magCalEnd(true, now);
       } else if (now - magStartAt > kMagTimeoutUs) {
         magCalEnd(false, now);

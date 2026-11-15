@@ -121,6 +121,7 @@ MagCal gCalib;
 bool gHaveCalib;
 SemaphoreHandle_t gCalMutex;
 bool gCollecting;
+uint32_t gCalSession;  // counts the starts, so the display can tell a restarted collection from the old one
 MagCalFit gFit;
 float gPressure, gTemp;
 bool gBaroValid;
@@ -509,8 +510,8 @@ void loadCalib() {
   nvs_close(h);
 }
 
-// Writes (cal != nullptr) or erases the stored calibration.
-void storeCalib(const MagCal* cal) {
+// Writes (cal != nullptr) or erases the stored calibration. False when NVS failed (logged).
+bool storeCalib(const MagCal* cal) {
   nvs_handle_t h;
   esp_err_t err = nvs_open(kNvsNs, NVS_READWRITE, &h);
   if (err == ESP_OK) {
@@ -527,6 +528,7 @@ void storeCalib(const MagCal* cal) {
     nvs_close(h);
   }
   if (err != ESP_OK) ESP_LOGE(TAG, "mag calibration not saved: %s", esp_err_to_name(err));
+  return err == ESP_OK;
 }
 
 }  // namespace
@@ -594,6 +596,7 @@ void magCalStart() {
   xSemaphoreTake(gCalMutex, portMAX_DELAY);
   gFit.reset();
   gCollecting = true;
+  gCalSession++;
   xSemaphoreGive(gCalMutex);
   ESP_LOGI(TAG, "mag calibration: collecting");
 }
@@ -621,12 +624,12 @@ MagCalError magCalFinish() {
   gCalib = cal;
   gHaveCalib = true;
   taskEXIT_CRITICAL(&gLock);
-  storeCalib(&cal);
+  const bool saved = storeCalib(&cal);
   ESP_LOGI(TAG, "mag calibration: offset %.1f %.1f %.1f uT, scale %.3f %.3f %.3f, field %.1f uT (%lu samples)",
            cal.offset[0], cal.offset[1], cal.offset[2], cal.scale[0], cal.scale[1], cal.scale[2], cal.field,
            static_cast<unsigned long>(gFit.samples()));
   xSemaphoreGive(gCalMutex);
-  return MagCalError::kNone;
+  return saved ? MagCalError::kNone : MagCalError::kNotSaved;
 }
 
 void magCalCancel() {
@@ -636,15 +639,16 @@ void magCalCancel() {
   xSemaphoreGive(gCalMutex);
 }
 
-void magCalClear() {
-  if (!gCalMutex) return;
+bool magCalClear() {
+  if (!gCalMutex) return false;
   xSemaphoreTake(gCalMutex, portMAX_DELAY);
   taskENTER_CRITICAL(&gLock);
   gHaveCalib = false;
   taskEXIT_CRITICAL(&gLock);
-  storeCalib(nullptr);
+  const bool saved = storeCalib(nullptr);
   xSemaphoreGive(gCalMutex);
   ESP_LOGI(TAG, "mag calibration cleared");
+  return saved;
 }
 
 MagCalInfo magCalInfo() {
@@ -656,6 +660,7 @@ MagCalInfo magCalInfo() {
   if (!gCalMutex) return info;
   xSemaphoreTake(gCalMutex, portMAX_DELAY);
   info.collecting = gCollecting;
+  info.session = gCalSession;
   info.samples = gFit.samples();
   for (int k = 0; k < 3; k++) info.coverage[k] = gFit.coverage(k);
   info.complete = gFit.complete();

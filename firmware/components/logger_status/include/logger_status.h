@@ -52,7 +52,9 @@ struct Status {
   uint32_t magCalSamples;
   float magCoverage[3];  // 0..1 per axis
   bool magCalComplete;   // enough rotation: finishing now will very likely succeed
-  uint8_t magCalResult;  // last finish: 0 none yet, 1 ok, 2 too few samples, 3 not rotated, 4 bad fit, 5 not running
+  uint32_t magCalSession;  // changes on every start of a collection (also from the serial console)
+  uint8_t magCalResult;  // last finish: 0 none yet, 1 ok, 2 too few samples, 3 not rotated, 4 bad fit,
+                         // 5 not running, 6 applied but not saved
   int64_t magCalResultAtUs;
   float pressureHpa, tempC;
 };
