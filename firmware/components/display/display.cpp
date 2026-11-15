@@ -522,8 +522,9 @@ bool resetPeaks = false;
 // console can start and end it too).
 bool magCollecting = false;
 int64_t magStartAt = 0, magLocalAt = 0;
-// Collection session the display is following. After our own start it is unknown until the logger reports the
-// new session: until then the Status still holds the previous collection's counts.
+// Collection session the display follows: the number our own start returned, or one started from the serial
+// console. Progress in a Status counts only when it carries this number (an older Status may still hold the
+// previous collection's counts, even while saying it is collecting).
 uint32_t magSession = 0;
 bool magSessionKnown = false;
 
@@ -569,10 +570,10 @@ void pollButtons(int64_t now) {
       } else if (page == 1) {
         resetPeaks = true;
       } else if (page == 2) {
-        onMagCalStart();
+        magSession = onMagCalStart();
+        magSessionKnown = true;
         magCollecting = true;
         magStartAt = magLocalAt = now;
-        magSessionKnown = false;
       }
     }
     downAt = 0;
@@ -598,12 +599,14 @@ void displayTask(void*) {
     gv = gs;
     portEXIT_CRITICAL(&stLock);
     // Calibration: finish by itself once there is plenty of rotation, give up after a while.
-    if (now - magLocalAt > 500000) magCollecting = s.magCollecting;
-    // A new session (ours, or a (re)start from the serial console): the 2 minutes count from now.
-    if (s.magCollecting && (!magSessionKnown || s.magCalSession != magSession)) {
-      magStartAt = now;
-      magSession = s.magCalSession;
-      magSessionKnown = true;
+    if (now - magLocalAt > 500000) {
+      magCollecting = s.magCollecting;
+      // A session we did not start (a (re)start from the serial console): follow it, 2 minutes from now.
+      if (s.magCollecting && (!magSessionKnown || s.magCalSession != magSession)) {
+        magStartAt = now;
+        magSession = s.magCalSession;
+        magSessionKnown = true;
+      }
     }
     if (magCollecting) {
       page = 2;

@@ -683,9 +683,9 @@ extern "C" void app_main() {
   xTaskCreate(consoleTask, "console", 4096, nullptr, 2, nullptr);
 }
 
-void logger::onMagCalStart() {
+uint32_t logger::onMagCalStart() {
   magCalResult = 0;
-  imu::magCalStart();
+  return imu::magCalStart();
 }
 
 void logger::onMagCalFinish() {

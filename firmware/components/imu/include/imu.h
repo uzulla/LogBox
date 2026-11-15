@@ -58,12 +58,14 @@ struct MagCalInfo {
   float coverage[3];   // 0..1 per raw axis
   bool complete;       // enough samples and rotation: finishing will very likely succeed
 };
-void magCalStart();               // starts (or restarts) collecting; the current calibration stays applied
+uint32_t magCalStart();           // starts (or restarts) collecting; the current calibration stays applied.
+                                  // Returns the new session number (MagCalInfo::session)
 MagCalError magCalFinish();       // fits, and on success applies and saves the result; stops collecting.
                                   // kNotCollecting when nothing is being collected, kNotSaved when applied
                                   // but NVS failed
 void magCalCancel();
-bool magCalClear();               // forgets the calibration (raw readings from now on); false when NVS failed
+bool magCalClear();               // stops any collection and forgets the calibration (raw readings from now
+                                  // on); false when NVS failed
                                   // (the old one comes back at the next reboot)
 MagCalInfo magCalInfo();
 

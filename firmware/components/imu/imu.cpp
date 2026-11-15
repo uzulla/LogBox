@@ -591,14 +591,15 @@ void latest(Sample& out) {
   taskEXIT_CRITICAL(&gLock);
 }
 
-void magCalStart() {
-  if (!gCalMutex) return;
+uint32_t magCalStart() {
+  if (!gCalMutex) return 0;
   xSemaphoreTake(gCalMutex, portMAX_DELAY);
   gFit.reset();
   gCollecting = true;
-  gCalSession++;
+  const uint32_t session = ++gCalSession;
   xSemaphoreGive(gCalMutex);
   ESP_LOGI(TAG, "mag calibration: collecting");
+  return session;
 }
 
 MagCalError magCalFinish() {
@@ -642,6 +643,7 @@ void magCalCancel() {
 bool magCalClear() {
   if (!gCalMutex) return false;
   xSemaphoreTake(gCalMutex, portMAX_DELAY);
+  gCollecting = false;  // a pending or automatic finish must not save the collection after the clear
   taskENTER_CRITICAL(&gLock);
   gHaveCalib = false;
   taskEXIT_CRITICAL(&gLock);

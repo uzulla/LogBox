@@ -70,7 +70,7 @@ void onLongPress();
 
 // Implemented by the logger, called by the display: start collecting for the magnetometer calibration,
 // finish it (fit, apply, save; the result shows up in Status::magCalResult), or cancel it.
-void onMagCalStart();
+uint32_t onMagCalStart();  // returns the new session (Status::magCalSession once the logger reports it)
 void onMagCalFinish();
 void onMagCalCancel();
 
