@@ -3,10 +3,14 @@
 # requires-python = ">=3.9"
 # dependencies = ["bleak"]
 # ///
-"""Talk to the ESP32's BLE config service (advertised for 60 s after boot).
+"""Talk to the ESP32's BLE config service (advertised whenever the logger is on).
 
     uv run tools/ble-config.py status      # GNSS / SD state, Wi-Fi SSID, connected?, IP
     uv run tools/ble-config.py wifi-set    # prompts for SSID and password, saved to NVS
+    uv run tools/ble-config.py mag         # magnetometer calibration state
+    uv run tools/ble-config.py ctrl rec=0  # a command: rec=1|0, mag=start|done|cancel|clear, wifi=clear, reboot=1
+
+The same service is used by the Web Bluetooth page docs/index.html.
 
 The link is encrypted (Just Works pairing, nothing stored): the device asks
 the OS to pair as soon as it connects.
@@ -23,10 +27,11 @@ from bleak.exc import BleakError
 SERVICE = "9b3c0001-4e5f-4a2b-8c6d-2f1e0a7b5c3d"
 STATUS = "9b3c0002-4e5f-4a2b-8c6d-2f1e0a7b5c3d"
 WIFI = "9b3c0003-4e5f-4a2b-8c6d-2f1e0a7b5c3d"
+CTRL = "9b3c0004-4e5f-4a2b-8c6d-2f1e0a7b5c3d"
 
 
 async def find(name, timeout):
-    print(f"scanning for up to {timeout:.0f} s (power-cycle the ESP32 if its 60 s window has passed)...",
+    print(f"scanning for up to {timeout:.0f} s...",
           file=sys.stderr)
     found = {}
 
@@ -60,7 +65,8 @@ async def when_encrypted(op, timeout=30):
 
 async def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["status", "wifi-set"])
+    ap.add_argument("command", choices=["status", "wifi-set", "mag", "ctrl"])
+    ap.add_argument("value", nargs="?", help="ctrl: the command, e.g. rec=0")
     ap.add_argument("--name", help="advertised name, e.g. logbo-06FA (default: first found)")
     ap.add_argument("--timeout", type=float, default=30)
     args = ap.parse_args()
@@ -72,11 +78,22 @@ async def main() -> int:
             print("SSID must be non-empty; tabs are not allowed", file=sys.stderr)
             return 1
 
+    if args.command == "ctrl" and not args.value:
+        print("ctrl needs a command, e.g. rec=0", file=sys.stderr)
+        return 1
+
     dev = await find(args.name, args.timeout)
     async with BleakClient(dev) as client:
-        if args.command == "status":
-            data = await when_encrypted(lambda: client.read_gatt_char(STATUS))
+        if args.command in ("status", "mag"):
+            data = await when_encrypted(lambda: client.read_gatt_char(STATUS if args.command == "status" else CTRL))
             print(json.dumps(json.loads(data), indent=2, ensure_ascii=False))
+        elif args.command == "ctrl":
+            try:
+                await when_encrypted(lambda: client.write_gatt_char(CTRL, args.value.encode(), response=True))
+            except BleakError as e:
+                print(f"rejected by the device: {e}", file=sys.stderr)
+                return 1
+            print(f"OK {args.value}")
         else:
             try:
                 await when_encrypted(

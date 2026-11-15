@@ -68,6 +68,10 @@ static imu::Status imuStatus;
 static std::atomic<uint32_t> records{0};
 static std::atomic<int64_t> lastPvtUs{0};
 static std::atomic<uint32_t> pvtCount{0};
+static std::atomic<uint8_t> lastFix{0}, lastSats{0};  // of the latest NAV-PVT, for the BLE status
+// Result of the last magnetometer calibration, for the display (see logger::Status::magCalResult).
+static std::atomic<uint8_t> magCalResult{0};
+static std::atomic<int64_t> magCalResultAtUs{0};
 
 // ---------------------------------------------------------------------------
 // UDP
@@ -195,11 +199,14 @@ static void initWifi() {
 }
 
 // ---------------------------------------------------------------------------
-// BLE peripheral: config service. Advertised for CONFIG_LOGBO_CONFIG_WINDOW_S seconds after boot; a client
-// that connects within the window may stay until it disconnects. Both characteristics need an encrypted
-// link (Just Works pairing, no bonding), so the password is not sent in the clear.
+// BLE peripheral: config service. Advertised all the time (or, when CONFIG_LOGBO_CONFIG_WINDOW_S > 0, for that
+// many seconds after boot; a client that connects within the window may stay until it disconnects). All characteristics need an encrypted
+// link (Just Works pairing, no bonding), so the password is not sent in the clear. Used by tools/ble-config.py
+// and the Web Bluetooth page docs/index.html.
 //   status (read):  JSON, see statusJson()
 //   wifi   (write): "<ssid>\t<password>", saved to NVS and applied at once
+//   ctrl   (read):  magnetometer calibration state, see magCalJson()
+//          (write): one command, see onCtrlWrite()
 
 // 128-bit UUIDs are stored little-endian.
 static constexpr ble_uuid128_t uuid128(const uint8_t (&be)[16]) {
@@ -209,20 +216,26 @@ static constexpr ble_uuid128_t uuid128(const uint8_t (&be)[16]) {
   return u;
 }
 
-// 9b3c0001-4e5f-4a2b-8c6d-2f1e0a7b5c3d and ...0002 / ...0003
+// 9b3c0001-4e5f-4a2b-8c6d-2f1e0a7b5c3d and ...0002 / ...0003 / ...0004
 static constexpr ble_uuid128_t kConfigService = uuid128(
     {0x9B, 0x3C, 0x00, 0x01, 0x4E, 0x5F, 0x4A, 0x2B, 0x8C, 0x6D, 0x2F, 0x1E, 0x0A, 0x7B, 0x5C, 0x3D});
 static constexpr ble_uuid128_t kConfigStatus = uuid128(
     {0x9B, 0x3C, 0x00, 0x02, 0x4E, 0x5F, 0x4A, 0x2B, 0x8C, 0x6D, 0x2F, 0x1E, 0x0A, 0x7B, 0x5C, 0x3D});
 static constexpr ble_uuid128_t kConfigWifi = uuid128(
     {0x9B, 0x3C, 0x00, 0x03, 0x4E, 0x5F, 0x4A, 0x2B, 0x8C, 0x6D, 0x2F, 0x1E, 0x0A, 0x7B, 0x5C, 0x3D});
+static constexpr ble_uuid128_t kConfigCtrl = uuid128(
+    {0x9B, 0x3C, 0x00, 0x04, 0x4E, 0x5F, 0x4A, 0x2B, 0x8C, 0x6D, 0x2F, 0x1E, 0x0A, 0x7B, 0x5C, 0x3D});
 
 static uint8_t ownAddrType;
 static std::atomic<bool> configWindowOpen{true};
 static std::atomic<uint16_t> configConnHandle{BLE_HS_CONN_HANDLE_NONE};
 
-// {"gnss":{"configured":true,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01.csv",
-//  "wifi_ssid":"...","wifi_connected":true,"ip":"192.168.11.38"}
+// {"device":"logbo-CD0E","uptime_s":120,"free_heap":45000,
+//  "gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01.csv",
+//  "records":3000,"imu":true,"mag":true,"baro":true,"wifi_ssid":"...","wifi_connected":true,"ip":"192.168.11.38",
+//  "rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0}
+// The earlier members keep their names and meaning (tools/ble-config.py). At most ~470 bytes even with an
+// SSID of 32 characters that all need escaping, below the 512 bytes an attribute may have.
 static size_t statusJson(char* buf, size_t size) {
   static const char* const kRec[] = {"off", "rec", "saving", "safe", "failed"};
   char ssid[sizeof(wifiSsid) * 6];
@@ -233,19 +246,104 @@ static size_t statusJson(char* buf, size_t size) {
   if (connected && esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &info) == ESP_OK) {
     snprintf(ip, sizeof(ip), "\"" IPSTR "\"", IP2STR(&info.ip));
   }
+  wifi_ap_record_t ap;
+  const int rssi = connected && esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
   const gnss::Stats gs = gnss::stats();
-  const int n = snprintf(buf, size,
-                         "{\"gnss\":{\"configured\":%s,\"messages\":%lu},\"rec\":\"%s\",\"log\":\"%s\","
-                         "\"wifi_ssid\":\"%s\",\"wifi_connected\":%s,\"ip\":%s}",
-                         gs.configured ? "true" : "false", static_cast<unsigned long>(gs.pvt),
-                         kRec[static_cast<int>(sdlog::state())], sdlog::fileName(), ssid,
-                         connected ? "true" : "false", ip);
+  const bool fresh = lastPvtUs && esp_timer_get_time() - lastPvtUs < 2000000;
+  const char* t = "true";
+  const char* f = "false";
+  const int n = snprintf(
+      buf, size,
+      "{\"device\":\"%s\",\"uptime_s\":%lu,\"free_heap\":%lu,"
+      "\"gnss\":{\"configured\":%s,\"messages\":%lu,\"baud\":%lu,\"fix\":%u,\"sats\":%u},"
+      "\"rec\":\"%s\",\"log\":\"%s\",\"records\":%lu,\"imu\":%s,\"mag\":%s,\"baro\":%s,"
+      "\"wifi_ssid\":\"%s\",\"wifi_connected\":%s,\"ip\":%s,\"rssi\":%d,\"ap_ssid\":\"%s\",\"ap_clients\":%d}",
+      deviceName, static_cast<unsigned long>(esp_timer_get_time() / 1000000),
+      static_cast<unsigned long>(esp_get_free_heap_size()), gs.configured ? t : f,
+      static_cast<unsigned long>(gs.pvt), static_cast<unsigned long>(gs.baud), fresh ? lastFix.load() : 0,
+      fresh ? lastSats.load() : 0, kRec[static_cast<int>(sdlog::state())], sdlog::fileName(),
+      static_cast<unsigned long>(records.load()), imuStatus.bmi270 ? t : f, imuStatus.bmm150 ? t : f,
+      imuStatus.bmp280 ? t : f, ssid, connected ? t : f, ip, rssi, LOGBO_AP_SSID, apClients.load());
   return n > 0 && static_cast<size_t>(n) < size ? n : 0;
+}
+
+// {"calibrated":true,"field":34.4,"collecting":false,"session":3,"samples":0,"coverage":[0.00,0.00,0.00],
+//  "complete":false,"result":1}   result: as logger::Status::magCalResult (0 none, 1 ok, 2.. failures)
+static size_t magCalJson(char* buf, size_t size) {
+  const imu::MagCalInfo mc = imu::magCalInfo();
+  const char* t = "true";
+  const char* f = "false";
+  const int n = snprintf(buf, size,
+                         "{\"calibrated\":%s,\"field\":%.1f,\"collecting\":%s,\"session\":%lu,\"samples\":%lu,"
+                         "\"coverage\":[%.2f,%.2f,%.2f],\"complete\":%s,\"result\":%u}",
+                         mc.calibrated ? t : f, mc.calibrated ? mc.cal.field : 0.0f, mc.collecting ? t : f,
+                         static_cast<unsigned long>(mc.session), static_cast<unsigned long>(mc.samples),
+                         mc.coverage[0], mc.coverage[1], mc.coverage[2], mc.complete ? t : f, magCalResult.load());
+  return n > 0 && static_cast<size_t>(n) < size ? n : 0;
+}
+
+static void rebootSoon() {
+  // Let the write response go out first
+  static esp_timer_handle_t timer;
+  if (!timer) {
+    const esp_timer_create_args_t args = {.callback = [](void*) { esp_restart(); }, .name = "reboot"};
+    if (esp_timer_create(&args, &timer) != ESP_OK) return;
+  }
+  esp_timer_start_once(timer, 500000);
+}
+
+// ctrl commands (ASCII, no newline):
+//   rec=1 / rec=0                      start / stop the SD recording (as holding B)
+//   mag=start / done / cancel / clear  magnetometer calibration (as the STATUS page and the serial console)
+//   wifi=clear                         forget the Wi-Fi credentials
+//   reboot=1
+// Unknown commands, and a calibration finish that fails, are refused with ATT error 0x13 (value not allowed);
+// the calibration's result is in the ctrl read (magCalJson) either way.
+static int onCtrlWrite(const char* cmd) {
+  if (strcmp(cmd, "rec=1") == 0) {
+    sdlog::requestStart();
+  } else if (strcmp(cmd, "rec=0") == 0) {
+    sdlog::requestStop();
+  } else if (strcmp(cmd, "mag=start") == 0) {
+    logger::onMagCalStart();
+  } else if (strcmp(cmd, "mag=done") == 0) {
+    logger::onMagCalFinish();
+    if (magCalResult != 1) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+  } else if (strcmp(cmd, "mag=cancel") == 0) {
+    logger::onMagCalCancel();
+  } else if (strcmp(cmd, "mag=clear") == 0) {
+    if (!imu::magCalClear()) return BLE_ATT_ERR_UNLIKELY;
+  } else if (strcmp(cmd, "wifi=clear") == 0) {
+    clearWifiCredentials();
+    applyWifiConfig();
+  } else if (strcmp(cmd, "reboot=1") == 0) {
+    rebootSoon();
+  } else {
+    return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+  }
+  ESP_LOGI(TAG, "BLE ctrl: %s", cmd);
+  return 0;
+}
+
+static int onCtrlAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
+  if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+    char json[256];
+    const size_t n = magCalJson(json, sizeof(json));
+    return n && os_mbuf_append(ctxt->om, json, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+  }
+  if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+    char cmd[32];
+    uint16_t len = 0;
+    if (ble_hs_mbuf_to_flat(ctxt->om, cmd, sizeof(cmd) - 1, &len) != 0) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    cmd[len] = '\0';
+    return onCtrlWrite(cmd);
+  }
+  return BLE_ATT_ERR_UNLIKELY;
 }
 
 static int onConfigAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-    char json[400];
+    char json[512];
     const size_t n = statusJson(json, sizeof(json));
     return n && os_mbuf_append(ctxt->om, json, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
@@ -277,6 +375,9 @@ static const ble_gatt_chr_def kConfigChrs[] = {
     {.uuid = &kConfigWifi.u,
      .access_cb = onConfigAccess,
      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC},
+    {.uuid = &kConfigCtrl.u,
+     .access_cb = onCtrlAccess,
+     .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC},
     {},
 };
 
@@ -380,7 +481,9 @@ static void initBle() {
   const esp_timer_create_args_t window = {.callback = closeConfigWindow, .name = "config_window"};
   esp_timer_handle_t windowTimer;
   ESP_ERROR_CHECK(esp_timer_create(&window, &windowTimer));
-  ESP_ERROR_CHECK(esp_timer_start_once(windowTimer, CONFIG_LOGBO_CONFIG_WINDOW_S * 1000000LL));
+  if (CONFIG_LOGBO_CONFIG_WINDOW_S > 0) {
+    ESP_ERROR_CHECK(esp_timer_start_once(windowTimer, CONFIG_LOGBO_CONFIG_WINDOW_S * 1000000LL));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -390,9 +493,6 @@ static void initBle() {
 // Held while a record is built and sent: the GNSS task and the watchdog may meet when the GNSS resumes.
 static SemaphoreHandle_t recordMutex;
 
-// Result of the last magnetometer calibration, for the display (see logger::Status::magCalResult).
-static std::atomic<uint8_t> magCalResult{0};
-static std::atomic<int64_t> magCalResultAtUs{0};
 
 static void publishStatus(const record::Record* r) {
   static logger::Status ds = {};
@@ -506,6 +606,8 @@ static void emitRecord(const gnss::Pvt* pvt) {
 static void onPvt(const gnss::Pvt& p) {
   lastPvtUs = esp_timer_get_time();
   pvtCount++;
+  lastFix = p.fixOk() ? p.fixType : 0;
+  lastSats = p.numSV;
   emitRecord(&p);
 }
 
