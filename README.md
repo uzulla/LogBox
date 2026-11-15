@@ -78,12 +78,14 @@ numbers already on the card; flushed every second. No card, an unreadable card, 
 recording, and nothing is retried by itself (hold B).
 
 ```
-t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c,mag_cal
+t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c,mag_cal,head_acc_deg,speed_acc_kmh
 ```
 
 The columns up to `charging` are those of the RaceBox logs, so [`log-viewer/`](log-viewer/README.md) reads both. acc is
 in G and gyro in deg/s, BMI270 axes (mean over the epoch); mag in uT (BMM150 axes; calibrated when `mag_cal` is 1, raw
-with the base magnets' offset when 0, see above); press in hPa, temp in °C (BMP280, warmed by the stack).
+with the base magnets' offset when 0, see above); press in hPa, temp in °C (BMP280, warmed by the stack);
+head_acc / speed_acc: the receiver's accuracy estimates of heading (deg) and speed (km/h), used by log-viewer to pick the
+stretches it trusts for the body heading / slip angle.
 
 ### Soft AP
 

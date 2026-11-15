@@ -70,9 +70,10 @@ size_t csvHeader(char* buf, size_t size, unsigned session, unsigned seq) {
       "t_ms = ms since this file was opened\n"
       "# lat/lon: deg, alt: m (MSL), speed: km/h, heading: deg (of motion), hacc: m, "
       "acc: G and gyro: deg/s (BMI270 axes, mean over the epoch), batt/charging: not available (empty), "
-      "mag: uT (BMM150 axes; mag_cal 1 = hard / soft iron calibrated, 0 = raw), press: hPa, temp: C (BMP280)\n"
+      "mag: uT (BMM150 axes; mag_cal 1 = hard / soft iron calibrated, 0 = raw), press: hPa, temp: C (BMP280), "
+      "head_acc: deg and speed_acc: km/h (receiver's 1-sigma estimates)\n"
       "t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,"
-      "batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c,mag_cal\n",
+      "batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c,mag_cal,head_acc_deg,speed_acc_kmh\n",
       session, seq);
   return n > 0 && static_cast<size_t>(n) < size ? static_cast<size_t>(n) : 0;
 }
@@ -88,11 +89,13 @@ size_t csvRow(const Record& r, int64_t startUs, char* buf, size_t size) {
   if (s.magValid) snprintf(mag, sizeof(mag), "%.1f,%.1f,%.1f", s.mx, s.my, s.mz);
   char baro[24] = ",";
   const char* magCal = s.magValid ? (s.magCal ? "1" : "0") : "";
+  char acc2[32] = ",";
+  if (r.hasPvt) snprintf(acc2, sizeof(acc2), "%.2f,%.2f", p.headAcc / 1e5, p.sAcc * 0.0036);
   if (s.baroValid) snprintf(baro, sizeof(baro), "%.2f,%.2f", s.pressureHpa, s.tempC);
-  const int n = snprintf(buf, size, "%ld,%s,%u,%u,%.7f,%.7f,%.1f,%.2f,%.2f,%.1f,%s,,,%s,%s,%s\n",
+  const int n = snprintf(buf, size, "%ld,%s,%u,%u,%.7f,%.7f,%.1f,%.2f,%.2f,%.1f,%s,,,%s,%s,%s,%s\n",
                          static_cast<long>((r.atUs - startUs) / 1000), utc, p.fixType, p.numSV, p.lat / 1e7,
                          p.lon / 1e7, p.hMSL / 1000.0, p.gSpeed * 0.0036, p.headMot / 1e5, p.hAcc / 1000.0, acc,
-                         mag, baro, magCal);
+                         mag, baro, magCal, acc2);
   return n > 0 && static_cast<size_t>(n) < size ? static_cast<size_t>(n) : 0;
 }
 
