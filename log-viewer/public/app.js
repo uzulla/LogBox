@@ -589,6 +589,8 @@ function viewRange(d) {
 }
 let V = { t0: 0, t1: 0, c0: 0, c1: 0 };
 // 凡例: サーキットモードで周回があるときは、加速 / 減速の凡例にする
+// 凡例の最高速度。サーキットモードで周回があるときは凡例が「減速 / 加速」になり、この欄は無い
+function setVmax(text) { const e = $('vmax'); if (e) e.textContent = text; }
 function updateLegend() {
   const lap = circuitOn && D && D.lap;
   $('legend').innerHTML = lap
@@ -1026,7 +1028,7 @@ function clearView() {
   $('pos').textContent = '0:00 / 0:00';
   $('laps').textContent = ''; $('lapsum').textContent = '--';
   $('seek').min = 0; $('seek').max = 0; $('seek').value = 0;
-  $('vmax').textContent = '-- km/h';
+  setVmax('-- km/h');
   $('meta').textContent = 'CSV を選ぶか、ここにドロップしてください';
   layoutChart();
   drawCursor(0);
@@ -1441,7 +1443,7 @@ function load(text, name) {
     : D.hdg.breaks.length ? `機器が車内で動いたとみなした箇所が ${D.hdg.breaks.length} つあります(その前後はスリップアングルを出しません)` : '';
   if (hn) $('notice').textContent = ($('notice').textContent ? $('notice').textContent + ' / ' : '') + hn;
   if (D.lapManualError) $('notice').textContent = ($('notice').textContent ? $('notice').textContent + ' / ' : '') + '保存していた計測ラインではラップにならないため、自動検出に戻しました';
-  $('vmax').textContent = `${Math.round(D.vmax)} km/h`;
+  setVmax(`${Math.round(D.vmax)} km/h`);
   updateGapInfo();
   updateStillInfo();
   updateLapInfo();
@@ -1460,8 +1462,9 @@ function load(text, name) {
 // 選び直したとき、遅れて届いた古い応答で上書きしないよう連番で最新だけ反映する
 let loadSeq = 0;
 // 読み込みに失敗したら、選択欄を今表示しているログに戻す(名前と表示内容を食い違わせない)
-function loadFailed() {
-  $('notice').textContent = '読み込めませんでした';
+function loadFailed(err) {
+  if (err) console.error(err);
+  $('notice').textContent = '読み込めませんでした' + (err ? `(${err.message})` : '');
   $('files').value = D ? D.name : '';
 }
 async function loadServer(name) {
@@ -1474,7 +1477,7 @@ async function loadServer(name) {
     if (seq !== loadSeq) return;
     load(text, name);
   } catch (e) {
-    if (seq === loadSeq) loadFailed();
+    if (seq === loadSeq) loadFailed(e);
   }
 }
 $('files').onchange = (e) => e.target.value && loadServer(e.target.value);
@@ -1497,7 +1500,7 @@ function refreshDistance() {
   if (D.lap) D.lap.delta = null; // 比較ラップとの差は走行距離でそろえているので、作り直す
   updateGapInfo();
   $('meta').textContent = $('meta').textContent.replace(/最高 \d+ km\/h \/ [\d.,]+ (m|km)/, `最高 ${Math.round(D.vmax)} km/h / ${fmtKm(D.distance)}`);
-  $('vmax').textContent = `${Math.round(D.vmax)} km/h`;
+  setVmax(`${Math.round(D.vmax)} km/h`);
 }
 function updateStillInfo() {
   $('stillinfo').textContent = !D ? '--' : D.hasG ? (D.stillRuns ? `${D.stillRuns} 回 / ${D.stillSec.toFixed(0)} 秒` : 'なし') : '静止区間なし(判定不可)';
