@@ -154,18 +154,10 @@ constexpr uint32_t kMagAutoFinishSamples = 375;  // 15 s at 25 Hz: finish by its
 
 int kmh10(int32_t mms) { return static_cast<int>(static_cast<int64_t>(mms) * 36 / 1000); }
 
-// Dynamic acceleration: the measured acceleration minus the gravity vector measured while standing still
-// (so it reads 0 at rest), split into the horizontal plane: lateral along the screen's left-right axis
-// and longitudinal perpendicular to it. "Still" is judged from the GNSS speed with a fix, otherwise from
-// the IMU alone (no rotation, steady acceleration for ~1 s).
-//
-// Screen axes in BMI270 axes, checked on the board: +Y points to the top of the screen, -Z out of the screen
-// (towards the viewer) and -X to the right (tilting the screen to the right makes acc_x positive).
-constexpr float kScreenRight[3] = {-1, 0, 0};
-
+// G circle: the car-axis G from the logger (carframe: gravity learnt while standing still, lateral along the
+// screen's left-right axis), shown as the G the driver feels.
 struct GState {
   bool haveRef = false;
-  float ref[3] = {};
   float lat = 0, lon = 0, total = 0;  // G
   static constexpr int kTrail = 50;   // 2 s at 25 Hz
   float trail[kTrail][2] = {};
@@ -175,34 +167,13 @@ struct GState {
 GState gv;  // display task's copy of gs
 
 void updateG(const Status& s) {
-  static float prev[3];
-  static int still = 0;
-  const float a[3] = {s.ax, s.ay, s.az};
-  float jerk = 0;
-  for (int i = 0; i < 3; i++) jerk = fmaxf(jerk, fabsf(a[i] - prev[i])), prev[i] = a[i];
-  const float rot = fmaxf(fabsf(s.gx), fmaxf(fabsf(s.gy), fabsf(s.gz)));
-  const bool calm = rot < 5 && (s.fixOk ? kmh10(s.speedMms) < 10 : jerk < 0.03f);
-  still = calm ? std::min(still + 1, 1000) : 0;
-  if (still >= 25) {
-    for (int i = 0; i < 3; i++) gs.ref[i] = gs.haveRef ? gs.ref[i] + (a[i] - gs.ref[i]) * 0.05f : a[i];
-    gs.haveRef = true;
-  }
-  if (!gs.haveRef) return;
-  const float n = sqrtf(gs.ref[0] * gs.ref[0] + gs.ref[1] * gs.ref[1] + gs.ref[2] * gs.ref[2]);
-  if (n < 0.5f) return;
-  const float up[3] = {gs.ref[0] / n, gs.ref[1] / n, gs.ref[2] / n};
-  // Lateral axis: screen-right projected onto the horizontal plane. Forward = up x right.
-  const float k = kScreenRight[0] * up[0] + kScreenRight[1] * up[1] + kScreenRight[2] * up[2];
-  float r[3] = {kScreenRight[0] - k * up[0], kScreenRight[1] - k * up[1], kScreenRight[2] - k * up[2]};
-  const float rn = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
-  if (rn < 0.3f) return;  // screen-right points up or down: lateral is undefined
-  for (float& v : r) v /= rn;
-  const float f[3] = {up[1] * r[2] - up[2] * r[1], up[2] * r[0] - up[0] * r[2], up[0] * r[1] - up[1] * r[0]};
-  const float d[3] = {a[0] - gs.ref[0], a[1] - gs.ref[1], a[2] - gs.ref[2]};
+  if (!s.carValid) return;  // until the unit has stood still once
+  gs.haveRef = true;
   // Shown as the G the driver feels (like a ball in a bowl): opposite to the acceleration. Braking moves it
   // forward (up), a left turn to the right, and tilting the unit moves it towards the side that goes down.
-  gs.lat = -(d[0] * r[0] + d[1] * r[1] + d[2] * r[2]);
-  gs.lon = -(d[0] * f[0] + d[1] * f[1] + d[2] * f[2]);
+  // carG: x forward, y left (z up), with gravity only on z.
+  gs.lat = s.carG[1];
+  gs.lon = -s.carG[0];
   gs.total = sqrtf(gs.lat * gs.lat + gs.lon * gs.lon);
   gs.trail[gs.trailPos][0] = gs.lat;
   gs.trail[gs.trailPos][1] = gs.lon;
@@ -441,8 +412,9 @@ void drawStatusPage(const Status& s, int64_t now, int rate) {
     const float now3 = sqrtf(s.mx * s.mx + s.my * s.my + s.mz * s.mz);
     const bool showResult = s.magCalResult && now - s.magCalResultAtUs < kMagResultUs;
     if (showResult && s.magCalResult != 1) {
-      static const char* const kFail[] = {"", "", "FAILED: TOO SHORT", "FAILED: ROTATE MORE", "FAILED: TRY AGAIN"};
-      row("CAL", kFail[s.magCalResult < 5 ? s.magCalResult : 4], kRed);
+      static const char* const kFail[] = {"",          "",           "FAILED: TOO SHORT", "FAILED: ROTATE MORE",
+                                          "FAILED: TRY AGAIN", "NOT RUNNING", "NOT SAVED"};
+      row("CAL", kFail[s.magCalResult < 7 ? s.magCalResult : 4], kRed);
     } else if (s.magCalibrated) {
       snprintf(b, sizeof(b), "%s %.0fUT NOW %.0f", showResult ? "DONE" : "ON", s.magField, now3);
       row("CAL", b, kGreen);
@@ -550,6 +522,11 @@ bool resetPeaks = false;
 // console can start and end it too).
 bool magCollecting = false;
 int64_t magStartAt = 0, magLocalAt = 0;
+// Collection session the display follows: the number our own start returned, or one started from the serial
+// console. Progress in a Status counts only when it carries this number (an older Status may still hold the
+// previous collection's counts, even while saying it is collecting).
+uint32_t magSession = 0;
+bool magSessionKnown = false;
 
 void magCalEnd(bool finish, int64_t now) {
   if (finish) {
@@ -593,7 +570,8 @@ void pollButtons(int64_t now) {
       } else if (page == 1) {
         resetPeaks = true;
       } else if (page == 2) {
-        onMagCalStart();
+        magSession = onMagCalStart();
+        magSessionKnown = true;
         magCollecting = true;
         magStartAt = magLocalAt = now;
       }
@@ -621,13 +599,23 @@ void displayTask(void*) {
     gv = gs;
     portEXIT_CRITICAL(&stLock);
     // Calibration: finish by itself once there is plenty of rotation, give up after a while.
-    if (now - magLocalAt > 500000) {
-      if (s.magCollecting && !magCollecting) magStartAt = now;
+    // Session numbers only grow: a Status with a smaller number than ours is older than our own start (the logger
+    // can go up to ~1 s between updates while the GNSS is silent) and is ignored, however long it lingers.
+    const bool stale = magSessionKnown && static_cast<int32_t>(s.magCalSession - magSession) < 0;
+    if (now - magLocalAt > 500000 && !stale) {
       magCollecting = s.magCollecting;
+      // A newer session we did not start (a (re)start from the serial console): follow it, 2 minutes from now.
+      if (s.magCollecting && (!magSessionKnown || s.magCalSession != magSession)) {
+        magStartAt = now;
+        magSession = s.magCalSession;
+        magSessionKnown = true;
+      }
     }
     if (magCollecting) {
       page = 2;
-      if (s.magCalComplete && s.magCalSamples >= kMagAutoFinishSamples) {
+      // Only on the counts of the session we follow (not the previous collection's, see magSession).
+      const bool current = magSessionKnown && s.magCalSession == magSession;
+      if (current && s.magCalComplete && s.magCalSamples >= kMagAutoFinishSamples) {
         magCalEnd(true, now);
       } else if (now - magStartAt > kMagTimeoutUs) {
         magCalEnd(false, now);

@@ -42,6 +42,8 @@ struct Status {
   float ax, ay, az;      // G, BMI270 axes, mean over the epoch
   float gx, gy, gz;      // deg/s
   float mx, my, mz;      // uT (calibrated when magCalibrated)
+  bool carValid;         // carG is known (gravity learnt while standing still)
+  float carG[3];         // G in the car's axes: x forward, y left, z up (see carframe.h)
 
   // Magnetometer calibration
   bool magCalibrated;
@@ -50,7 +52,9 @@ struct Status {
   uint32_t magCalSamples;
   float magCoverage[3];  // 0..1 per axis
   bool magCalComplete;   // enough rotation: finishing now will very likely succeed
-  uint8_t magCalResult;  // last finish: 0 none yet, 1 ok, 2 too few samples, 3 not rotated, 4 bad fit
+  uint32_t magCalSession;  // changes on every start of a collection (also from the serial console)
+  uint8_t magCalResult;  // last finish: 0 none yet, 1 ok, 2 too few samples, 3 not rotated, 4 bad fit,
+                         // 5 not running, 6 applied but not saved
   int64_t magCalResultAtUs;
   float pressureHpa, tempC;
 };
@@ -66,7 +70,7 @@ void onLongPress();
 
 // Implemented by the logger, called by the display: start collecting for the magnetometer calibration,
 // finish it (fit, apply, save; the result shows up in Status::magCalResult), or cancel it.
-void onMagCalStart();
+uint32_t onMagCalStart();  // returns the new session (Status::magCalSession once the logger reports it)
 void onMagCalFinish();
 void onMagCalCancel();
 

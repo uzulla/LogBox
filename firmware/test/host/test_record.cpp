@@ -1,5 +1,6 @@
 // Host tests for components/record: the CSV row must stay readable by log-viewer (same leading columns as the
 // RaceBox logs), and the JSON must fit one UDP datagram.
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -22,6 +23,7 @@ record::Record sample() {
   p.fixType = 3, p.flags = 0x01, p.numSV = 14;
   p.lat = 356'812'360, p.lon = 1'397'671'250;
   p.hMSL = 40'500, p.hAcc = 1'200, p.gSpeed = 27'778, p.headMot = 9'000'000;
+  p.headAcc = 123'000, p.sAcc = 150;  // 1.23 deg, 0.15 m/s
   r.imu.n = 8;
   r.imu.ax = 0.1f, r.imu.ay = -0.25f, r.imu.az = 0.98f;
   r.imu.gx = 1.5f, r.imu.gy = -2.0f, r.imu.gz = 30.25f;
@@ -77,6 +79,8 @@ void test_csv_row() {
   TEST_ASSERT_EQUAL_STRING("", f[16].c_str());  // batt
   TEST_ASSERT_EQUAL_STRING("1013.25", f[21].c_str());
   TEST_ASSERT_EQUAL_STRING("1", f[23].c_str());  // mag_cal
+  TEST_ASSERT_EQUAL_STRING("1.23", f[24].c_str());  // head_acc_deg
+  TEST_ASSERT_EQUAL_STRING("0.54", f[25].c_str());  // speed_acc_kmh
 }
 
 void test_csv_row_without_gnss_and_sensors() {
@@ -91,14 +95,44 @@ void test_csv_row_without_gnss_and_sensors() {
   TEST_ASSERT_EQUAL_STRING("0", f[2].c_str());  // no fix
   TEST_ASSERT_EQUAL_STRING("", f[10].c_str());  // no IMU
   TEST_ASSERT_EQUAL_STRING("", f[23].c_str());  // no mag
+  TEST_ASSERT_EQUAL_STRING("", f[24].c_str());  // no GNSS
 }
 
 void test_json_fits_and_fields() {
   char buf[record::kMaxUdpPayload + 1];
-  const size_t n = record::toJson(sample(), 7, buf, sizeof(buf));
+  record::Record r = sample();
+  r.carValid = true;
+  r.carG[0] = -0.3f, r.carG[1] = 0.25f, r.carG[2] = 0.98f;
+  r.carGyro[0] = 1, r.carGyro[1] = 2, r.carGyro[2] = -15.5f;
+  r.pvt.flags2 = 0xE0, r.pvt.nano = 123'456'789;
+  const size_t n = record::toJson(r, 7, "logbo-06FA", buf, sizeof(buf));
   TEST_ASSERT_GREATER_THAN(0, n);
-  TEST_ASSERT_TRUE(strstr(buf, "\"type\":\"sample\",\"seq\":7,\"gnss\":true") != nullptr);
-  TEST_ASSERT_TRUE(strstr(buf, "\"time\":\"2026-11-15T05:06:06.999000Z\"") != nullptr);
+  // Same leading members as esp32-racebox-bridge, so lapcam's osd-feed (match type=racebox, g_x / g_y,
+  // speed_mps, lat / lon / latlon_valid) and other receivers written for it work unchanged.
+  TEST_ASSERT_TRUE(strstr(buf, "{\"type\":\"racebox\",\"seq\":7,\"device\":\"logbo-06FA\",\"itow\":") == buf);
+  TEST_ASSERT_TRUE(strstr(buf, "\"time\":\"2026-11-15T05:06:07.123456789Z\",\"time_valid\":true,\"time_confirmed\":true") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"lat\":35.6812360,\"lon\":139.7671250,\"latlon_valid\":true") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"speed_mps\":27.778,") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"g\":{\"x\":-0.300,\"y\":0.250,\"z\":0.980},\"gyro_dps\":{\"x\":1.00,\"y\":2.00,\"z\":-15.50}") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"gnss\":true,\"vel_ned_mps\":{") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"g_sensor\":{\"x\":0.100,") != nullptr);
+  // Car axes unknown yet: null (osd-feed hides the ball)
+  r.carValid = false;
+  TEST_ASSERT_GREATER_THAN(0, record::toJson(r, 7, "logbo-06FA", buf, sizeof(buf)));
+  TEST_ASSERT_TRUE(strstr(buf, "\"g\":null,\"gyro_dps\":null") != nullptr);
+  // NaN never reaches the JSON (it would make the datagram invalid)
+  r.carValid = true;
+  r.carG[1] = NAN;
+  r.imu.mx = INFINITY;
+  TEST_ASSERT_GREATER_THAN(0, record::toJson(r, 7, "logbo-06FA", buf, sizeof(buf)));
+  TEST_ASSERT_TRUE(strstr(buf, "\"g\":null,\"gyro_dps\":null") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"mag_ut\":null") != nullptr);
+  TEST_ASSERT_NULL(strstr(buf, "nan"));
+  TEST_ASSERT_NULL(strstr(buf, "inf"));
+  // Negative nano rolls the second back
+  r = sample();
+  TEST_ASSERT_GREATER_THAN(0, record::toJson(r, 7, "x", buf, sizeof(buf)));
+  TEST_ASSERT_TRUE(strstr(buf, "\"time\":\"2026-11-15T05:06:06.999000000Z\"") != nullptr);
   TEST_ASSERT_TRUE(strstr(buf, "\"press_hpa\":1013.25") != nullptr);
   TEST_ASSERT_TRUE(strstr(buf, "\"mag_cal\":true") != nullptr);
   // Widest values still fit one datagram.
@@ -111,7 +145,13 @@ void test_json_fits_and_fields() {
   w.imu.ax = w.imu.ay = w.imu.az = -16.0f;
   w.imu.gx = w.imu.gy = w.imu.gz = -2000.0f;
   w.imu.mx = w.imu.my = w.imu.mz = -2500.0f;
-  TEST_ASSERT_GREATER_THAN(0, record::toJson(w, 4'000'000'000u, buf, sizeof(buf)));
+  w.carValid = true;
+  for (int k = 0; k < 3; k++) w.carG[k] = -16.0f, w.carGyro[k] = -2000.0f;
+  w.pvt.pDOP = 65535, w.pvt.fixType = 255, w.pvt.numSV = 255, w.pvt.tAcc = 4'000'000'000u;
+  w.imu.baroValid = true, w.imu.pressureHpa = -1000.0f, w.imu.tempC = -100.0f;
+  const size_t wn = record::toJson(w, 4'000'000'000u, "logbo-FFFF", buf, sizeof(buf));
+  printf("widest JSON: %zu bytes\n", wn);
+  TEST_ASSERT_GREATER_THAN(0, wn);
 }
 
 void runRecordTests() {

@@ -53,14 +53,20 @@ struct MagCalInfo {
   bool calibrated;     // a calibration is applied
   MagCal cal;          // valid when calibrated
   bool collecting;
+  uint32_t session;    // changes on every start (a restart resets samples / coverage)
   uint32_t samples;    // collected so far
   float coverage[3];   // 0..1 per raw axis
   bool complete;       // enough samples and rotation: finishing will very likely succeed
 };
-void magCalStart();               // starts (or restarts) collecting; the current calibration stays applied
-MagCalError magCalFinish();       // fits, and on success applies and saves the result; stops collecting
+uint32_t magCalStart();           // starts (or restarts) collecting; the current calibration stays applied.
+                                  // Returns the new session number (MagCalInfo::session)
+MagCalError magCalFinish();       // fits, and on success applies and saves the result; stops collecting.
+                                  // kNotCollecting when nothing is being collected, kNotSaved when applied
+                                  // but NVS failed
 void magCalCancel();
-void magCalClear();               // forgets the calibration (raw readings from now on)
+bool magCalClear();               // stops any collection and forgets the calibration (raw readings from now
+                                  // on); false when NVS failed
+                                  // (the old one comes back at the next reboot)
 MagCalInfo magCalInfo();
 
 }  // namespace imu
