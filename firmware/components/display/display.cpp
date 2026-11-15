@@ -599,9 +599,12 @@ void displayTask(void*) {
     gv = gs;
     portEXIT_CRITICAL(&stLock);
     // Calibration: finish by itself once there is plenty of rotation, give up after a while.
-    if (now - magLocalAt > 500000) {
+    // Session numbers only grow: a Status with a smaller number than ours is older than our own start (the logger
+    // can go up to ~1 s between updates while the GNSS is silent) and is ignored, however long it lingers.
+    const bool stale = magSessionKnown && static_cast<int32_t>(s.magCalSession - magSession) < 0;
+    if (now - magLocalAt > 500000 && !stale) {
       magCollecting = s.magCollecting;
-      // A session we did not start (a (re)start from the serial console): follow it, 2 minutes from now.
+      // A newer session we did not start (a (re)start from the serial console): follow it, 2 minutes from now.
       if (s.magCollecting && (!magSessionKnown || s.magCalSession != magSession)) {
         magStartAt = now;
         magSession = s.magCalSession;
