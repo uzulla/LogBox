@@ -5,7 +5,7 @@
 # ///
 """Talk to the ESP32's BLE config service (advertised for 60 s after boot).
 
-    uv run tools/ble-config.py status      # RaceBox link, Wi-Fi SSID, connected?, IP
+    uv run tools/ble-config.py status      # GNSS / SD state, Wi-Fi SSID, connected?, IP
     uv run tools/ble-config.py wifi-set    # prompts for SSID and password, saved to NVS
 
 The link is encrypted (Just Works pairing, nothing stored): the device asks
@@ -61,7 +61,7 @@ async def when_encrypted(op, timeout=30):
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("command", choices=["status", "wifi-set"])
-    ap.add_argument("--name", help="advertised name, e.g. ESP32-RaceBox-Bridge-06FA (default: first found)")
+    ap.add_argument("--name", help="advertised name, e.g. logbo-06FA (default: first found)")
     ap.add_argument("--timeout", type=float, default=30)
     args = ap.parse_args()
 

@@ -1,49 +1,49 @@
-# Firmware is built and flashed on the host that has ESP-IDF and the board (default: wvx).
-#   mise run fw:build                  # VARIANT=c6-geek (default), c6 or s3
-#   VARIANT=s3 mise run fw:flash
+# Firmware is built and flashed on the host that has ESP-IDF and the M5Stack (default: wvx).
+#   mise run fw:build
+#   mise run fw:flash
+#   mise run fw:monitor
 # Wi-Fi is configured over BLE from this machine.
 #   mise run ble:status
 #   mise run ble:wifi-set
 
 [env]
-VARIANT = "{{ get_env(name='VARIANT', default='c6-geek') }}"
 BUILD_HOST = "{{ get_env(name='BUILD_HOST', default='wvx') }}"
 IDF_EXPORT = "~/esp/esp-idf-v6.1/export.sh"
-SERIAL_PORT = "{{ get_env(name='SERIAL_PORT', default='/dev/ttyACM0') }}"
+SERIAL_PORT = "{{ get_env(name='SERIAL_PORT', default='/dev/ttyUSB0') }}"
+REMOTE_DIR = "logbo"
 
 [tasks."fw:sync"]
-description = "rsync firmware/ and tools/variant.sh to $BUILD_HOST:racebox/"
+description = "rsync firmware/ to $BUILD_HOST:$REMOTE_DIR/"
 run = """
-rsync -a --delete --exclude 'build*' --exclude sdkconfig --exclude sdkconfig.old \
-  --exclude sdkconfig.c6-geek --exclude sdkconfig.c6 --exclude sdkconfig.s3 \
-  --exclude managed_components firmware/ $BUILD_HOST:racebox/
+rsync -a --delete --exclude 'build*' --exclude sdkconfig --exclude sdkconfig.old --exclude managed_components \
+  firmware/ $BUILD_HOST:$REMOTE_DIR/
 """
 
 [tasks."fw:build"]
-description = "Build $VARIANT (c6-geek | c6 | s3) on $BUILD_HOST"
+description = "Build on $BUILD_HOST"
 depends = ["fw:sync"]
-run = """
-. tools/variant.sh
-ssh $BUILD_HOST ". $IDF_EXPORT >/dev/null 2>&1; cd ~/racebox && IDF_TARGET=$IDF_TARGET_NAME idf.py $IDF_ARGS build"
-"""
+run = "ssh $BUILD_HOST \". $IDF_EXPORT >/dev/null 2>&1; cd ~/$REMOTE_DIR && idf.py build\""
 
 [tasks."fw:flash"]
-description = "Build and flash $VARIANT to $SERIAL_PORT on $BUILD_HOST"
+description = "Build and flash to $SERIAL_PORT on $BUILD_HOST"
 depends = ["fw:sync"]
-run = """
-. tools/variant.sh
-ssh $BUILD_HOST ". $IDF_EXPORT >/dev/null 2>&1; cd ~/racebox && IDF_TARGET=$IDF_TARGET_NAME idf.py $IDF_ARGS -p $SERIAL_PORT build flash"
-"""
+run = "ssh $BUILD_HOST \". $IDF_EXPORT >/dev/null 2>&1; cd ~/$REMOTE_DIR && idf.py -p $SERIAL_PORT build flash\""
+
+[tasks."fw:monitor"]
+description = "Serial monitor on $BUILD_HOST (Ctrl-] to quit)"
+run = "ssh -t $BUILD_HOST \". $IDF_EXPORT >/dev/null 2>&1; cd ~/$REMOTE_DIR && idf.py -p $SERIAL_PORT monitor\""
+
+[tasks."fw:test"]
+description = "Run the host unit tests on $BUILD_HOST"
+depends = ["fw:sync"]
+run = "ssh $BUILD_HOST \". $IDF_EXPORT >/dev/null 2>&1; cd ~/$REMOTE_DIR/test/host && cmake -S . -B build >/dev/null && cmake --build build && ./build/test_gnss\""
 
 [tasks."fw:ap"]
-description = "Show the soft-AP SSID/password of the last $VARIANT build (new on every build)"
-run = """
-. tools/variant.sh
-ssh $BUILD_HOST "cat ~/racebox/build-$VARIANT/esp-idf/main/ap_credentials.h"
-"""
+description = "Show the soft-AP SSID/password of the last build (new on every build)"
+run = "ssh $BUILD_HOST \"cat ~/$REMOTE_DIR/build/esp-idf/main/ap_credentials.h\""
 
 [tasks."ble:status"]
-description = "Show RaceBox link / Wi-Fi state of the bridge over BLE"
+description = "Show GNSS / SD / Wi-Fi state of the logger over BLE"
 run = "uv run tools/ble-config.py status"
 
 [tasks."ble:wifi-set"]

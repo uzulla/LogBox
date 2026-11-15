@@ -1,17 +1,5 @@
 #include "sdlog.h"
 
-#ifndef RACEBOX_SDLOG
-
-namespace sdlog {
-void init() {}
-void write(const racebox::Data&, bool) {}
-void requestStop() {}
-void requestStart() {}
-State state() { return State::Off; }
-}  // namespace sdlog
-
-#else
-
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,10 +8,8 @@ State state() { return State::Off; }
 
 #include <atomic>
 
-#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
-#include "esp_rom_gpio.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
@@ -31,31 +17,23 @@ State state() { return State::Off; }
 #include "freertos/task.h"
 #include "nvs.h"
 #include "sdmmc_cmd.h"
-#include "soc/spi_periph.h"
 
 namespace sdlog {
 namespace {
 
 const char* TAG = "sdlog";
 
-// Waveshare ESP32-C6-GEEK (v1): the TF slot is on GPIO18-20/23 and the LCD on GPIO1/2/5, but the
-// ESP32-C6 has only one general purpose SPI host (SPI2). So SPI2 is initialised once with the TF
-// pins, and its clock and MOSI are also routed to the LCD's pins through the GPIO matrix. Each
-// device only listens while its own CS is low, so they share the bus without noticing each other.
-constexpr spi_host_device_t kHost = SPI2_HOST;
-constexpr gpio_num_t kSdClk = GPIO_NUM_19, kSdMosi = GPIO_NUM_18, kSdMiso = GPIO_NUM_20, kSdCs = GPIO_NUM_23;
-constexpr gpio_num_t kLcdClk = GPIO_NUM_1, kLcdMosi = GPIO_NUM_2;
-constexpr int kBusMaxTransfer = 240 * 135 * 2;  // one LCD frame
+// M5Stack (Basic / Gray): the TF slot and the LCD share VSPI (SPI3: SCLK 18, MOSI 23, MISO 19). The card's CS
+// is GPIO4, the LCD's GPIO14; the bus is initialised here and the display adds itself as a second device.
+constexpr spi_host_device_t kHost = SPI3_HOST;
+constexpr gpio_num_t kSdClk = GPIO_NUM_18, kSdMosi = GPIO_NUM_23, kSdMiso = GPIO_NUM_19, kSdCs = GPIO_NUM_4;
+constexpr int kBusMaxTransfer = 320 * 48 * 2;  // one LCD band (the display draws the screen in bands)
 
 constexpr const char* kMount = "/sdcard";
-constexpr int kQueueLen = 64;  // about 2.5 s of 25 Hz data
+constexpr int kQueueLen = 64;  // about 2.5 s at 25 Hz
 constexpr int64_t kFlushUs = 1000000;
 
-struct Item {
-  racebox::Data d;
-  int64_t atUs;
-  bool micro;
-};
+using Item = record::Record;
 
 std::atomic<State> gState{State::Off};
 std::atomic<bool> gStop{false};
@@ -68,16 +46,6 @@ uint32_t gSeq;
 std::atomic<bool> gStarting{false};
 uint32_t gDropped;
 
-void routeToLcdPins() {
-  const auto& sig = spi_periph_signal[kHost];
-  const struct { gpio_num_t pin; uint32_t signal; } map[] = {{kLcdClk, sig.spiclk_out}, {kLcdMosi, sig.spid_out}};
-  for (const auto& m : map) {
-    esp_rom_gpio_pad_select_gpio(m.pin);
-    gpio_set_direction(m.pin, GPIO_MODE_OUTPUT);
-    esp_rom_gpio_connect_out_signal(m.pin, m.signal, false, false);
-  }
-}
-
 bool initBus() {
   spi_bus_config_t bus = {};
   bus.mosi_io_num = kSdMosi;
@@ -86,9 +54,7 @@ bool initBus() {
   bus.quadwp_io_num = -1;
   bus.quadhd_io_num = -1;
   bus.max_transfer_sz = kBusMaxTransfer;
-  if (spi_bus_initialize(kHost, &bus, SPI_DMA_CH_AUTO) != ESP_OK) return false;
-  routeToLcdPins();
-  return true;
+  return spi_bus_initialize(kHost, &bus, SPI_DMA_CH_AUTO) == ESP_OK;
 }
 
 bool mountCard() {
@@ -148,36 +114,16 @@ bool openLog() {
   if (!gFile) return false;
   static char buf[4096];
   setvbuf(gFile, buf, _IOFBF, sizeof(buf));
-  const int n = fprintf(gFile,
-      "# session %u seq %u\n"
-      "# RaceBox log (ESP32 bridge). One row per RaceBox data message, t_ms = ms since this file was opened\n"
-      "# lat/lon: deg, alt: m (MSL), speed: km/h, heading: deg, hacc: m, acc: G (RaceBox axes), gyro: deg/s, "
-      "batt: %% (RaceBox Mini) or V (RaceBox Micro)\n"
-      "t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,batt,charging\n",
-      static_cast<unsigned>(gSession), static_cast<unsigned>(gSeq));
-  return n > 0;
+  char head[768];
+  const size_t n = record::csvHeader(head, sizeof(head), gSession, gSeq);
+  return n && fwrite(head, 1, n, gFile) == n;
 }
 
 // Returns false on a write error (disk full, card removed, ...).
 bool writeRow(const Item& it, int64_t startUs) {
-  const racebox::Data& d = it.d;
-  char utc[32] = "";
-  if (d.dateTimeValid()) {
-    snprintf(utc, sizeof(utc), "%04u-%02u-%02uT%02u:%02u:%02u.%03dZ", d.year, d.month, d.day, d.hour, d.minute,
-             d.second, static_cast<int>((d.nanoseconds / 1000000 + 1000) % 1000));
-  }
-  char batt[12];
-  if (it.micro) {
-    snprintf(batt, sizeof(batt), "%.1f", (d.battery) / 10.0);
-  } else {
-    snprintf(batt, sizeof(batt), "%u", d.battery & 0x7F);
-  }
-  const int n = fprintf(gFile, "%ld,%s,%u,%u,%.7f,%.7f,%.1f,%.2f,%.2f,%.1f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%s,%d\n",
-                        static_cast<long>((it.atUs - startUs) / 1000), utc, d.fixStatus, d.numSV, d.lat / 1e7,
-                        d.lon / 1e7, d.mslAlt / 1000.0, d.speed * 0.0036, d.heading / 1e5, d.hAcc / 1000.0,
-                        d.gX / 1000.0, d.gY / 1000.0, d.gZ / 1000.0, d.rotX / 100.0, d.rotY / 100.0, d.rotZ / 100.0,
-                        batt, (!it.micro && (d.battery & 0x80)) ? 1 : 0);
-  return n > 0;
+  char row[320];
+  const size_t n = record::csvRow(it, startUs, row, sizeof(row));
+  return n && fwrite(row, 1, n, gFile) == n;
 }
 
 bool flushFile() { return fflush(gFile) == 0 && fsync(fileno(gFile)) == 0; }
@@ -266,10 +212,9 @@ void init() {
   startLogging();
 }
 
-void write(const racebox::Data& d, bool micro) {
+void write(const record::Record& r) {
   if (gState != State::Rec) return;
-  const Item it{d, esp_timer_get_time(), micro};
-  if (xQueueSend(gQueue, &it, 0) != pdTRUE) gDropped++;
+  if (xQueueSend(gQueue, &r, 0) != pdTRUE) gDropped++;
 }
 
 void requestStop() {
@@ -288,6 +233,9 @@ void requestStart() {
 
 State state() { return gState; }
 
-}  // namespace sdlog
+const char* fileName() {
+  const char* slash = strrchr(gPath, '/');
+  return slash ? slash + 1 : gPath;
+}
 
-#endif
+}  // namespace sdlog

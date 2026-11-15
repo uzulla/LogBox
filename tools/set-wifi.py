@@ -3,12 +3,12 @@
 # requires-python = ">=3.9"
 # dependencies = ["pyserial"]
 # ///
-"""Save Wi-Fi credentials to the ESP32's NVS over USB serial.
+"""Save Wi-Fi credentials to the ESP32's NVS over USB serial (UART0 console).
 
 The password is read with getpass and only sent to the device, so it never
 ends up in the source tree or the firmware image.
 
-    uv run tools/set-wifi.py [--port /dev/ttyACM0]
+    uv run tools/set-wifi.py [--port /dev/ttyUSB0]
     uv run tools/set-wifi.py --clear
 """
 import argparse
@@ -21,7 +21,7 @@ import serial
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default="/dev/ttyUSB0")
     ap.add_argument("--clear", action="store_true", help="erase the saved credentials")
     args = ap.parse_args()
 
@@ -39,14 +39,18 @@ def main() -> int:
     ser.port = args.port
     ser.baudrate = 115200
     ser.timeout = 0.2
-    # The USB-Serial/JTAG port resets the chip while RTS=1 and DTR=0. pyserial
-    # applies DTR before RTS on open, so leave DTR asserted and only drop RTS.
+    # The M5Stack's CP2104 drives EN from RTS and GPIO0 from DTR (auto-reset circuit):
+    # keep both released so opening the port neither resets the ESP32 nor selects the bootloader.
     ser.rts = False
+    ser.dtr = False
     try:
         ser.open()
     except serial.SerialException as e:
         print(f"{e}\nRun this on the machine the ESP32 is plugged into.", file=sys.stderr)
         return 1
+    # Some hosts (the Linux cp210x driver) still pulse the lines on open and reset the ESP32 anyway:
+    # wait until it has booted (the console is up a second after reset) before sending the command.
+    time.sleep(2.5)
     ser.reset_input_buffer()
     ser.write((cmd + "\n").encode())
 

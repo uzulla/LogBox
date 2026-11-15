@@ -1,30 +1,27 @@
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# M5Stack Basic / Gray: ESP32-D0WDQ6, 4 MB flash, no PSRAM. Console on UART0 (CP2104 USB bridge).
+CONFIG_IDF_TARGET="esp32"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
-# Console on the built-in USB-Serial/JTAG port
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
-
-# BLE: NimBLE host. Central to the RaceBox; peripheral for the config service.
-# The peripheral role is needed even without the config service: it brings in the
-# GATT server, and without it requests from the RaceBox (e.g. its MTU exchange)
-# are rejected and it never starts notifying.
+# BLE: NimBLE host, peripheral only (Wi-Fi config service).
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
-CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
-# RaceBox (central) + one config client (peripheral)
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
-CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
-# Pairing with the config client (LE Secure Connections, software ECDH) keeps the
-# host busy for a while; meanwhile RaceBox notifications keep arriving. The
-# default pools (12 msys blocks, 24 ACL buffers) run dry, which fails the pairing
-# and can stall the RaceBox link.
-CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=48
-CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=48
-CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=48
 
-# Power management: dynamic frequency scaling between RACEBOX_CPU_MIN_MHZ and this
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+# log_0001_01.csv is not an 8.3 name
+CONFIG_FATFS_LFN_HEAP=y
+
+# Power management: dynamic frequency scaling between LOGBO_CPU_MIN_MHZ and this
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_PM_ENABLE=y
+# 1 kHz tick: the IMU and GNSS tasks run at 200 / 25 Hz
+CONFIG_FREERTOS_HZ=1000
+
+# Wi-Fi + BLE overflow the classic ESP32's IRAM by default; the Wi-Fi fast paths go to flash (throughput
+# is not needed here: a few KB/s of UDP).
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n

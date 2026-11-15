@@ -1,22 +1,23 @@
-menu "RaceBox bridge"
+menu "logbo"
 
-config RACEBOX_UDP_PORT
+config LOGBO_GNSS_RATE_HZ
+    int "GNSS navigation rate (Hz); one log row per epoch"
+    range 1 25
+    default 25
+    help
+        The NEO-M9N supports up to 25 Hz. If the receiver rejects the rate, 10 Hz is used.
+
+config LOGBO_UDP_PORT
     int "UDP port the JSON datagrams are broadcast to"
     default 5005
 
-config RACEBOX_NAME_FILTER
-    string "Only connect to devices whose name contains this (e.g. serial number)"
-    default ""
-    help
-        Empty matches any device whose name starts with "RaceBox ".
-
-config RACEBOX_CPU_MIN_MHZ
+config LOGBO_CPU_MIN_MHZ
     int "Minimum CPU frequency for dynamic frequency scaling (MHz)"
     default 80
     help
         One of 40, 80, 160, 240. The maximum is the default CPU frequency.
 
-config RACEBOX_CONFIG_WINDOW_S
+config LOGBO_CONFIG_WINDOW_S
     int "Seconds after boot during which the BLE config service is advertised"
     default 60
 

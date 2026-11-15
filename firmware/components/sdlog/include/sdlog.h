@@ -1,6 +1,5 @@
-// Logs the RaceBox data messages to a FAT32 microSD card as CSV (same layout as the M5Stack gmeter
-// logs: `#` comment lines, a header row, one row per sample). Only the variants built with
-// RACEBOX_SDLOG (the C6-GEEK) have a card slot; elsewhere every call below does nothing.
+// Logs the records (one per GNSS epoch) to a FAT32 microSD card as CSV (record::csvHeader / csvRow:
+// `#` comment lines, a header row, one row per record), on the M5Stack's TF slot.
 //
 // Recording starts by itself at boot if a card is present. No card, a card that cannot be mounted
 // (exFAT, ...) or a full / failing card means no recording, and nothing is retried by itself. A long
@@ -10,7 +9,7 @@
 
 #include <stdint.h>
 
-#include "racebox.h"
+#include "record.h"
 
 namespace sdlog {
 
@@ -22,16 +21,18 @@ enum class State : uint8_t {
   Failed,  // disk full or write error; recording stopped
 };
 
-// Initialises the SPI bus (shared with the LCD, so call it before bridge::frontendStart()), mounts the
+// Initialises the SPI bus (shared with the LCD, so call it before logger::displayStart()), mounts the
 // card and starts recording.
 void init();
-// Queues one data message; never blocks. `micro`: the battery field is a voltage.
-void write(const racebox::Data& d, bool micro);
+// Queues one record; never blocks (dropped when the queue is full).
+void write(const record::Record& r);
 // Stops recording and unmounts the card (returns at once; state() goes Saving, then Safe).
 void requestStop();
 // From Safe, Failed or Off (no card at boot): mounts the card and records to the next file
 // (log_<session>_02.csv, ...). This is how a card inserted later, or after SD ERR, is used.
 void requestStart();
 State state();
+// Name of the current / last log file ("log_0012_01.csv"), "" if none yet.
+const char* fileName();
 
 }  // namespace sdlog
