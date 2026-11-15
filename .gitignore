@@ -3,3 +3,4 @@ firmware/sdkconfig
 firmware/sdkconfig.old
 firmware/test/host/build/
 client/logbo-dump
+__pycache__/
