@@ -112,6 +112,7 @@ struct BleClient {
   int listStart;
 };
 static BleClient bleClients[CONFIG_BT_NIMBLE_MAX_CONNECTIONS];
+static std::atomic<uint32_t> wifiListGen{1};  // bumped on every change of the list (shown as "gen")
 static int bleClientCount = 0;
 static portMUX_TYPE bleClientsLock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -182,6 +183,7 @@ static void wifiTargetCopy(char (&out)[33]) {
 // the top of the new list.
 static void wifiListChanged() {
   wifiCount = wifinets::count();
+  wifiListGen++;
   resetWifiListStarts();
   if (wifiEvents) xEventGroupSetBits(wifiEvents, kWifiChanged);
 }
@@ -618,7 +620,8 @@ static int onWifiAccess(uint16_t connHandle, uint16_t, ble_gatt_access_ctxt* ctx
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
     static wifinets::Entry list[wifinets::kMax];
     static char json[512];  // BLE host task only
-    const size_t n = wifinets::listJson(list, wifinets::load(list), wifiListStartOf(connHandle), json, sizeof(json));
+    const size_t n = wifinets::listJson(list, wifinets::load(list), wifiListStartOf(connHandle), wifiListGen.load(),
+                                        json, sizeof(json));
     return n && os_mbuf_append(ctxt->om, json, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
   if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
@@ -627,7 +630,11 @@ static int onWifiAccess(uint16_t connHandle, uint16_t, ble_gatt_access_ctxt* ctx
     if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf) - 1, &len) != 0) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     buf[len] = '\0';
     int start;
-    if (wifinets::parseListRequest(buf, &start)) {
+    uint32_t gen;
+    bool hasGen;
+    if (wifinets::parseListRequest(buf, &start, &gen, &hasGen)) {
+      // A request for a page of an older list: refused (the client starts over); "list=0" always works
+      if (hasGen && gen != wifiListGen.load() && start != 0) return 0x83;
       setWifiListStart(connHandle, start);
       return 0;
     }
@@ -984,8 +991,8 @@ static void handleCommand(char* line) {
                                                              : "ERR NVS write failed");
   } else if (strcmp(line, "wifi-list") == 0) {
     static wifinets::Entry list[wifinets::kMax];
-    static char json[wifinets::kMax * (33 * 6 + 48) + 48];  // one page holds them all; static: ~2 KB
-    if (wifinets::listJson(list, wifinets::load(list), 0, json, sizeof(json))) printf("%s\n", json);
+    static char json[wifinets::kMax * (33 * 6 + 48) + 64];  // one page holds them all; static: ~2 KB
+    if (wifinets::listJson(list, wifinets::load(list), 0, wifiListGen.load(), json, sizeof(json))) printf("%s\n", json);
   } else if (strcmp(line, "wifi-clear") == 0) {
     if (wifinets::clear() != wifinets::StoreError::kNone) {
       printf("ERR NVS write failed\n");
