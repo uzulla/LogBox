@@ -121,7 +121,7 @@ off: Wi-Fi is not started (no UDP), BLE stays so they can be turned back on.
 
 ### BLE config service
 
-The ESP32 advertises as `logbo-XXXX` with a config service all the time (`CONFIG_LOGBO_CONFIG_WINDOW_S` > 0
+Up to 3 clients can be connected at once (`CONFIG_BT_NIMBLE_MAX_CONNECTIONS`; advertising goes on while there is room). The ESP32 advertises as `logbo-XXXX` with a config service all the time (`CONFIG_LOGBO_CONFIG_WINDOW_S` > 0
 limits it to that many seconds after boot; the screen's top bar shows `BT` while it advertises). The link is encrypted (Just Works pairing, no bond stored), so macOS asks to confirm ("接続") on each connection.
 
 **Web page** (`docs/index.html`, Web Bluetooth: Chrome / Edge on Android or a PC, over HTTPS or as a local file;
