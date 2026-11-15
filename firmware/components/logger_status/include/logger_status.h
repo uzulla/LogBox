@@ -11,6 +11,7 @@ struct Status {
   bool configWindow;     // BLE config service is being advertised
   bool wifiConfigured;
   bool wifiUp;
+  bool apOn, staOn;      // radio switches of this boot (off = not started)
   int8_t rssi;
   char ip[16];
   char ssid[33];

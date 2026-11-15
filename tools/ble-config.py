@@ -6,9 +6,12 @@
 """Talk to the ESP32's BLE config service (advertised whenever the logger is on).
 
     uv run tools/ble-config.py status      # GNSS / SD state, Wi-Fi SSID, connected?, IP
-    uv run tools/ble-config.py wifi-set    # prompts for SSID and password, saved to NVS
-    uv run tools/ble-config.py mag         # magnetometer calibration state
-    uv run tools/ble-config.py ctrl rec=0  # a command: rec=1|0, mag=start|done|cancel|clear, wifi=clear, reboot=1
+    uv run tools/ble-config.py wifi-set    # prompts for SSID, password and priority; adds / updates a network
+    uv run tools/ble-config.py wifi-list   # the networks (up to 8, tried from the highest priority)
+    uv run tools/ble-config.py wifi-del HomeAP
+    uv run tools/ble-config.py mag         # magnetometer calibration state and the AP / STA switches
+    uv run tools/ble-config.py ctrl rec=0  # a command: rec=1|0, mag=start|done|cancel|clear, wifi=clear,
+                                           #   ap=0|1, sta=0|1 (from the next boot), reboot=1
 
 The same service is used by the Web Bluetooth page docs/index.html.
 
@@ -20,6 +23,7 @@ import asyncio
 import getpass
 import json
 import sys
+from urllib.parse import quote
 
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
@@ -65,8 +69,8 @@ async def when_encrypted(op, timeout=30):
 
 async def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["status", "wifi-set", "mag", "ctrl"])
-    ap.add_argument("value", nargs="?", help="ctrl: the command, e.g. rec=0")
+    ap.add_argument("command", choices=["status", "wifi-set", "wifi-list", "wifi-del", "mag", "ctrl"])
+    ap.add_argument("value", nargs="?", help="ctrl: the command, e.g. rec=0; wifi-del: the SSID")
     ap.add_argument("--name", help="advertised name, e.g. logbo-06FA (default: first found)")
     ap.add_argument("--timeout", type=float, default=30)
     args = ap.parse_args()
@@ -74,19 +78,38 @@ async def main() -> int:
     if args.command == "wifi-set":
         ssid = input("SSID: ")
         password = getpass.getpass("Password: ")
-        if not ssid or "\t" in ssid + password:
-            print("SSID must be non-empty; tabs are not allowed", file=sys.stderr)
+        try:
+            prio = int(input("Priority (higher first) [0]: ").strip() or "0")
+        except ValueError:
+            prio = None
+        if not ssid or prio is None:
+            print("SSID must be non-empty and the priority a number", file=sys.stderr)
             return 1
+        query = f"ssid={quote(ssid, safe='')}&pass={quote(password, safe='')}&prio={prio}"
 
-    if args.command == "ctrl" and not args.value:
-        print("ctrl needs a command, e.g. rec=0", file=sys.stderr)
+    if args.command in ("ctrl", "wifi-del") and not args.value:
+        print(f"{args.command} needs a value, e.g. {'rec=0' if args.command == 'ctrl' else 'HomeAP'}", file=sys.stderr)
         return 1
 
     dev = await find(args.name, args.timeout)
     async with BleakClient(dev) as client:
         if args.command in ("status", "mag"):
-            data = await when_encrypted(lambda: client.read_gatt_char(STATUS if args.command == "status" else CTRL))
+            uuid = STATUS if args.command == "status" else CTRL
+            data = await when_encrypted(lambda: client.read_gatt_char(uuid))
             print(json.dumps(json.loads(data), indent=2, ensure_ascii=False))
+        elif args.command == "wifi-list":
+            # Pages of at most 512 bytes: "next" is where to continue ("list=<next>", then read again)
+            networks = []
+            page = json.loads(await when_encrypted(lambda: client.read_gatt_char(WIFI)))
+            while True:
+                networks += page["networks"]
+                if page.get("next") is None:
+                    break
+                await client.write_gatt_char(WIFI, f"list={page['next']}".encode(), response=True)
+                page = json.loads(await client.read_gatt_char(WIFI))
+            if "next" in page:
+                await client.write_gatt_char(WIFI, b"list=0", response=True)
+            print(json.dumps({"networks": networks}, indent=2, ensure_ascii=False))
         elif args.command == "ctrl":
             try:
                 await when_encrypted(lambda: client.write_gatt_char(CTRL, args.value.encode(), response=True))
@@ -94,10 +117,18 @@ async def main() -> int:
                 print(f"rejected by the device: {e}", file=sys.stderr)
                 return 1
             print(f"OK {args.value}")
+        elif args.command == "wifi-del":
+            try:
+                await when_encrypted(lambda: client.write_gatt_char(
+                    WIFI, f"ssid={quote(args.value, safe='')}&del=1".encode(), response=True))
+            except BleakError as e:
+                print(f"rejected by the device (no such network?): {e}", file=sys.stderr)
+                return 1
+            print("OK wifi deleted")
         else:
             try:
                 await when_encrypted(
-                    lambda: client.write_gatt_char(WIFI, f"{ssid}\t{password}".encode(), response=True))
+                    lambda: client.write_gatt_char(WIFI, query.encode(), response=True))
             except BleakError as e:
                 print(f"rejected by the device: {e}", file=sys.stderr)
                 return 1
