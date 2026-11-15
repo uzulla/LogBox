@@ -103,6 +103,7 @@ constexpr EventBits_t kWifiGotIp = 1 << 0, kWifiDisconnected = 1 << 1, kWifiChan
 constexpr TickType_t kWifiJoinTimeout = pdMS_TO_TICKS(30000);  // association + DHCP, per network
 constexpr TickType_t kWifiRetryIdle = pdMS_TO_TICKS(10000);    // after every network failed
 static std::atomic<int> wifiCount{0};                           // networks in NVS
+static bool radioApOn = true, radioStaOn = true;                // this boot (see the radio switches below)
 static std::atomic<bool> staAssociated{false};                  // between STA_CONNECTED and STA_DISCONNECTED
 static portMUX_TYPE wifiLock = portMUX_INITIALIZER_UNLOCKED;
 static char wifiTarget[33];  // network being tried or joined, "" if none (guarded by wifiLock)
@@ -119,8 +120,9 @@ static void wifiTargetCopy(char (&out)[33]) {
   taskEXIT_CRITICAL(&wifiLock);
 }
 
-// The list changed (BLE, console): reconnect from the top of the new list.
+// The list changed (BLE, console): count it (also while the STA is off) and reconnect from the top of the new list.
 static void wifiListChanged() {
+  wifiCount = wifinets::count();
   if (wifiEvents) xEventGroupSetBits(wifiEvents, kWifiChanged);
 }
 
@@ -131,6 +133,7 @@ static const char* applyWifiText(const char* text, bool* full = nullptr, bool* n
   switch (wifinets::parse(text, cmd)) {
     case wifinets::ParseError::kNoSsid: return "no SSID";
     case wifinets::ParseError::kTooLong: return "SSID must be 1-32 bytes, password at most 64";
+    case wifinets::ParseError::kInvalid: return "invalid value (NUL byte, or priority not a number in +-1000000)";
     default: break;
   }
   const wifinets::StoreError err =
@@ -167,8 +170,8 @@ static void staTask(void*) {
     const int n = wifinets::load(list);
     wifiCount = n;
     if (!n) {
+      staLeave();  // before clearing the target: the disconnect event is matched against it
       setWifiTarget("");
-      staLeave();
       ESP_LOGW(TAG, "Wi-Fi not configured; set a network over BLE (docs/index.html, tools/ble-config.py) or "
                     "tools/set-wifi.py");
       xEventGroupWaitBits(wifiEvents, kWifiChanged, pdFALSE, pdFALSE, portMAX_DELAY);
@@ -178,15 +181,20 @@ static void staTask(void*) {
     bool joined = false, changed = false;
     for (int i = 0; i < n && !joined && !changed; i++) {
       ESP_LOGI(TAG, "Wi-Fi trying \"%s\" (priority %ld)", list[i].ssid, static_cast<long>(list[i].prio));
+      staLeave();  // leave the previous network while it is still the target (its disconnect event is matched)
       setWifiTarget(list[i].ssid);
       wifi_config_t cfg = {};
-      strlcpy(reinterpret_cast<char*>(cfg.sta.ssid), list[i].ssid, sizeof(cfg.sta.ssid));
-      strlcpy(reinterpret_cast<char*>(cfg.sta.password), list[i].pass, sizeof(cfg.sta.password));
+      // Fixed-size fields: a 32-byte SSID / 64-character PSK fills them with no terminator (strlcpy would cut
+      // the last byte off). The entries are validated to fit.
+      memcpy(cfg.sta.ssid, list[i].ssid, strnlen(list[i].ssid, sizeof(cfg.sta.ssid)));
+      memcpy(cfg.sta.password, list[i].pass, strnlen(list[i].pass, sizeof(cfg.sta.password)));
       cfg.sta.threshold.authmode = list[i].pass[0] ? WIFI_AUTH_WPA_PSK : WIFI_AUTH_OPEN;
-      staLeave();
       xEventGroupClearBits(wifiEvents, kWifiGotIp | kWifiDisconnected);
-      esp_wifi_set_config(WIFI_IF_STA, &cfg);
-      esp_wifi_connect();
+      if (esp_wifi_set_config(WIFI_IF_STA, &cfg) != ESP_OK || esp_wifi_connect() != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi \"%s\": could not start connecting", list[i].ssid);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        continue;
+      }
       // An IP, a failure (disconnect event: wrong password, not found, ...), a new list, or the timeout
       const EventBits_t bits = xEventGroupWaitBits(wifiEvents, kWifiGotIp | kWifiDisconnected | kWifiChanged,
                                                    pdFALSE, pdFALSE, kWifiJoinTimeout);
@@ -202,10 +210,51 @@ static void staTask(void*) {
       xEventGroupWaitBits(wifiEvents, kWifiChanged, pdFALSE, pdFALSE, kWifiRetryIdle);
       continue;
     }
-    // Joined: wait for a disconnect or a new list, then start over from the highest priority
-    xEventGroupWaitBits(wifiEvents, kWifiDisconnected | kWifiChanged, pdFALSE, pdFALSE, portMAX_DELAY);
+    // Joined: a disconnect starts over from the highest priority. A change of the list only does when it touches
+    // the joined network (deleted, password or priority changed) or adds one with a higher priority: leaving the
+    // network also moves the soft AP's channel and drops the phones on it.
+    char joinedSsid[33];
+    wifiTargetCopy(joinedSsid);
+    int32_t joinedPrio = 0;
+    char joinedPass[65] = "";
+    for (int i = 0; i < n; i++) {
+      if (!strcmp(list[i].ssid, joinedSsid)) {
+        joinedPrio = list[i].prio;
+        memcpy(joinedPass, list[i].pass, sizeof(joinedPass));
+      }
+    }
+    for (;;) {
+      const EventBits_t bits =
+          xEventGroupWaitBits(wifiEvents, kWifiDisconnected | kWifiChanged, pdFALSE, pdFALSE, portMAX_DELAY);
+      if (bits & kWifiDisconnected) break;
+      xEventGroupClearBits(wifiEvents, kWifiChanged);
+      const int m = wifinets::load(list);
+      wifiCount = m;
+      bool stay = false, better = false;
+      for (int i = 0; i < m; i++) {
+        if (!strcmp(list[i].ssid, joinedSsid)) {
+          stay = list[i].prio == joinedPrio && !strcmp(list[i].pass, joinedPass);
+        } else if (list[i].prio > joinedPrio) {
+          better = true;
+        }
+      }
+      if (!stay || better) {
+        xEventGroupSetBits(wifiEvents, kWifiChanged);  // handled at the top of the loop
+        break;
+      }
+      ESP_LOGI(TAG, "Wi-Fi list changed; staying on \"%s\"", joinedSsid);
+    }
     vTaskDelay(pdMS_TO_TICKS(500));
   }
+}
+
+// The STA's address; false (and 0.0.0.0) when the STA is off or not joined. The STA netif only exists when the
+// STA was started, and none exists when Wi-Fi is off.
+static bool staIpInfo(esp_netif_ip_info_t* ip) {
+  *ip = {};
+  if (!radioStaOn || !broadcastAddr) return false;
+  esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  return sta && esp_netif_get_ip_info(sta, ip) == ESP_OK;
 }
 
 static void refreshApClients() {
@@ -232,6 +281,12 @@ static void onWifiEvent(void*, esp_event_base_t base, int32_t id, void* data) {
     if (len == strlen(target) && !memcmp(ev->ssid, target, len)) {
       xEventGroupSetBits(wifiEvents, kWifiDisconnected);  // staTask decides what to try next
     }
+  } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
+    // The DHCP lease ran out without a disconnect: stop sending to the old subnet and join again
+    broadcastAddr = 0;
+    xEventGroupClearBits(wifiEvents, kWifiGotIp);
+    xEventGroupSetBits(wifiEvents, kWifiDisconnected);
+    ESP_LOGW(TAG, "Wi-Fi lost the IP address");
   } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
     const auto* ev = static_cast<ip_event_got_ip_t*>(data);
     const uint32_t bcast = ev->ip_info.ip.addr | ~ev->ip_info.netmask.addr;
@@ -247,7 +302,6 @@ static void onWifiEvent(void*, esp_event_base_t base, int32_t id, void* data) {
 // "sta", missing = on) and applied at the next boot. Both off: Wi-Fi is not started at all; BLE stays, so the
 // Web page / tools/ble-config.py can turn them back on.
 
-static bool radioApOn = true, radioStaOn = true;  // this boot
 
 static void radioSaved(bool* ap, bool* sta) {
   *ap = *sta = true;
@@ -280,6 +334,7 @@ static size_t radioJson(char* buf, size_t size) {
 
 static void initWifi() {
   wifiEvents = xEventGroupCreate();
+  wifiCount = wifinets::count();
   radioSaved(&radioApOn, &radioStaOn);
   if (!radioApOn && !radioStaOn) {
     ESP_LOGW(TAG, "Wi-Fi off (AP and STA both turned off); BLE only");
@@ -295,6 +350,7 @@ static void initWifi() {
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
   ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, onWifiEvent, nullptr));
   ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, onWifiEvent, nullptr));
+  ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, onWifiEvent, nullptr));
   // AP + STA: the STA joins the configured network, the AP lets a phone or PC connect directly
   // (no router at the track). The radio has one channel, so the AP follows the STA's channel.
   ESP_ERROR_CHECK(esp_wifi_set_mode(radioApOn && radioStaOn ? WIFI_MODE_APSTA : radioApOn ? WIFI_MODE_AP : WIFI_MODE_STA));
@@ -369,12 +425,12 @@ static size_t statusJson(char* buf, size_t size) {
   static const char* const kRec[] = {"off", "rec", "saving", "safe", "failed"};
   char target[33];
   wifiTargetCopy(target);
-  char ssid[sizeof(target) * 6];
+  char ssid[100];  // an SSID full of characters that need escaping is cut short: the reply must stay <= 512 bytes
   record::jsonEscape(target, ssid, sizeof(ssid));
   const bool connected = broadcastAddr != 0;
   char ip[24] = "null";
   esp_netif_ip_info_t info = {};
-  if (connected && esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &info) == ESP_OK) {
+  if (connected && staIpInfo(&info)) {
     snprintf(ip, sizeof(ip), "\"" IPSTR "\"", IP2STR(&info.ip));
   }
   wifi_ap_record_t ap;
@@ -496,13 +552,16 @@ static int onConfigAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*)
   return BLE_ATT_ERR_UNLIKELY;
 }
 
-// wifi characteristic. read: the list JSON (no passwords). write: one wifinets text command; refused with
-// ATT error 0x80 (invalid), 0x81 (8 networks already), 0x82 (no such network to delete).
+// wifi characteristic. read: one page of the list JSON (no passwords). write: one wifinets text command, or
+// "list=<index>" to read the list from that entry on; refused with ATT error 0x80 (invalid), 0x81 (8 networks
+// already), 0x82 (no such network to delete).
+// The list is read in pages of at most 512 bytes (the ATT limit): a client writes "list=<next>" and reads again.
+static int wifiListStart = 0;  // BLE host task only
 static int onWifiAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
     static wifinets::Entry list[wifinets::kMax];
-    char json[wifinets::kMax * (33 * 6 + 48) + 16];
-    const size_t n = wifinets::listJson(list, wifinets::load(list), json, sizeof(json));
+    static char json[512];  // BLE host task only
+    const size_t n = wifinets::listJson(list, wifinets::load(list), wifiListStart, json, sizeof(json));
     return n && os_mbuf_append(ctxt->om, json, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
   if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
@@ -510,6 +569,8 @@ static int onWifiAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
     uint16_t len = 0;
     if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf) - 1, &len) != 0) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     buf[len] = '\0';
+    if (wifinets::parseListRequest(buf, &wifiListStart)) return 0;
+    wifiListStart = 0;  // a change: the next read starts from the top again
     bool full = false, notFound = false;
     if (const char* err = applyWifiText(buf, &full, &notFound)) {
       ESP_LOGW(TAG, "Wi-Fi write over BLE rejected: %s", err);
@@ -710,7 +771,7 @@ static void publishStatus(const record::Record* r) {
     wifi_ap_record_t ap;
     copy.rssi = copy.wifiUp && esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
     esp_netif_ip_info_t ip = {};
-    esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip);
+    staIpInfo(&ip);
     snprintf(copy.ip, sizeof(copy.ip), IPSTR, IP2STR(&ip.ip));
     char target[33];
     wifiTargetCopy(target);
@@ -773,7 +834,7 @@ static void sendStatus() {
   wifi_ap_record_t ap;
   if (broadcastAddr && esp_wifi_sta_get_ap_info(&ap) == ESP_OK) rssi = ap.rssi;
   esp_netif_ip_info_t ip = {};
-  esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip);
+  staIpInfo(&ip);
 
   char json[record::kMaxUdpPayload + 1];
   const int n = snprintf(
@@ -864,12 +925,15 @@ static void handleCommand(char* line) {
                                                              : "ERR NVS write failed");
   } else if (strcmp(line, "wifi-list") == 0) {
     static wifinets::Entry list[wifinets::kMax];
-    char json[wifinets::kMax * (33 * 6 + 48) + 16];
-    if (wifinets::listJson(list, wifinets::load(list), json, sizeof(json))) printf("%s\n", json);
+    static char json[wifinets::kMax * (33 * 6 + 48) + 48];  // one page holds them all; static: ~2 KB
+    if (wifinets::listJson(list, wifinets::load(list), 0, json, sizeof(json))) printf("%s\n", json);
   } else if (strcmp(line, "wifi-clear") == 0) {
-    wifinets::clear();
-    wifiListChanged();
-    printf("OK wifi cleared\n");
+    if (wifinets::clear() != wifinets::StoreError::kNone) {
+      printf("ERR NVS write failed\n");
+    } else {
+      wifiListChanged();
+      printf("OK wifi cleared\n");
+    }
   } else if (strcmp(line, "radio") == 0) {
     char json[96];
     if (radioJson(json, sizeof(json))) printf("%s\n", json);

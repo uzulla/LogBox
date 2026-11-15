@@ -78,11 +78,14 @@ async def main() -> int:
     if args.command == "wifi-set":
         ssid = input("SSID: ")
         password = getpass.getpass("Password: ")
-        prio = input("Priority (higher first) [0]: ").strip() or "0"
-        if not ssid or not prio.lstrip("-").isdigit():
+        try:
+            prio = int(input("Priority (higher first) [0]: ").strip() or "0")
+        except ValueError:
+            prio = None
+        if not ssid or prio is None:
             print("SSID must be non-empty and the priority a number", file=sys.stderr)
             return 1
-        query = f"ssid={quote(ssid, safe='')}&pass={quote(password, safe='')}&prio={int(prio)}"
+        query = f"ssid={quote(ssid, safe='')}&pass={quote(password, safe='')}&prio={prio}"
 
     if args.command in ("ctrl", "wifi-del") and not args.value:
         print(f"{args.command} needs a value, e.g. {'rec=0' if args.command == 'ctrl' else 'HomeAP'}", file=sys.stderr)
@@ -90,10 +93,23 @@ async def main() -> int:
 
     dev = await find(args.name, args.timeout)
     async with BleakClient(dev) as client:
-        if args.command in ("status", "mag", "wifi-list"):
-            uuid = {"status": STATUS, "mag": CTRL, "wifi-list": WIFI}[args.command]
+        if args.command in ("status", "mag"):
+            uuid = STATUS if args.command == "status" else CTRL
             data = await when_encrypted(lambda: client.read_gatt_char(uuid))
             print(json.dumps(json.loads(data), indent=2, ensure_ascii=False))
+        elif args.command == "wifi-list":
+            # Pages of at most 512 bytes: "next" is where to continue ("list=<next>", then read again)
+            networks = []
+            page = json.loads(await when_encrypted(lambda: client.read_gatt_char(WIFI)))
+            while True:
+                networks += page["networks"]
+                if page.get("next") is None:
+                    break
+                await client.write_gatt_char(WIFI, f"list={page['next']}".encode(), response=True)
+                page = json.loads(await client.read_gatt_char(WIFI))
+            if "next" in page:
+                await client.write_gatt_char(WIFI, b"list=0", response=True)
+            print(json.dumps({"networks": networks}, indent=2, ensure_ascii=False))
         elif args.command == "ctrl":
             try:
                 await when_encrypted(lambda: client.write_gatt_char(CTRL, args.value.encode(), response=True))

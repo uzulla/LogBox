@@ -248,8 +248,22 @@ $('rec_start').onclick = () => ctrl('rec=1', '記録の開始を指示しまし�
 $('rec_stop').onclick = () => ctrl('rec=0', '記録の停止を指示しました(「外してよい」になるまで待ってください)', 'rec_msg');
 
 // ---- Wi-Fi ----
+// 一覧は 512 バイトずつのページで返る("next" があれば "list=<next>" を書いて続きを読む)。古いファームウェアは 1 回で全部
+async function readNetworks() {
+  const all = [];
+  let j = await readJson(ch.wifi);
+  for (let guard = 0; ; guard++) {
+    all.push(...j.networks);
+    if (j.next === undefined || j.next === null || guard > 8) break;
+    await write(ch.wifi, `list=${j.next}`);
+    j = await readJson(ch.wifi);
+  }
+  if (j.next !== undefined) await write(ch.wifi, 'list=0').catch(() => {}); // 次に読む人のため先頭に戻す
+  return { networks: all };
+}
+
 async function refreshWifi() {
-  const j = await readJson(ch.wifi);
+  const j = await readNetworks();
   const ul = $('nets');
   ul.innerHTML = '';
   if (!j.networks.length) ul.innerHTML = '<li class="muted">登録なし</li>';
@@ -268,15 +282,16 @@ async function refreshWifi() {
 async function wifiWrite(q, okMsg) {
   try {
     await write(ch.wifi, q);
-    log(okMsg); $('wifi_msg').textContent = okMsg;
-    await refreshWifi();
-    return true;
   } catch (e) {
     // 本体はアプリ固有の ATT エラー(0x80 不正 / 0x81 8 件超 / 0x82 見つからない)を返すが、ブラウザでは区別できない
     const m = `失敗: ${e.message}(SSID は 1〜32 バイト、パスワードは 64 バイトまで。最大 8 件)`;
     log(m); $('wifi_msg').textContent = m;
     return false;
   }
+  log(okMsg); $('wifi_msg').textContent = okMsg;
+  // 保存はできている。一覧を読み直せなくても失敗扱いにはしない
+  try { await refreshWifi(); } catch (e) { log(`保存しましたが、一覧を読み直せませんでした: ${e.message}`); $('wifi_msg').textContent = `${okMsg}(一覧の更新に失敗。「更新」で読み直せます)`; }
+  return true;
 }
 
 $('setwifi').onclick = async () => {
@@ -288,13 +303,18 @@ $('setwifi').onclick = async () => {
     const ok = await wifiWrite(`ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}&prio=${prio}`, `"${ssid}" を保存しました`);
     if (!ok) return;
     $('pass').value = '';
-    for (let i = 0; i < 20; i++) { // どれかにつながるまで状態を読む(最長 60 秒)
+    const radio = ch.ctrl ? (await readJson(ch.ctrl).catch(() => ({}))).radio : null;
+    if (radio && !radio.active.sta) { $('wifi_msg').textContent = `"${ssid}" を保存しました。いまは STA がオフなので接続しません(下の「無線」で STA をオンにして再起動してください)`; return; }
+    let s = null;
+    for (let i = 0; i < 20; i++) { // 登録したネットワークにつながるまで状態を読む(最長 60 秒)
       $('wifi_msg').textContent = `接続待ち… (${i * 3}s)`;
       await new Promise(r => setTimeout(r, 3000));
-      const s = await refreshStatus();
-      if (s.wifi_connected) { $('wifi_msg').textContent = `接続しました: ${s.wifi_ssid} ${s.ip}`; log(`Wi-Fi ${s.wifi_ssid} ${s.ip}`); return; }
+      s = await refreshStatus();
+      if (s.wifi_connected && s.wifi_ssid === ssid) { $('wifi_msg').textContent = `接続しました: ${s.wifi_ssid} ${s.ip}`; log(`Wi-Fi ${s.wifi_ssid} ${s.ip}`); return; }
     }
-    $('wifi_msg').textContent = 'まだ接続できていません(パスワード違い、5 GHz のみ、電波が届かない、STA がオフ の可能性)。「更新」で再確認できます';
+    $('wifi_msg').textContent = s?.wifi_connected
+      ? `"${ssid}" には接続していません(優先度の高い "${s.wifi_ssid}" に接続中です)`
+      : 'まだ接続できていません(パスワード違い、5 GHz のみ、電波が届かない可能性)。「更新」で再確認できます';
   } catch (e) {
     log(`失敗: ${e.message}`);
   } finally {
@@ -319,14 +339,17 @@ async function refreshRadio() {
 $('radio_save').onclick = async () => {
   const ap = $('radio_ap').checked ? 1 : 0, sta = $('radio_sta').checked ? 1 : 0;
   if (!ap && !sta && !confirm('AP と STA を両方オフにします。次の起動から Wi-Fi は止まり(UDP の送信も止まります)、BLE(このページ)だけになります。よろしいですか？')) return;
+  // オンにするほうを先に保存する(途中で失敗しても、選んでいない「両方オフ」が残らないように)
+  const order = [['ap', ap], ['sta', sta]].sort((a, b) => b[1] - a[1]);
   try {
-    await write(ch.ctrl, `ap=${ap}`);
-    await write(ch.ctrl, `sta=${sta}`);
+    for (const [k, v] of order) await write(ch.ctrl, `${k}=${v}`);
     log(`無線設定を保存: AP ${ap ? 'オン' : 'オフ'} / STA ${sta ? 'オン' : 'オフ'}(次の起動から)`);
     await refreshRadio();
     if (confirm('保存しました。いま再起動して反映しますか？')) $('reboot').onclick(true);
   } catch (e) {
-    $('radio_msg').textContent = `失敗: ${e.message}`; log(`無線設定の保存に失敗: ${e.message}`);
+    log(`無線設定の保存に失敗: ${e.message}`);
+    await refreshRadio().catch(() => {}); // 途中まで保存されたかもしれないので、本体の保存値を表示し直す
+    $('radio_msg').textContent = `失敗: ${e.message}(一部だけ保存された可能性があります。上のチェックが本体に保存されている値です)`;
   }
 };
 

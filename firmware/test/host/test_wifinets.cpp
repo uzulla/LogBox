@@ -1,5 +1,8 @@
 // Host tests for components/wifinets: the text formats shared by BLE, the serial console and the Web page.
+#include <stdlib.h>
 #include <string.h>
+
+#include <string>
 
 #include "unity.h"
 #include "wifinets.h"
@@ -43,6 +46,11 @@ void test_wifinets_parse_tab_and_errors() {
   char longPass[128] = "ssid=a&pass=";
   memset(longPass + 12, 'b', 65);
   TEST_ASSERT_EQUAL(static_cast<int>(ParseError::kTooLong), static_cast<int>(wifinets::parse(longPass, c)));
+  TEST_ASSERT_EQUAL(static_cast<int>(ParseError::kInvalid), static_cast<int>(wifinets::parse("ssid=a%00b", c)));
+  TEST_ASSERT_EQUAL(static_cast<int>(ParseError::kInvalid), static_cast<int>(wifinets::parse("ssid=a&prio=1x", c)));
+  TEST_ASSERT_EQUAL(static_cast<int>(ParseError::kInvalid), static_cast<int>(wifinets::parse("ssid=a&prio=", c)));
+  TEST_ASSERT_EQUAL(static_cast<int>(ParseError::kInvalid),
+                    static_cast<int>(wifinets::parse("ssid=a&prio=99999999999999999999", c)));
   // 32-byte SSID written as %XX escapes still fits
   char enc[160] = "ssid=";
   for (int i = 0; i < 32; i++) strcat(enc, "%41");
@@ -62,17 +70,51 @@ void test_wifinets_sort_and_json() {
   TEST_ASSERT_EQUAL_STRING("low", e[2].ssid);  // stable
   TEST_ASSERT_EQUAL_STRING("low2", e[3].ssid);
   char buf[512];
-  TEST_ASSERT_GREATER_THAN(0, wifinets::listJson(e, 2, buf, sizeof(buf)));
+  TEST_ASSERT_GREATER_THAN(0, wifinets::listJson(e, 2, 0, buf, sizeof(buf)));
   TEST_ASSERT_EQUAL_STRING(
-      "{\"networks\":[{\"ssid\":\"high\",\"prio\":20,\"secured\":true},{\"ssid\":\"mid\\\"q\",\"prio\":5,\"secured\":false}]}",
+      "{\"networks\":[{\"ssid\":\"high\",\"prio\":20,\"secured\":true},{\"ssid\":\"mid\\\"q\",\"prio\":5,\"secured\":false}],"
+      "\"total\":2,\"next\":null}",
       buf);
-  TEST_ASSERT_GREATER_THAN(0, wifinets::listJson(e, 0, buf, sizeof(buf)));
-  TEST_ASSERT_EQUAL_STRING("{\"networks\":[]}", buf);
-  TEST_ASSERT_EQUAL(0, wifinets::listJson(e, 4, buf, 20));  // does not fit
+  TEST_ASSERT_GREATER_THAN(0, wifinets::listJson(e, 0, 0, buf, sizeof(buf)));
+  TEST_ASSERT_EQUAL_STRING("{\"networks\":[],\"total\":0,\"next\":null}", buf);
+  TEST_ASSERT_EQUAL(0, wifinets::listJson(e, 4, 0, buf, 40));  // not even one entry fits
+}
+
+// 8 networks with 32-character SSIDs that all need escaping do not fit one 512-byte attribute: the pages
+// together hold every entry, each page fits, and "next" chains them.
+void test_wifinets_list_pages() {
+  wifinets::Entry e[wifinets::kMax] = {};
+  for (int i = 0; i < wifinets::kMax; i++) {
+    memset(e[i].ssid, '"', 31);
+    e[i].ssid[31] = static_cast<char>('A' + i);
+    e[i].prio = -1000000 + i;
+    strcpy(e[i].pass, "x");
+  }
+  int start = 0, seen = 0, pages = 0;
+  char buf[512];
+  while (true) {
+    const size_t n = wifinets::listJson(e, wifinets::kMax, start, buf, sizeof(buf));
+    TEST_ASSERT_GREATER_THAN(0, n);
+    TEST_ASSERT_LESS_THAN(512, n);
+    pages++;
+    for (const char* p = buf; (p = strstr(p, "\"prio\"")); p++) seen++;
+    const char* next = strstr(buf, "\"next\":");
+    TEST_ASSERT_NOT_NULL(next);
+    if (!strncmp(next + 7, "null", 4)) break;
+    TEST_ASSERT_TRUE(wifinets::parseListRequest((std::string("list=") + std::to_string(atoi(next + 7))).c_str(), &start));
+  }
+  TEST_ASSERT_EQUAL(wifinets::kMax, seen);
+  TEST_ASSERT_GREATER_THAN(1, pages);
+  int k;
+  TEST_ASSERT_FALSE(wifinets::parseListRequest("list=", &k));
+  TEST_ASSERT_FALSE(wifinets::parseListRequest("list=9", &k));
+  TEST_ASSERT_FALSE(wifinets::parseListRequest("list=1x", &k));
+  TEST_ASSERT_FALSE(wifinets::parseListRequest("ssid=a", &k));
 }
 
 void runWifinetsTests() {
   RUN_TEST(test_wifinets_parse_query);
   RUN_TEST(test_wifinets_parse_tab_and_errors);
   RUN_TEST(test_wifinets_sort_and_json);
+  RUN_TEST(test_wifinets_list_pages);
 }

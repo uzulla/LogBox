@@ -36,6 +36,10 @@ def main() -> int:
     elif args.list:
         cmd = "wifi-list"
     elif args.delete:
+        if any(c in args.delete for c in "\r\n\t"):
+            # One line is one console command: a newline would send a second command (e.g. wifi-clear)
+            print("the SSID must not contain newlines or tabs", file=sys.stderr)
+            return 1
         cmd = f"wifi-del\t{args.delete}"
     else:
         ssid = input("SSID: ")
@@ -43,7 +47,9 @@ def main() -> int:
         if not ssid or "\t" in ssid + password or "\n" in ssid + password:
             print("SSID must be non-empty; tabs and newlines are not allowed", file=sys.stderr)
             return 1
-        cmd = f"wifi-set\t{ssid}\t{password}\t{args.prio}"
+        # The priority field only when given: firmware before the multi-network change would take it as part
+        # of the password
+        cmd = f"wifi-set\t{ssid}\t{password}" + (f"\t{args.prio}" if args.prio else "")
 
     ser = serial.Serial()
     ser.port = args.port
