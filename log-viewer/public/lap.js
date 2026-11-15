@@ -169,6 +169,7 @@
     const maxNear = Math.max(...cands.map((c) => c.sc.nNear));
     // 周回が取れている(最多の 9 割以上)ゲートだけを対象に、最も直線的な点を選ぶ。曲がりが同程度なら速い方
     const ok = cands.filter((c) => c.sc.nNear >= Math.max(3, maxNear * 0.9));
+    if (!ok.length) return null; // どのゲートも 3 周に満たない
     let best = ok[0];
     for (const c of ok) if (c.bend < best.bend - 1 || (Math.abs(c.bend - best.bend) <= 1 && c.speed > best.speed)) best = c;
     const lat = best.y / P.ky + P.lat0, lon = best.x / P.kx + P.lon0;
