@@ -198,9 +198,6 @@ function computeHeading(d) {
   });
   if (!r.ok) { d.hdgWhy = '速度があってまっすぐ走った区間が無い'; return; }
   d.hdg = r;
-  let m = 5;
-  for (let i = 0; i < d.n; i++) if (isFinite(r.slip[i]) && Math.abs(r.slip[i]) > m) m = Math.abs(r.slip[i]);
-  d.slipMax = Math.min(45, m);
 }
 
 function inertialGap(d, a, b, sigma) {
@@ -498,11 +495,75 @@ function build(rows, name) {
 
 // ---- ラップ ----
 // コースの事前情報なしで、軌跡から計測ラインを自動で見つける(lap.js)。位置は GPS の生の値で見る(停止固定の切り替えに左右されない)
+// 計測ラインを手動で置いたログは、その場所(緯度経度)をブラウザに覚えておく(ログのファイル名ごと)
+const gateKey = (name) => 'lapGate:' + name;
+function savedGate(name) {
+  try { const v = JSON.parse(localStorage.getItem(gateKey(name))); return v && isFinite(v.lat) && isFinite(v.lon) ? v : null; } catch (e) { return null; }
+}
 function detectLaps(d) {
   d.lap = null;
+  d.lapManualError = '';
   if (!d.nvalid) return;
-  const r = Lap.detect({ n: d.n, t: d.t, lat: d.rLat, lon: d.rLon, speed: d.rSpeed, valid: d.valid });
-  if (!r) return;
+  const src = { n: d.n, t: d.t, lat: d.rLat, lon: d.rLon, speed: d.rSpeed, valid: d.valid };
+  const manual = savedGate(d.name);
+  let r = null;
+  if (manual) {
+    r = Lap.gateAt(src, manual.lat, manual.lon);
+    if (r.error) { d.lapManualError = r.error; r = null; } // 覚えていた場所が使えなければ自動に戻す(メッセージを出す)
+  }
+  if (!r) r = Lap.detect(src);
+  if (r) d.lap = lapStats(r);
+  computeSectors(d);
+}
+
+// ---- セクター ----
+// 地図で置いた区切り(緯度経度)をログのファイル名ごとに覚えておく。区切りごとに計測ラインと同じゲートを置き、
+// 各ラップの中で最初に横切った時刻で区切る。区切りの順番は、ラップの中での位置(平均)で決める
+const sectorKey = (name) => 'sectors:' + name;
+function savedSectors(name) {
+  try { const v = JSON.parse(localStorage.getItem(sectorKey(name))); return Array.isArray(v) ? v.filter((p) => p && isFinite(p.lat) && isFinite(p.lon)) : []; } catch (e) { return []; }
+}
+function storeSectors(name, list) {
+  try { if (list.length) localStorage.setItem(sectorKey(name), JSON.stringify(list)); else localStorage.removeItem(sectorKey(name)); } catch (e) { /* 無視 */ }
+}
+const lapSrc = (d) => ({ n: d.n, t: d.t, lat: d.rLat, lon: d.rLon, speed: d.rSpeed, valid: d.valid });
+function computeSectors(d) {
+  d.sectors = null;
+  const marks = savedSectors(d.name);
+  if (!d.lap || !marks.length) return;
+  const laps = d.lap.laps;
+  const src = lapSrc(d);
+  const ms = [];
+  for (const m of marks) {
+    const r = Lap.gateAt(src, m.lat, m.lon);
+    if (r.error === 'far') continue;
+    // ラップごとに、その中で最初に横切った時刻
+    const at = laps.map((l) => { const c = r.crossings.find((x) => x.t > l.start && x.t < l.end); return c ? c.t : NaN; });
+    const fr = at.map((t, k) => (t - laps[k].start) / laps[k].time).filter((v) => isFinite(v));
+    if (!fr.length) continue; // どのラップの中でも通っていない(ピットなど)
+    ms.push({ lat: m.lat, lon: m.lon, gate: r.gate, at, pos: fr.reduce((a, b) => a + b, 0) / fr.length });
+  }
+  if (!ms.length) return;
+  ms.sort((a, b) => a.pos - b.pos);
+  // セクタータイム: [ラップ開始, 区切り 1, ..., 区切り k, ラップ終了] の差。区切りを通っていないラップは、その前後のセクターを出さない
+  const times = laps.map((l, k) => {
+    const b = [l.start, ...ms.map((m) => m.at[k]), l.end];
+    const out = [];
+    for (let j = 1; j < b.length; j++) out.push(isFinite(b[j]) && isFinite(b[j - 1]) && b[j] > b[j - 1] ? b[j] - b[j - 1] : NaN);
+    return out;
+  });
+  const n = ms.length + 1;
+  const best = [];
+  for (let j = 0; j < n; j++) {
+    let v = Infinity;
+    laps.forEach((l, k) => { if (!l.outlier && isFinite(times[k][j]) && times[k][j] < v) v = times[k][j]; });
+    best.push(isFinite(v) ? v : NaN);
+  }
+  const ideal = best.every((v) => isFinite(v)) ? best.reduce((a, b) => a + b, 0) : NaN;
+  d.sectors = { marks: ms, times, best, ideal };
+}
+// ベスト・平均・参考扱いの周回を付ける
+function lapStats(r) {
   const times = r.laps.map((l) => l.time).sort((a, b) => a - b);
   const med = times[times.length >> 1];
   // 中央値の 1.25 倍を超える周回(ピット、スピン、検出漏れ)は参考扱いにして、ベストと平均から外す
@@ -512,7 +573,7 @@ function detectLaps(d) {
   r.best = good.length ? good.reduce((a, b) => (b.time < a.time ? b : a)) : null;
   r.sel = -1; // 最初は比較ラップを選ばない(クリックで選ぶ)
   r.avg = good.length ? good.reduce((s, l) => s + l.time, 0) / good.length : NaN;
-  d.lap = r;
+  return r;
 }
 
 // ---- サーキットモード ----
@@ -678,17 +739,28 @@ const fmtLap = (s) => `${Math.floor(s / 60)}:${(s % 60).toFixed(3).padStart(6, '
 function updateLapInfo() {
   const box = $('laps');
   box.textContent = '';
+  $('lapshead').textContent = '';
   if (!D || !D.lap) {
     $('lapsum').textContent = D ? '周回を検出できませんでした' : '--';
     return;
   }
-  const r = D.lap;
-  $('lapsum').textContent = `${r.laps.length} 周 / ベスト ${r.best ? fmtLap(r.best.time) : '--'} / 平均 ${fmtLap(r.avg)}`;
+  const r = D.lap, sc = D.sectors;
+  const nsec = sc ? sc.marks.length + 1 : 0;
+  $('lapsum').textContent = `${r.laps.length} 周 / ベスト ${r.best ? fmtLap(r.best.time) : '--'} / 平均 ${fmtLap(r.avg)}` +
+    (sc && isFinite(sc.ideal) ? ` / 理論ベスト ${fmtLap(sc.ideal)}` : '') + (r.gate.manual ? ' / 計測ライン: 手動' : ' / 計測ライン: 自動');
+  // 列: 周 / タイム / ベストとの差 / セクター 1..n
+  const cols = `3em 6.5em 5.5em${' 5.5em'.repeat(nsec)}`;
+  const head = $('lapshead');
+  head.style.setProperty('--cols', cols);
+  box.style.setProperty('--cols', cols);
+  head.innerHTML = `<span>周</span><span>タイム</span><span>差</span>${Array.from({ length: nsec }, (_, j) => `<span>S${j + 1}</span>`).join('')}`;
+  const fs = (v) => (isFinite(v) ? (v >= 60 ? fmtLap(v) : v.toFixed(3)) : '--');
   r.laps.forEach((l, i) => {
     const row = document.createElement('div');
     row.className = 'lap' + (l === r.best ? ' best' : '') + (l.outlier ? ' out' : '');
     const diff = r.best && !l.outlier ? `+${(l.time - r.best.time).toFixed(3)}` : l.outlier ? '参考' : '';
-    row.innerHTML = `<span>${i + 1}</span><span>${fmtLap(l.time)}</span><span>${diff}</span>`;
+    const secs = sc ? sc.times[i].map((v, j) => `<span class="sec${!l.outlier && v === sc.best[j] ? ' sbest' : ''}">${fs(v)}</span>`).join('') : '';
+    row.innerHTML = `<span>${i + 1}</span><span>${fmtLap(l.time)}</span><span class="diff">${diff}</span>${secs}`;
     row.title = 'クリック / Enter: 比較に選ぶ。ダブルクリック / Shift+Enter: 頭出し';
     row.tabIndex = 0; // キーボードでも選べるようにする
     row.setAttribute('role', 'button');
@@ -776,6 +848,117 @@ function drawPath() {
   if (D.lap) drawGate();
 }
 
+// ---- ラップ表の高さ(上端の取っ手をドラッグ。ブラウザに覚えておく) ----
+(function () {
+  const panel = $('lappanel'), grip = $('lpresize');
+  const DEF = 200, MIN = 60;
+  const maxH = () => Math.max(MIN, window.innerHeight * 0.7);
+  const set = (h, save) => {
+    h = Math.round(Math.min(maxH(), Math.max(MIN, h)));
+    panel.style.height = h + 'px';
+    map.invalidateSize(); // 地図の高さが変わる
+    if (save) try { localStorage.setItem('lapPanelHeight', String(h)); } catch (e) { /* 無視 */ }
+  };
+  try { const v = +localStorage.getItem('lapPanelHeight'); if (v) set(v, false); } catch (e) { /* 既定 */ }
+  let drag = null;
+  grip.addEventListener('pointerdown', (e) => {
+    e.preventDefault(); grip.setPointerCapture(e.pointerId); grip.classList.add('drag');
+    drag = { y: e.clientY, h: panel.getBoundingClientRect().height };
+  });
+  grip.addEventListener('pointermove', (e) => { if (drag) set(drag.h - (e.clientY - drag.y), false); }); // 上へドラッグ = 高く
+  const end = () => { if (!drag) return; drag = null; grip.classList.remove('drag'); set(panel.getBoundingClientRect().height, true); };
+  grip.addEventListener('pointerup', end);
+  grip.addEventListener('pointercancel', end);
+  grip.addEventListener('dblclick', () => set(DEF, true));
+})();
+
+// ---- 計測ラインを地図で指定する(軌跡の上を長押し / 右クリック → メニュー) ----
+// スマホでも使えるよう、長押しを基本にする(Android は長押しで contextmenu、iPhone は Leaflet が長押しを contextmenu にする)
+const LONG_PRESS_MS = 600, LONG_PRESS_MOVE = 8; // ミリ秒 / px。この間に指やマウスが動いたら地図の移動とみなす
+let lastMenuAt = 0;
+function lapMenu(latlng) {
+  if (!D || !D.nvalid) return;
+  const now = performance.now();
+  if (now - lastMenuAt < 700) return; // 長押しと contextmenu が両方来たときに 2 回開かない
+  lastMenuAt = now;
+  const box = document.createElement('div');
+  box.className = 'mapmenu';
+  const add = (label, fn) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = () => { map.closePopup(); fn(); };
+    box.appendChild(b);
+  };
+  add('ここを計測ラインにする', () => setManualGate(latlng));
+  if (savedGate(D.name)) add('計測ラインを自動検出に戻す', () => setManualGate(null));
+  add('ここにセクターの区切りを置く', () => addSector(latlng));
+  // 近くにある区切りは消せる(画面上で 30 px 以内)
+  const marks = savedSectors(D.name);
+  const pt = map.latLngToContainerPoint(latlng);
+  const near = marks.findIndex((m) => map.latLngToContainerPoint([m.lat, m.lon]).distanceTo(pt) < 30);
+  if (near >= 0) add('このセクターの区切りを消す', () => { marks.splice(near, 1); storeSectors(D.name, marks); computeSectors(D); applyLapChange(); });
+  if (marks.length) add('セクターの区切りをすべて消す', () => { storeSectors(D.name, []); computeSectors(D); applyLapChange(); });
+  // 長押しを離したときのクリックで閉じないよう、地図のクリックでは閉じない(× か別の場所の長押しで閉じる)
+  L.popup({ closeOnClick: false, autoClose: true, className: 'mapmenu-popup' }).setLatLng(latlng).setContent(box).openOn(map);
+}
+function setManualGate(latlng) {
+  if (!D) return;
+  if (latlng) {
+    const r = Lap.gateAt({ n: D.n, t: D.t, lat: D.rLat, lon: D.rLon, speed: D.rSpeed, valid: D.valid }, latlng.lat, latlng.lng);
+    if (r.error) {
+      $('notice').textContent = r.error === 'far' ? '計測ラインは軌跡の近く(30 m 以内)を長押ししてください' : 'その場所を 2 回以上通っていないため、ラップになりません';
+      return;
+    }
+    try { localStorage.setItem(gateKey(D.name), JSON.stringify({ lat: r.gate.lat, lon: r.gate.lon })); } catch (e) { /* 覚えられなくても今回は使う */ }
+    detectLaps(D);
+    if (!D.lap || !D.lap.gate.manual) D.lap = lapStats(r); // localStorage が使えないとき
+  } else {
+    try { localStorage.removeItem(gateKey(D.name)); } catch (e) { /* 無視 */ }
+    detectLaps(D);
+  }
+  $('notice').textContent = '';
+  applyLapChange();
+}
+function addSector(latlng) {
+  if (!D) return;
+  if (!D.lap) { $('notice').textContent = 'ラップが無いログには、セクターを置けません'; return; }
+  const r = Lap.gateAt(lapSrc(D), latlng.lat, latlng.lng);
+  if (r.error === 'far') { $('notice').textContent = 'セクターの区切りは軌跡の近く(30 m 以内)を長押ししてください'; return; }
+  const marks = savedSectors(D.name);
+  marks.push({ lat: r.gate.lat, lon: r.gate.lon });
+  storeSectors(D.name, marks);
+  computeSectors(D);
+  $('notice').textContent = D.sectors && D.sectors.marks.length === marks.length ? '' : 'その場所はラップの中で通っていないため、セクターになりません';
+  applyLapChange();
+}
+// ラップが変わったら、表示範囲・ラップ一覧・地図・グラフを作り直す
+function applyLapChange() {
+  updateLapInfo();
+  updateLapButtons();
+  updateView();
+  CZ = null;
+  setTime(Math.min(V.t1, Math.max(V.t0, T)));
+  curLap = circuitOn && D.lap ? lapIndexAt(T) : -1;
+  updateLapRows();
+  if (D.nvalid) drawPath();
+  layoutChart();
+  show(T);
+}
+(function () {
+  const mc = map.getContainer();
+  let lp = null;
+  const cancel = () => { if (lp) { clearTimeout(lp.timer); lp = null; } };
+  mc.addEventListener('pointerdown', (e) => {
+    cancel();
+    if (e.button !== 0 || e.target.closest('.leaflet-control, .leaflet-popup')) return;
+    const at = map.mouseEventToLatLng(e);
+    lp = { x: e.clientX, y: e.clientY, timer: setTimeout(() => { lp = null; lapMenu(at); }, LONG_PRESS_MS) };
+  });
+  mc.addEventListener('pointermove', (e) => { if (lp && Math.hypot(e.clientX - lp.x, e.clientY - lp.y) > LONG_PRESS_MOVE) cancel(); });
+  for (const t of ['pointerup', 'pointercancel', 'pointerleave']) mc.addEventListener(t, cancel);
+  map.on('contextmenu', (e) => lapMenu(e.latlng)); // 右クリック、スマホの長押し
+})();
+
 function drawGate() {
   if (D.lap) {
     const g = D.lap.gate;
@@ -783,6 +966,14 @@ function drawGate() {
     const ll = [[g.a.lat, g.a.lon], [g.b.lat, g.b.lon]];
     L.polyline(ll, { color: '#000', weight: 9, opacity: 1, interactive: false }).addTo(trackLayer);
     L.polyline(ll, { color: '#fff', weight: 6, opacity: 1, dashArray: '5 5' }).addTo(trackLayer);
+  }
+  if (D.sectors) { // セクターの区切り: 黄色の線と番号(区切り k = セクター k と k+1 の境目)
+    D.sectors.marks.forEach((m, k) => {
+      const g = m.gate;
+      L.polyline([[g.a.lat, g.a.lon], [g.b.lat, g.b.lon]], { color: '#ffd400', weight: 4, opacity: 0.95, interactive: false }).addTo(trackLayer);
+      L.marker([g.a.lat, g.a.lon], { interactive: false, keyboard: false,
+        icon: L.divIcon({ className: 'secmark', html: `S${k + 1}|S${k + 2}`, iconSize: null }) }).addTo(trackLayer);
+    });
   }
 }
 
@@ -793,19 +984,39 @@ function drawTrack() {
   drawPath();
   // 車体(オレンジの箱 + 前へ伸ばした黄色の線、推定できたときだけ)と進行方向(緑の線)。
   // 線を長く伸ばして、2 本の開き(= スリップアングル)が見えるようにする。方位が無いログは、向きを持たない丸で出す
-  const car = D.hdg ? '<svg class="arrow car" viewBox="-60 -60 120 120"><path d="M0-12 L0-58" stroke="#ffd400" stroke-width="1" stroke-linecap="round"/>' +
-    '<path d="M0-13 L6-7 L6 12 L-6 12 L-6-7 Z" fill="rgba(255,150,40,.9)" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/></svg>' : '';
-  const course = D.hasHd ? '<path d="M0 0 L0-58" stroke="#32e678" stroke-width="1" stroke-linecap="round"/><circle r="3" fill="#32e678"/>'
+  // 箱と線の長さは地図の縮尺に合わせて sizeCar() で決める(実車の大きさ)
+  const car = D.hdg ? '<svg class="arrow car" viewBox="-60 -60 120 120"><path class="car-line" stroke="#ffd400" stroke-width="1" stroke-linecap="round"/>' +
+    '<path class="car-box" fill="rgba(255,150,40,.9)" stroke="#fff" stroke-width="1" stroke-linejoin="round"/></svg>' : '';
+  const course = D.hasHd ? '<path class="course-line" stroke="#32e678" stroke-width="1" stroke-linecap="round"/><circle r="2" fill="#32e678"/>'
     : '<circle r="7" fill="#00cdff" stroke="#fff" stroke-width="2"/>';
   const icon = L.divIcon({
     className: '', iconSize: [120, 120], iconAnchor: [60, 60],
     html: `<div class="arrows">${car}<svg class="arrow course" viewBox="-60 -60 120 120">${course}</svg></div>`,
   });
   marker = L.marker([D.lat[D.firstValid], D.lon[D.firstValid]], { icon, interactive: false, keyboard: false, zIndexOffset: 1000 }).addTo(map);
+  sizeCar();
   fitTrack();
 }
 
+// 車体の箱を、地図の縮尺で実車くらいの大きさ(長さ 4.5 m、幅 1.8 m)にする。小さくなりすぎるときは見える大きさで止める。
+// 黄色の線(車体の向き)と緑の線(進行方向)は、箱の先から一定の長さだけ伸ばす
+const CAR_LEN = 4.5, CAR_WIDTH = 1.8, CAR_MIN_PX = 8, LINE_PX = 46;
+function sizeCar() {
+  const el = marker && marker.getElement();
+  if (!el) return;
+  const lat = marker.getLatLng().lat;
+  const mPerPx = 40075016.686 * Math.cos(lat * Math.PI / 180) / 2 ** (map.getZoom() + 8);
+  const k = Math.max(1, CAR_MIN_PX / (CAR_LEN / mPerPx)); // 小さすぎるときの拡大率(縦横比は保つ)
+  const l = CAR_LEN / mPerPx * k / 2, w = CAR_WIDTH / mPerPx * k / 2, nose = Math.min(w, l * 0.3);
+  const f = (v) => v.toFixed(1);
+  el.querySelector('.car-box')?.setAttribute('d', `M0 ${f(-l)} L${f(w)} ${f(-l + nose)} L${f(w)} ${f(l)} L${f(-w)} ${f(l)} L${f(-w)} ${f(-l + nose)} Z`);
+  el.querySelector('.car-line')?.setAttribute('d', `M0 ${f(-l)} L0 ${f(-l - LINE_PX)}`);
+  el.querySelector('.course-line')?.setAttribute('d', `M0 0 L0 ${f(-l - LINE_PX)}`);
+}
+map.on('zoom', sizeCar);
+
 function clearView() {
+  updateLapButtons();
   trackLayer.clearLayers(); lapLayer.clearLayers();
   if (marker) { map.removeLayer(marker); marker = null; }
   for (const id of ['delta', 'g', 'acc', 'hdg', 'alt', 'gps', 'hacc', 'yaw', 'batt', 'clock', 'body', 'slip', 'crate']) $(id).textContent = '--';
@@ -901,30 +1112,32 @@ function show(T) {
   drawCursor(T);
 }
 
-// ---- G ボール(上 = 加速、下 = 減速、右 = 右向きの加速度 = 右コーナー。直近 1.5 秒の軌跡つき) ----
+// ---- G ボール(体が感じる G。上 = 減速、下 = 加速、右 = 左コーナー、左 = 右コーナー。直近 1.5 秒の軌跡つき) ----
+// 加速度(前後 fb: + = 加速、左右 lr: + = 右向き)の逆向きに描く。ボウルの中のボールと同じ動き
 const ballCv = $('ball'), bctx = ballCv.getContext('2d');
+const BALL_MAX_G = 2; // G ボールの外周
 function drawBall(i) {
   const dpr = window.devicePixelRatio || 1;
   const size = Math.round(ballCv.clientWidth * dpr);
   if (size && ballCv.width !== size) { ballCv.width = size; ballCv.height = size; }
-  const W = ballCv.width, c = W / 2, R = W / 2 - 4 * dpr, scale = R / 1.5;
+  const W = ballCv.width, c = W / 2, R = W / 2 - 4 * dpr, scale = R / BALL_MAX_G;
   bctx.clearRect(0, 0, W, W);
   bctx.lineWidth = dpr;
-  for (const g of [0.5, 1, 1.5]) {
-    bctx.strokeStyle = g === 1 ? '#ff4646' : '#26304d';
-    bctx.beginPath(); bctx.arc(c, c, g * scale, 0, 2 * Math.PI); bctx.stroke();
-  }
+  bctx.strokeStyle = '#26304d'; // 外周 = 2G
+  bctx.beginPath(); bctx.arc(c, c, BALL_MAX_G * scale, 0, 2 * Math.PI); bctx.stroke();
+  bctx.strokeStyle = 'rgba(255,70,70,.35)'; // 1G(薄い線)
+  bctx.beginPath(); bctx.arc(c, c, scale, 0, 2 * Math.PI); bctx.stroke();
   bctx.strokeStyle = '#26304d';
   bctx.beginPath(); bctx.moveTo(c, c - R); bctx.lineTo(c, c + R); bctx.moveTo(c - R, c); bctx.lineTo(c + R, c); bctx.stroke();
   if (!D || !isFinite(D.fb[i])) return;
   for (let j = i; j >= 0 && D.t[i] - D.t[j] < 1.5; j -= 2) {
     if (!isFinite(D.fb[j])) continue;
     bctx.fillStyle = `rgba(0,205,255,${0.6 * (1 - (D.t[i] - D.t[j]) / 1.5)})`;
-    bctx.beginPath(); bctx.arc(c + D.lr[j] * scale, c - D.fb[j] * scale, 2.5 * dpr, 0, 2 * Math.PI); bctx.fill();
+    bctx.beginPath(); bctx.arc(c - D.lr[j] * scale, c + D.fb[j] * scale, 2.5 * dpr, 0, 2 * Math.PI); bctx.fill();
   }
   bctx.fillStyle = D.dynG[i] > 1 ? '#ff4646' : '#00cdff';
   bctx.strokeStyle = '#fff'; bctx.lineWidth = 2 * dpr;
-  bctx.beginPath(); bctx.arc(c + D.lr[i] * scale, c - D.fb[i] * scale, 6 * dpr, 0, 2 * Math.PI); bctx.fill(); bctx.stroke();
+  bctx.beginPath(); bctx.arc(c - D.lr[i] * scale, c + D.fb[i] * scale, 6 * dpr, 0, 2 * Math.PI); bctx.fill(); bctx.stroke();
 }
 
 // ---- グラフ(速度 + G。クリック / ドラッグでシーク) ----
@@ -963,7 +1176,7 @@ function layoutChart() {
   base = document.createElement('canvas'); base.width = cv.width; base.height = cv.height;
   const c = base.getContext('2d');
   c.scale(dpr, dpr);
-  if (!D) return;
+  if (!D) { updateScrollbar(); return; }
   const R = chartRange();
   const padL = 40, padR = 8, sw = w - padL - padR, span = Math.max(1e-6, R.t1 - R.t0);
   const xOf = (t) => padL + ((t - R.t0) / span) * sw;
@@ -1020,8 +1233,8 @@ function layoutChart() {
       px = x; py = y;
     }
   }
-  if (D.hdg) { // スリップアングル(車体 − 進行方向)。上 = 車体が右を向く、下 = 左
-    const y0 = yTop(slipRow), y1 = yBot(slipRow), ym = (y0 + y1) / 2, sc = Math.ceil(D.slipMax / 5) * 5, half = (y1 - y0) / 2;
+  if (D.hdg) { // スリップアングル(車体 − 進行方向)。上 = 車体が右を向く、下 = 左。±SLIP_CHART_DEG を超える分は端に張り付ける
+    const y0 = yTop(slipRow), y1 = yBot(slipRow), ym = (y0 + y1) / 2, sc = SLIP_CHART_DEG, half = (y1 - y0) / 2;
     frame(y0, y1, 'β', `右${sc}°`, `左${sc}°`);
     c.strokeStyle = '#4a526e'; c.lineWidth = 1; c.beginPath(); c.moveTo(padL, ym); c.lineTo(w - padR, ym); c.stroke();
     c.strokeStyle = '#ff9628'; c.lineWidth = 1.5; c.beginPath();
@@ -1048,8 +1261,10 @@ function layoutChart() {
     c.stroke();
   }
   chartGeom = { padL, padR, w, R };
+  updateScrollbar();
 }
 let chartGeom = null;
+const SLIP_CHART_DEG = 10; // グラフのスリップアングルの範囲(左右)
 function drawCursor(T) {
   const dpr = window.devicePixelRatio || 1;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1078,10 +1293,50 @@ function followChart(t) {
   CZ.t1 = CZ.t0 + span;
   layoutChart();
 }
-let dragging = false;
-cv.addEventListener('pointerdown', (e) => { dragging = true; cv.setPointerCapture(e.pointerId); seekFromEvent(e); });
-cv.addEventListener('pointermove', (e) => { if (dragging) seekFromEvent(e); });
-cv.addEventListener('pointerup', () => { dragging = false; });
+// 左ボタン = シーク、右(または中)ボタンのドラッグ = 左右に移動(つかんで動かす向き)
+let dragging = false, panning = null;
+cv.addEventListener('pointerdown', (e) => {
+  cv.setPointerCapture(e.pointerId);
+  if (e.button === 1 || e.button === 2) { e.preventDefault(); panning = { x: e.clientX }; return; }
+  dragging = true; seekFromEvent(e);
+});
+cv.addEventListener('pointermove', (e) => {
+  if (panning && chartGeom) {
+    const { padL, padR, w, R } = chartGeom;
+    panChart(-(e.clientX - panning.x) / (w - padL - padR) * (R.t1 - R.t0));
+    panning.x = e.clientX;
+  } else if (dragging) seekFromEvent(e);
+});
+cv.addEventListener('pointerup', () => { dragging = false; panning = null; });
+cv.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// スクロールバー: つまみ = グラフに見えている範囲。つまみのドラッグで移動、溝のクリックで 1 画面ずつ移動
+const sbar = $('cscroll'), sthumb = $('cthumb');
+function updateScrollbar() {
+  const full = V.t1 - V.t0;
+  if (!D || full <= 0) { sthumb.style.left = '0'; sthumb.style.width = '100%'; sbar.classList.add('full'); return; }
+  const R = chartRange();
+  sthumb.style.left = `${(R.t0 - V.t0) / full * 100}%`;
+  sthumb.style.width = `${Math.max(2, (R.t1 - R.t0) / full * 100)}%`;
+  sbar.classList.toggle('full', !CZ);
+}
+let thumbDrag = null;
+sthumb.addEventListener('pointerdown', (e) => {
+  if (!D || !CZ) return;
+  e.stopPropagation(); sthumb.setPointerCapture(e.pointerId);
+  thumbDrag = { x: e.clientX };
+});
+sthumb.addEventListener('pointermove', (e) => {
+  if (!thumbDrag) return;
+  panChart((e.clientX - thumbDrag.x) / sbar.clientWidth * (V.t1 - V.t0));
+  thumbDrag.x = e.clientX;
+});
+sthumb.addEventListener('pointerup', () => { thumbDrag = null; });
+sbar.addEventListener('pointerdown', (e) => {
+  if (!D || !CZ || e.target !== sbar) return;
+  const R = chartRange(), r = sthumb.getBoundingClientRect();
+  panChart((e.clientX < r.left ? -1 : 1) * (R.t1 - R.t0) * 0.9);
+});
 // ズーム: ホイール(トラックパッドはピンチ)でカーソル位置を中心に拡大 / 縮小、Shift+ホイール(横スクロール)で左右に移動
 cv.addEventListener('wheel', (e) => {
   if (!D || !chartGeom) return;
@@ -1100,27 +1355,66 @@ window.addEventListener('resize', () => { layoutChart(); show(T); map.invalidate
 
 // ---- 再生 ----
 let T = 0, playing = false, lastFrame = 0;
+let playDir = 1; // 1 = 再生、-1 = 逆再生
 function setTime(t) { T = Math.min(D ? V.t1 : 0, Math.max(D ? V.t0 : 0, t)); show(T); }
 function frame(now) {
   if (!playing) return;
-  T += ((now - lastFrame) / 1000) * +$('rate').value;
+  T += ((now - lastFrame) / 1000) * +$('rate').value * playDir;
   lastFrame = now;
   if (T >= V.t1) { T = V.t1; setPlaying(false); }
+  if (T <= V.t0) { T = V.t0; setPlaying(false); }
   show(T);
   if (playing) requestAnimationFrame(frame);
 }
-function setPlaying(p) {
-  if (p && D && T >= V.t1) T = V.t0;
+// dir: 1 = 再生、-1 = 逆再生(省略時は今の向き)。端にいるときは反対の端から始める
+function setPlaying(p, dir = playDir) {
+  playDir = dir;
+  if (p && D && playDir > 0 && T >= V.t1) T = V.t0;
+  if (p && D && playDir < 0 && T <= V.t0) T = V.t1;
   playing = p && !!D;
-  $('play').textContent = playing ? '❚❚' : '▶';
+  $('play').textContent = playing && playDir > 0 ? '❚❚' : '▶';
+  $('rev').textContent = playing && playDir < 0 ? '❚❚' : '◀';
   if (playing) { lastFrame = performance.now(); requestAnimationFrame(frame); }
 }
-$('play').onclick = () => setPlaying(!playing);
+$('play').onclick = () => setPlaying(!(playing && playDir > 0), 1);
+$('rev').onclick = () => setPlaying(!(playing && playDir < 0), -1);
+
+// コマ送り: 前後の行(記録の 1 行 = 1 コマ)へ。再生は止める
+function stepFrame(dir) {
+  if (!D) return;
+  setPlaying(false);
+  const i = Math.max(0, upperBound(D.t, T) - 1);
+  if (dir > 0) setTime(D.t[Math.min(D.n - 1, i + 1)]);
+  else setTime(T > D.t[i] + 1e-6 ? D.t[i] : D.t[Math.max(0, i - 1)]);
+}
+// ラップ送り: 次のラップの頭へ / 今のラップの頭へ(頭から 1 秒以内なら前のラップの頭へ)。再生中なら再生を続ける
+function stepLap(dir) {
+  if (!D || !D.lap || !D.lap.laps.length) return;
+  const starts = D.lap.laps.map((l) => l.start);
+  let t;
+  if (dir > 0) t = starts.find((s) => s > T + 1e-3);
+  else { const prev = starts.filter((s) => s < T - 1); t = prev.length ? prev[prev.length - 1] : starts[0]; }
+  if (t !== undefined) setTime(t);
+}
+$('fprev').onclick = () => stepFrame(-1);
+$('fnext').onclick = () => stepFrame(1);
+$('lprev').onclick = () => stepLap(-1);
+$('lnext').onclick = () => stepLap(1);
+// ラップが無いログではラップ送りを押せなくする
+function updateLapButtons() {
+  const has = !!(D && D.lap && D.lap.laps.length);
+  $('lprev').disabled = $('lnext').disabled = !has;
+}
+updateLapButtons(); // 読み込み前は押せない
 $('seek').oninput = (e) => setTime(+e.target.value);
 $('fit').onclick = () => D && fitTrack();
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT' && e.target.type !== 'range' && e.target.type !== 'checkbox') return;
   if (e.code === 'Space') { e.preventDefault(); setPlaying(!playing); }
+  else if (e.code === 'Comma') stepFrame(-1);
+  else if (e.code === 'Period') stepFrame(1);
+  else if (e.code === 'BracketLeft') stepLap(-1);
+  else if (e.code === 'BracketRight') stepLap(1);
   else if (e.code === 'ArrowLeft') setTime(T - (e.shiftKey ? 30 : 5));
   else if (e.code === 'ArrowRight') setTime(T + (e.shiftKey ? 30 : 5));
 });
@@ -1146,10 +1440,12 @@ function load(text, name) {
   const hn = !D.hdg ? `車体の向き・スリップアングルは出せません: ${D.hdgWhy}`
     : D.hdg.breaks.length ? `機器が車内で動いたとみなした箇所が ${D.hdg.breaks.length} つあります(その前後はスリップアングルを出しません)` : '';
   if (hn) $('notice').textContent = ($('notice').textContent ? $('notice').textContent + ' / ' : '') + hn;
+  if (D.lapManualError) $('notice').textContent = ($('notice').textContent ? $('notice').textContent + ' / ' : '') + '保存していた計測ラインではラップにならないため、自動検出に戻しました';
   $('vmax').textContent = `${Math.round(D.vmax)} km/h`;
   updateGapInfo();
   updateStillInfo();
   updateLapInfo();
+  updateLapButtons();
   updateView();
   CZ = null;
   arrowRot = D.hd[0];
