@@ -58,7 +58,26 @@ void test_carframe_flat() {
   TEST_ASSERT_FLOAT_WITHIN(1e-4, 1, c[2]);
 }
 
+// GNSS already below 1 km/h while still braking: the braking must not be learnt as gravity.
+void test_carframe_braking_not_learnt() {
+  carframe::Estimator e;
+  const float g[3] = {0, 0, 0};
+  // Braking 0.3 G (backwards = -Z), with the deceleration easing off a little each record
+  for (int i = 0; i < 40; i++) {
+    const float a[3] = {0, 1, -0.3f + 0.1f * (i % 2)};  // jerky: the car is still pitching / braking
+    e.update(a, g, 1);
+  }
+  TEST_ASSERT_FALSE(e.ready());
+  const float rest[3] = {0, 1, 0};
+  for (int i = 0; i < 30; i++) e.update(rest, g, 1);
+  TEST_ASSERT_TRUE(e.ready());
+  float c[3];
+  e.toCar(rest, c);
+  TEST_ASSERT_FLOAT_WITHIN(1e-3, 0, c[0]);
+}
+
 void runCarframeTests() {
+  RUN_TEST(test_carframe_braking_not_learnt);
   RUN_TEST(test_carframe_upright);
   RUN_TEST(test_carframe_moving_does_not_learn);
   RUN_TEST(test_carframe_flat);

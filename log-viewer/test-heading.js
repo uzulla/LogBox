@@ -69,5 +69,41 @@ check('bias -1 deg/s, scale -3%, noise', { bias: -1, scale: 0.97 }, 1.2, 3.0);
   console.log(`mount turned 90 deg at ${tFlip} s: breaks ${r.breaks.map((t) => t.toFixed(0)).join(',')}, rows ${cnt}, rms ${rms.toFixed(2)}°`);
   assert.ok(rms < 1.0 && cnt > d.n * 0.7, 'error around the flip');
 }
+// ジャイロが 5 秒欠けた間に、車体と進行方向がそろって 20° 曲がって戻る: 欠けた区間とその後は、真の 0° から
+// ずれた値を出さない(出すなら正しい値)
+{
+  const HZ = 25, n = HZ * 120;
+  const d = { n, t: new Float64Array(n), valid: new Uint8Array(n).fill(1), speed_kmh: new Float64Array(n).fill(50),
+    heading_deg: new Float64Array(n), head_acc: new Float64Array(n).fill(0.5), rate: new Float64Array(n) };
+  let prev = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i / HZ;
+    d.t[i] = t;
+    const course = t > 60 && t < 65 ? 20 * Math.sin(Math.PI * (t - 60) / 5) : 0;
+    d.heading_deg[i] = (course + 360) % 360;
+    d.rate[i] = t > 60 && t < 65 ? NaN : (course - prev) * HZ + 0.3;
+    prev = course;
+  }
+  const r = H.estimate(d);
+  let worst = 0, cnt = 0;
+  for (let i = 0; i < n; i++) if (isFinite(r.slip[i])) { worst = Math.max(worst, Math.abs(r.slip[i])); cnt++; }
+  console.log(`gyro missing 5 s while turning: rows ${cnt}, max |slip| ${worst.toFixed(2)}° (true 0°)`);
+  assert.ok(worst < 1.5 && cnt > n * 0.8, 'slip invented over the gyro gap');
+}
+// 30 秒の直進の中央で機器だけ 90° 回る: 端の外挿に、回った分の傾きが混ざらない
+{
+  const HZ = 25, n = HZ * 30;
+  const d = { n, t: new Float64Array(n), valid: new Uint8Array(n).fill(1), speed_kmh: new Float64Array(n).fill(60),
+    heading_deg: new Float64Array(n), head_acc: new Float64Array(n).fill(0.5), rate: new Float64Array(n) };
+  for (let i = 0; i < n; i++) { d.t[i] = i / HZ; d.rate[i] = 0.2 + (i === n / 2 ? 90 * HZ : 0); }
+  const r = H.estimate(d);
+  let worst = 0, worstRate = 0;
+  for (let i = 0; i < n; i++) {
+    if (isFinite(r.slip[i])) worst = Math.max(worst, Math.abs(r.slip[i]));
+    if (isFinite(r.bodyRate[i]) && Math.abs(i - n / 2) > 2) worstRate = Math.max(worstRate, Math.abs(r.bodyRate[i]));
+  }
+  console.log(`mount turned in a straight: breaks ${r.breaks.length}, max |slip| ${worst.toFixed(2)}°, max |yaw rate| ${worstRate.toFixed(2)}°/s`);
+  assert.ok(r.breaks.length === 1 && worst < 0.5 && worstRate < 0.5, 'mount change leaked into the extrapolation');
+}
 // ジャイロの向き(符号)が逆なら推定は成り立たない: 呼び出し側(app.js)が GNSS と比べて符号を決める前提
 console.log('OK');

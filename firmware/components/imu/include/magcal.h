@@ -30,6 +30,7 @@ enum class MagCalError : uint8_t {
   kTooFewSamples,  // fewer than kMinSamples
   kNotRotated,     // some axis did not swing enough, or the fit is degenerate
   kBadFit,         // not an ellipsoid, implausible field / scale, or too noisy
+  kNotCollecting,  // finish without a running collection (cancelled, or finished elsewhere)
 };
 
 class MagCalFit {

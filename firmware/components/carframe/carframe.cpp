@@ -6,7 +6,9 @@ namespace carframe {
 namespace {
 constexpr int kStillSamples = 25;   // records (~1 s at 25 Hz) of calm before learning gravity
 constexpr float kStillRotDps = 5;   // any axis
-constexpr float kStillJerkG = 0.03f;
+constexpr float kStillJerkG = 0.03f;         // without a fix: the IMU alone decides
+constexpr float kStillJerkGnssG = 0.06f;     // with a fix: GNSS < 1 km/h is reached while still braking, so the
+                                             // acceleration must also have settled
 constexpr float kRefAlpha = 0.05f;  // low-pass of the gravity reference while still
 
 float dot(const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
@@ -19,7 +21,7 @@ void Estimator::update(const float a[3], const float gyro[3], int gnssStill) {
     prev_[i] = a[i];
   }
   const float rot = fmaxf(fabsf(gyro[0]), fmaxf(fabsf(gyro[1]), fabsf(gyro[2])));
-  const bool calm = rot < kStillRotDps && (gnssStill >= 0 ? gnssStill == 1 : jerk < kStillJerkG);
+  const bool calm = rot < kStillRotDps && (gnssStill >= 0 ? gnssStill == 1 && jerk < kStillJerkGnssG : jerk < kStillJerkG);
   still_ = calm ? (still_ < 1000 ? still_ + 1 : still_) : 0;
   if (still_ < kStillSamples) return;
   for (int i = 0; i < 3; i++) ref_[i] = haveRef_ ? ref_[i] + (a[i] - ref_[i]) * kRefAlpha : a[i];

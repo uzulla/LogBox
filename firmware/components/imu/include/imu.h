@@ -58,7 +58,8 @@ struct MagCalInfo {
   bool complete;       // enough samples and rotation: finishing will very likely succeed
 };
 void magCalStart();               // starts (or restarts) collecting; the current calibration stays applied
-MagCalError magCalFinish();       // fits, and on success applies and saves the result; stops collecting
+MagCalError magCalFinish();       // fits, and on success applies and saves the result; stops collecting.
+                                  // kNotCollecting when nothing is being collected
 void magCalCancel();
 void magCalClear();               // forgets the calibration (raw readings from now on)
 MagCalInfo magCalInfo();

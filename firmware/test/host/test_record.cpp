@@ -1,5 +1,6 @@
 // Host tests for components/record: the CSV row must stay readable by log-viewer (same leading columns as the
 // RaceBox logs), and the JSON must fit one UDP datagram.
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -119,6 +120,15 @@ void test_json_fits_and_fields() {
   r.carValid = false;
   TEST_ASSERT_GREATER_THAN(0, record::toJson(r, 7, "logbo-06FA", buf, sizeof(buf)));
   TEST_ASSERT_TRUE(strstr(buf, "\"g\":null,\"gyro_dps\":null") != nullptr);
+  // NaN never reaches the JSON (it would make the datagram invalid)
+  r.carValid = true;
+  r.carG[1] = NAN;
+  r.imu.mx = INFINITY;
+  TEST_ASSERT_GREATER_THAN(0, record::toJson(r, 7, "logbo-06FA", buf, sizeof(buf)));
+  TEST_ASSERT_TRUE(strstr(buf, "\"g\":null,\"gyro_dps\":null") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"mag_ut\":null") != nullptr);
+  TEST_ASSERT_NULL(strstr(buf, "nan"));
+  TEST_ASSERT_NULL(strstr(buf, "inf"));
   // Negative nano rolls the second back
   r = sample();
   TEST_ASSERT_GREATER_THAN(0, record::toJson(r, 7, "x", buf, sizeof(buf)));

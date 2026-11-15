@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 
@@ -112,9 +113,13 @@ bool gHaveAg;
 float gMag[3];
 bool gMagValid;
 bool gMagCalApplied;  // gMag is calibrated
-// Magnetometer calibration (also under gLock)
+// Magnetometer calibration. gCalib / gHaveCalib are read by readMag() under gLock. The collection (gFit,
+// gCollecting) and every start / finish / cancel / clear are serialised by gCalMutex instead: the fit's
+// double-precision sums are software floating point on the ESP32, too slow for a critical section, and a finish
+// from the display must not interleave with one from the serial console.
 MagCal gCalib;
 bool gHaveCalib;
+SemaphoreHandle_t gCalMutex;
 bool gCollecting;
 MagCalFit gFit;
 float gPressure, gTemp;
@@ -419,9 +424,13 @@ void readMag() {
   uint8_t d[10];  // ERR_REG, STATUS, AUX_DATA_0..7
   float m[3];
   bool ok = readRegs(gBmi, bmi::ERR_REG, d, sizeof(d)) && !(d[0] & bmi::kErrAux) && compensateMag(d + 2, m);
+  if (ok && gCalMutex) {
+    xSemaphoreTake(gCalMutex, portMAX_DELAY);
+    if (gCollecting) gFit.add(m);
+    xSemaphoreGive(gCalMutex);
+  }
   taskENTER_CRITICAL(&gLock);
   if (ok) {
-    if (gCollecting) gFit.add(m);
     if (gHaveCalib) {
       gCalib.apply(m, gMag);
     } else {
@@ -540,6 +549,7 @@ Status init() {
     if (!startBmi270(gStatus.bmm150)) gStatus.bmi270 = gStatus.bmm150 = false;
   }
   gStatus.bmp280 = initBmp280();
+  gCalMutex = xSemaphoreCreateMutex();
   if (gStatus.bmm150) loadCalib();
   ESP_LOGI(TAG, "BMI270 %s, BMM150 %s, BMP280 %s", gStatus.bmi270 ? "ok" : "--", gStatus.bmm150 ? "ok" : "--",
            gStatus.bmp280 ? "ok" : "--");
@@ -580,25 +590,31 @@ void latest(Sample& out) {
 }
 
 void magCalStart() {
-  taskENTER_CRITICAL(&gLock);
+  if (!gCalMutex) return;
+  xSemaphoreTake(gCalMutex, portMAX_DELAY);
   gFit.reset();
   gCollecting = true;
-  taskEXIT_CRITICAL(&gLock);
+  xSemaphoreGive(gCalMutex);
   ESP_LOGI(TAG, "mag calibration: collecting");
 }
 
 MagCalError magCalFinish() {
-  // Solve on a copy, outside the critical section (the fit takes a while; readMag() must not wait for it).
-  static MagCalFit fit;
-  taskENTER_CRITICAL(&gLock);
-  fit = gFit;
+  if (!gCalMutex) return MagCalError::kNotCollecting;
+  // Holds the mutex until the result is applied and saved, so a clear or another finish can't slip in between.
+  // readMag() waits meanwhile (the solve is well under a millisecond, the NVS write a few); the BMI270 FIFO
+  // keeps the accel / gyro samples.
+  xSemaphoreTake(gCalMutex, portMAX_DELAY);
+  if (!gCollecting) {  // cancelled, or already finished (display and console)
+    xSemaphoreGive(gCalMutex);
+    return MagCalError::kNotCollecting;
+  }
   gCollecting = false;
-  taskEXIT_CRITICAL(&gLock);
   MagCal cal;
-  const MagCalError err = fit.solve(cal);
+  const MagCalError err = gFit.solve(cal);
   if (err != MagCalError::kNone) {
     ESP_LOGW(TAG, "mag calibration failed (%d) after %lu samples, coverage %.2f %.2f %.2f", static_cast<int>(err),
-             static_cast<unsigned long>(fit.samples()), fit.coverage(0), fit.coverage(1), fit.coverage(2));
+             static_cast<unsigned long>(gFit.samples()), gFit.coverage(0), gFit.coverage(1), gFit.coverage(2));
+    xSemaphoreGive(gCalMutex);
     return err;
   }
   taskENTER_CRITICAL(&gLock);
@@ -608,21 +624,26 @@ MagCalError magCalFinish() {
   storeCalib(&cal);
   ESP_LOGI(TAG, "mag calibration: offset %.1f %.1f %.1f uT, scale %.3f %.3f %.3f, field %.1f uT (%lu samples)",
            cal.offset[0], cal.offset[1], cal.offset[2], cal.scale[0], cal.scale[1], cal.scale[2], cal.field,
-           static_cast<unsigned long>(fit.samples()));
+           static_cast<unsigned long>(gFit.samples()));
+  xSemaphoreGive(gCalMutex);
   return MagCalError::kNone;
 }
 
 void magCalCancel() {
-  taskENTER_CRITICAL(&gLock);
+  if (!gCalMutex) return;
+  xSemaphoreTake(gCalMutex, portMAX_DELAY);
   gCollecting = false;
-  taskEXIT_CRITICAL(&gLock);
+  xSemaphoreGive(gCalMutex);
 }
 
 void magCalClear() {
+  if (!gCalMutex) return;
+  xSemaphoreTake(gCalMutex, portMAX_DELAY);
   taskENTER_CRITICAL(&gLock);
   gHaveCalib = false;
   taskEXIT_CRITICAL(&gLock);
   storeCalib(nullptr);
+  xSemaphoreGive(gCalMutex);
   ESP_LOGI(TAG, "mag calibration cleared");
 }
 
@@ -631,11 +652,14 @@ MagCalInfo magCalInfo() {
   taskENTER_CRITICAL(&gLock);
   info.calibrated = gHaveCalib;
   info.cal = gCalib;
+  taskEXIT_CRITICAL(&gLock);
+  if (!gCalMutex) return info;
+  xSemaphoreTake(gCalMutex, portMAX_DELAY);
   info.collecting = gCollecting;
   info.samples = gFit.samples();
   for (int k = 0; k < 3; k++) info.coverage[k] = gFit.coverage(k);
   info.complete = gFit.complete();
-  taskEXIT_CRITICAL(&gLock);
+  xSemaphoreGive(gCalMutex);
   return info;
 }
 

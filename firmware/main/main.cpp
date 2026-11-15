@@ -589,9 +589,10 @@ static void handleCommand(char* line) {
     printf("OK rotate the unit slowly in every direction, then mag-cal-done\n");
   } else if (strcmp(line, "mag-cal-done") == 0) {
     logger::onMagCalFinish();
-    static const char* const kResult[] = {"", "OK", "ERR too few samples", "ERR not rotated enough", "ERR bad fit"};
+    static const char* const kResult[] = {"",           "OK", "ERR too few samples", "ERR not rotated enough",
+                                          "ERR bad fit", "ERR not collecting (run mag-cal first)"};
     const uint8_t res = magCalResult;
-    printf("%s\n", res < 5 ? kResult[res] : "ERR");
+    printf("%s\n", res < 6 ? kResult[res] : "ERR");
   } else if (strcmp(line, "mag-clear") == 0) {
     imu::magCalClear();
     printf("OK mag calibration cleared\n");

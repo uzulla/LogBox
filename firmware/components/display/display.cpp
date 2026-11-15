@@ -412,8 +412,9 @@ void drawStatusPage(const Status& s, int64_t now, int rate) {
     const float now3 = sqrtf(s.mx * s.mx + s.my * s.my + s.mz * s.mz);
     const bool showResult = s.magCalResult && now - s.magCalResultAtUs < kMagResultUs;
     if (showResult && s.magCalResult != 1) {
-      static const char* const kFail[] = {"", "", "FAILED: TOO SHORT", "FAILED: ROTATE MORE", "FAILED: TRY AGAIN"};
-      row("CAL", kFail[s.magCalResult < 5 ? s.magCalResult : 4], kRed);
+      static const char* const kFail[] = {"",          "",           "FAILED: TOO SHORT", "FAILED: ROTATE MORE",
+                                          "FAILED: TRY AGAIN", "NOT RUNNING"};
+      row("CAL", kFail[s.magCalResult < 6 ? s.magCalResult : 4], kRed);
     } else if (s.magCalibrated) {
       snprintf(b, sizeof(b), "%s %.0fUT NOW %.0f", showResult ? "DONE" : "ON", s.magField, now3);
       row("CAL", b, kGreen);
@@ -598,7 +599,9 @@ void displayTask(void*) {
     }
     if (magCollecting) {
       page = 2;
-      if (s.magCalComplete && s.magCalSamples >= kMagAutoFinishSamples) {
+      // Not right after our own start: until the logger's next update the Status still holds the previous
+      // collection's counts (complete, hundreds of samples) and would finish the new one at once.
+      if (now - magLocalAt > 500000 && s.magCalComplete && s.magCalSamples >= kMagAutoFinishSamples) {
         magCalEnd(true, now);
       } else if (now - magStartAt > kMagTimeoutUs) {
         magCalEnd(false, now);

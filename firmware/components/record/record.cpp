@@ -1,5 +1,6 @@
 #include "record.h"
 
+#include <math.h>
 #include <stdio.h>
 
 namespace record {
@@ -139,21 +140,23 @@ size_t toJson(const Record& r, uint32_t seq, const char* device, char* buf, size
   if (timeOk) formatPvtTime(p, time, sizeof(time));
   char dev[64];
   jsonEscape(device ? device : "", dev, sizeof(dev));
+  // A NaN / inf would print as "nan" / "inf" and make the whole datagram invalid JSON: such values become null.
+  const auto finite3 = [](float a, float b, float c) { return isfinite(a) && isfinite(b) && isfinite(c); };
   char car[128] = "\"g\":null,\"gyro_dps\":null";
-  if (r.carValid) {
+  if (r.carValid && finite3(r.carG[0], r.carG[1], r.carG[2]) && finite3(r.carGyro[0], r.carGyro[1], r.carGyro[2])) {
     snprintf(car, sizeof(car), "\"g\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},\"gyro_dps\":{\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}",
              r.carG[0], r.carG[1], r.carG[2], r.carGyro[0], r.carGyro[1], r.carGyro[2]);
   }
   char raw[128] = "\"g_sensor\":null,\"gyro_sensor\":null";
-  if (s.n) {
+  if (s.n && finite3(s.ax, s.ay, s.az) && finite3(s.gx, s.gy, s.gz)) {
     snprintf(raw, sizeof(raw),
              "\"g_sensor\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},\"gyro_sensor\":{\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}", s.ax,
              s.ay, s.az, s.gx, s.gy, s.gz);
   }
   char mag[64] = "null";
-  if (s.magValid) snprintf(mag, sizeof(mag), "{\"x\":%.1f,\"y\":%.1f,\"z\":%.1f}", s.mx, s.my, s.mz);
+  if (s.magValid && finite3(s.mx, s.my, s.mz)) snprintf(mag, sizeof(mag), "{\"x\":%.1f,\"y\":%.1f,\"z\":%.1f}", s.mx, s.my, s.mz);
   char press[16] = "null", temp[16] = "null";
-  if (s.baroValid) {
+  if (s.baroValid && isfinite(s.pressureHpa) && isfinite(s.tempC)) {
     snprintf(press, sizeof(press), "%.2f", s.pressureHpa);
     snprintf(temp, sizeof(temp), "%.2f", s.tempC);
   }

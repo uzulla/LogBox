@@ -504,7 +504,7 @@ function detectLaps(d) {
   d.lap = null;
   d.lapManualError = '';
   if (!d.nvalid) return;
-  const src = { n: d.n, t: d.t, lat: d.rLat, lon: d.rLon, speed: d.rSpeed, valid: d.valid };
+  const src = lapSrc(d);
   const manual = savedGate(d.name);
   let r = null;
   if (manual) {
@@ -906,14 +906,14 @@ function lapMenu(latlng) {
 function setManualGate(latlng) {
   if (!D) return;
   if (latlng) {
-    const r = Lap.gateAt({ n: D.n, t: D.t, lat: D.rLat, lon: D.rLon, speed: D.rSpeed, valid: D.valid }, latlng.lat, latlng.lng);
+    const r = Lap.gateAt(lapSrc(D), latlng.lat, latlng.lng);
     if (r.error) {
       $('notice').textContent = r.error === 'far' ? '計測ラインは軌跡の近く(30 m 以内)を長押ししてください' : 'その場所を 2 回以上通っていないため、ラップになりません';
       return;
     }
     try { localStorage.setItem(gateKey(D.name), JSON.stringify({ lat: r.gate.lat, lon: r.gate.lon })); } catch (e) { /* 覚えられなくても今回は使う */ }
     detectLaps(D);
-    if (!D.lap || !D.lap.gate.manual) D.lap = lapStats(r); // localStorage が使えないとき
+    if (!D.lap || !D.lap.gate.manual) { D.lap = lapStats(r); computeSectors(D); } // localStorage が使えないとき(セクターも新しいラップで)
   } else {
     try { localStorage.removeItem(gateKey(D.name)); } catch (e) { /* 無視 */ }
     detectLaps(D);
@@ -1018,6 +1018,8 @@ function sizeCar() {
 map.on('zoom', sizeCar);
 
 function clearView() {
+  map.closePopup();
+  $('lapshead').textContent = '';
   updateLapButtons();
   trackLayer.clearLayers(); lapLayer.clearLayers();
   if (marker) { map.removeLayer(marker); marker = null; }
@@ -1361,10 +1363,12 @@ let playDir = 1; // 1 = 再生、-1 = 逆再生
 function setTime(t) { T = Math.min(D ? V.t1 : 0, Math.max(D ? V.t0 : 0, t)); show(T); }
 function frame(now) {
   if (!playing) return;
-  T += ((now - lastFrame) / 1000) * +$('rate').value * playDir;
+  // requestAnimationFrame の now はフレームの開始時刻で、再生を押した時刻(lastFrame)より前のことがある。
+  // 戻る向きには進めない。止めるのは進んでいる向きの端に着いた時だけ(再生を先頭から始めた直後に止まらないように)
+  T += Math.max(0, (now - lastFrame) / 1000) * +$('rate').value * playDir;
   lastFrame = now;
-  if (T >= V.t1) { T = V.t1; setPlaying(false); }
-  if (T <= V.t0) { T = V.t0; setPlaying(false); }
+  if (playDir > 0 && T >= V.t1) { T = V.t1; setPlaying(false); }
+  if (playDir < 0 && T <= V.t0) { T = V.t0; setPlaying(false); }
   show(T);
   if (playing) requestAnimationFrame(frame);
 }
@@ -1427,6 +1431,7 @@ function load(text, name) {
   loadSeq++; // 保留中のサーバー読み込みを無効にする
   try {
     setPlaying(false);
+    map.closePopup(); // 前のログの地図メニュー(計測ライン・セクター)を残さない
     $('notice').textContent = '';
     D = build(parseCsv(text), name);
   } catch (e) {
