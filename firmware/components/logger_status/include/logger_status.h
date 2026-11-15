@@ -41,7 +41,17 @@ struct Status {
   bool headingValid;
   float ax, ay, az;      // G, BMI270 axes, mean over the epoch
   float gx, gy, gz;      // deg/s
-  float mx, my, mz;      // uT
+  float mx, my, mz;      // uT (calibrated when magCalibrated)
+
+  // Magnetometer calibration
+  bool magCalibrated;
+  float magField;        // uT, field strength of the calibration
+  bool magCollecting;    // calibration running: rotate the unit
+  uint32_t magCalSamples;
+  float magCoverage[3];  // 0..1 per axis
+  bool magCalComplete;   // enough rotation: finishing now will very likely succeed
+  uint8_t magCalResult;  // last finish: 0 none yet, 1 ok, 2 too few samples, 3 not rotated, 4 bad fit
+  int64_t magCalResultAtUs;
   float pressureHpa, tempC;
 };
 
@@ -53,5 +63,11 @@ void displayUpdate(const Status& s);
 // Implemented by the logger, called by the display on a long press: stops the SD recording and makes the
 // card safe to remove; otherwise tries to start recording (after SAFE, SD ERR, or a card inserted late).
 void onLongPress();
+
+// Implemented by the logger, called by the display: start collecting for the magnetometer calibration,
+// finish it (fit, apply, save; the result shows up in Status::magCalResult), or cancel it.
+void onMagCalStart();
+void onMagCalFinish();
+void onMagCalCancel();
 
 }  // namespace logger

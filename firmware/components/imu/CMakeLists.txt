@@ -1,3 +1,3 @@
-idf_component_register(SRCS "imu.cpp" "bmi270_config.cpp"
+idf_component_register(SRCS "imu.cpp" "bmi270_config.cpp" "magcal.cpp"
                        INCLUDE_DIRS include
-                       PRIV_REQUIRES esp_driver_i2c esp_driver_gpio esp_rom)
+                       PRIV_REQUIRES esp_driver_i2c esp_driver_gpio esp_rom nvs_flash)

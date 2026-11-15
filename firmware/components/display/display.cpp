@@ -6,7 +6,8 @@
 // two band buffers, and sent by DMA while the next band is drawn.
 //
 // Buttons: A (left) / C (right) switch pages, B (middle) held for 1.5 s stops / starts the SD recording;
-// a short press of B on the G page resets the peak values.
+// a short press of B on the G page resets the peak values, on the STATUS page it starts the magnetometer
+// calibration (a page of its own until it ends: B finishes, A / C cancel).
 //
 // Pages: 0 speed + G, 1 G circle, 2 status.
 
@@ -147,6 +148,10 @@ Status st;
 portMUX_TYPE stLock = portMUX_INITIALIZER_UNLOCKED;
 int page = 0;
 
+constexpr int64_t kMagResultUs = 5000000;        // the calibration result stays on the STATUS page this long
+constexpr int64_t kMagTimeoutUs = 120000000;     // collecting is cancelled after this long
+constexpr uint32_t kMagAutoFinishSamples = 375;  // 15 s at 25 Hz: finish by itself once complete
+
 int kmh10(int32_t mms) { return static_cast<int>(static_cast<int64_t>(mms) * 36 / 1000); }
 
 // Dynamic acceleration: the measured acceleration minus the gravity vector measured while standing still
@@ -270,7 +275,14 @@ void drawButtonBar(const Status& s) {
   textCenter(68, H - 11, "<", 1, kGray);
   textCenter(252, H - 11, ">", 1, kGray);
   textCenter(160, H - 11, s.rec == 1 ? "HOLD: STOP REC" : "HOLD: START REC", 1, s.rec == 1 ? kRed : kGray);
+  if (s.magCollecting) {
+    textCenter(68, H - 11, "CANCEL", 1, kGray);
+    textCenter(252, H - 11, "CANCEL", 1, kGray);
+    textCenter(160, H - 22, "PRESS: FINISH", 1, s.magCalComplete ? kGreen : kDim);
+    return;
+  }
   if (page == 1) textCenter(160, H - 22, "PRESS: RESET PEAK", 1, kDim);
+  if (page == 2) textCenter(160, H - 22, "PRESS: MAG CAL", 1, kDim);
   for (int i = 0; i < kPages; i++) fillRect(4 + i * 8, H - 9, 5, 5, i == page ? kCyan : kTrack);
   textRight(W - 4, H - 11, kNames[page], 1, kDim);
 }
@@ -426,6 +438,17 @@ void drawStatusPage(const Status& s, int64_t now, int rate) {
   if (s.magOk) {
     snprintf(b, sizeof(b), "%.0f %.0f %.0f UT", s.mx, s.my, s.mz);
     row("MAG", b, kWhite);
+    const float now3 = sqrtf(s.mx * s.mx + s.my * s.my + s.mz * s.mz);
+    const bool showResult = s.magCalResult && now - s.magCalResultAtUs < kMagResultUs;
+    if (showResult && s.magCalResult != 1) {
+      static const char* const kFail[] = {"", "", "FAILED: TOO SHORT", "FAILED: ROTATE MORE", "FAILED: TRY AGAIN"};
+      row("CAL", kFail[s.magCalResult < 5 ? s.magCalResult : 4], kRed);
+    } else if (s.magCalibrated) {
+      snprintf(b, sizeof(b), "%s %.0fUT NOW %.0f", showResult ? "DONE" : "ON", s.magField, now3);
+      row("CAL", b, kGreen);
+    } else {
+      row("CAL", "NONE (RAW)", kAmber);
+    }
   } else {
     row("MAG", "--", kRed);
   }
@@ -446,6 +469,30 @@ void drawStatusPage(const Status& s, int64_t now, int rate) {
     snprintf(b, sizeof(b), "%s %d", s.ip, s.rssi);
     row("WIFI", b, kWhite);
   }
+}
+
+// Magnetometer calibration (replaces the page while collecting)
+
+void drawMagCal(const Status& s) {
+  textCenter(160, 30, "MAG CALIBRATION", 2, kCyan);
+  textCenter(160, 56, "ROTATE THE UNIT SLOWLY", 1, kWhite);
+  textCenter(160, 68, "IN EVERY DIRECTION (TURN IT OVER TOO)", 1, kWhite);
+  static const char* const kAxis[3] = {"X", "Y", "Z"};
+  for (int k = 0; k < 3; k++) {
+    const int y = 92 + k * 30;
+    text(24, y, kAxis[k], 2, kDim);
+    constexpr int bx = 50, bw = 220, bh = 16;
+    fillRect(bx, y, bw, bh, kTrack);
+    const float c = std::clamp(s.magCoverage[k], 0.0f, 1.0f);
+    fillRect(bx, y, static_cast<int>(bw * c), bh, c >= 1 ? kGreen : kAmber);
+    char b[8];
+    snprintf(b, sizeof(b), "%d%%", static_cast<int>(c * 100));
+    text(bx + bw + 8, y + 1, b, 2, c >= 1 ? kGreen : kWhite);
+  }
+  char b[32];
+  snprintf(b, sizeof(b), "%lu SAMPLES", static_cast<unsigned long>(s.magCalSamples));
+  textCenter(160, 186, b, 1, kDim);
+  if (s.magCalComplete) textCenter(160, 200, "OK - KEEP TURNING OR PRESS B", 1, kGreen);
 }
 
 // ---------------------------------------------------------------------------
@@ -498,13 +545,35 @@ void initLcd() {
 }
 
 bool resetPeaks = false;
+// Calibration state as the display sees it. The logger's Status lags a button press by up to one update, so
+// for a moment after we start / end collecting our own idea wins; after that, the Status does (the serial
+// console can start and end it too).
+bool magCollecting = false;
+int64_t magStartAt = 0, magLocalAt = 0;
+
+void magCalEnd(bool finish, int64_t now) {
+  if (finish) {
+    onMagCalFinish();
+  } else {
+    onMagCalCancel();
+  }
+  magCollecting = false;
+  magLocalAt = now;
+}
 
 // A / C: previous / next page on release. B held 1.5 s: SD stop / start; B short on the G page: reset peaks.
 void pollButtons(int64_t now) {
   static bool prevA, prevC;
   const bool a = gpio_get_level(kBtnA) == 0, c = gpio_get_level(kBtnC) == 0;
-  if (prevA && !a) page = (page + kPages - 1) % kPages;
-  if (prevC && !c) page = (page + 1) % kPages;
+  if ((prevA && !a) || (prevC && !c)) {
+    if (magCollecting) {
+      magCalEnd(false, now);
+    } else if (prevA && !a) {
+      page = (page + kPages - 1) % kPages;
+    } else {
+      page = (page + 1) % kPages;
+    }
+  }
   prevA = a;
   prevC = c;
 
@@ -518,7 +587,17 @@ void pollButtons(int64_t now) {
     longDone = true;
     onLongPress();
   } else if (!b && downAt) {
-    if (!longDone && page == 1) resetPeaks = true;  // short press on the G page
+    if (!longDone) {  // short press
+      if (magCollecting) {
+        magCalEnd(true, now);
+      } else if (page == 1) {
+        resetPeaks = true;
+      } else if (page == 2) {
+        onMagCalStart();
+        magCollecting = true;
+        magStartAt = magLocalAt = now;
+      }
+    }
     downAt = 0;
   }
 }
@@ -541,6 +620,20 @@ void displayTask(void*) {
     }
     gv = gs;
     portEXIT_CRITICAL(&stLock);
+    // Calibration: finish by itself once there is plenty of rotation, give up after a while.
+    if (now - magLocalAt > 500000) {
+      if (s.magCollecting && !magCollecting) magStartAt = now;
+      magCollecting = s.magCollecting;
+    }
+    if (magCollecting) {
+      page = 2;
+      if (s.magCalComplete && s.magCalSamples >= kMagAutoFinishSamples) {
+        magCalEnd(true, now);
+      } else if (now - magStartAt > kMagTimeoutUs) {
+        magCalEnd(false, now);
+      }
+    }
+    s.magCollecting = magCollecting;
     if (now - rateAt >= 1000000) {
       rate = static_cast<int>((s.gnssMessages - lastMsgs) * 1000000LL / (now - rateAt));
       lastMsgs = s.gnssMessages;
@@ -554,7 +647,9 @@ void displayTask(void*) {
       which ^= 1;
       std::fill(cv, cv + W * kBandH, kBg);
       drawTopBar(s, now);
-      if (page == 0) {
+      if (s.magCollecting) {
+        drawMagCal(s);
+      } else if (page == 0) {
         drawSpeedPage(s, now);
       } else if (page == 1) {
         drawGPage(s, now);

@@ -15,13 +15,16 @@
 
 #include <stdint.h>
 
+#include "magcal.h"
+
 namespace imu {
 
 struct Sample {
   float ax, ay, az;          // G, BMI270 sensor axes
   float gx, gy, gz;          // deg/s, BMI270 sensor axes
-  float mx, my, mz;          // uT, raw BMM150 axes (not remapped, see above)
+  float mx, my, mz;          // uT, BMM150 axes (not remapped, see above)
   bool magValid;
+  bool magCal;               // mx..mz are calibrated (hard / soft iron); false = raw
   float pressureHpa, tempC;  // BMP280
   bool baroValid;
   uint32_t n;                // accel/gyro samples averaged into this Sample (0 = none since last call)
@@ -42,5 +45,22 @@ void takeAverage(Sample& out);
 
 // Latest single values (for the display), thread-safe. n is 1 once there is an accel/gyro sample, else 0.
 void latest(Sample& out);
+
+// Magnetometer calibration (see magcal.h). The calibration is kept in NVS (namespace "imu"; nvs_flash_init()
+// must have run before init()) and applied to every mag reading; Sample::magCal tells whether it was.
+// Collecting: rotate the unit slowly in every direction, then magCalFinish() (or wait for complete).
+struct MagCalInfo {
+  bool calibrated;     // a calibration is applied
+  MagCal cal;          // valid when calibrated
+  bool collecting;
+  uint32_t samples;    // collected so far
+  float coverage[3];   // 0..1 per raw axis
+  bool complete;       // enough samples and rotation: finishing will very likely succeed
+};
+void magCalStart();               // starts (or restarts) collecting; the current calibration stays applied
+MagCalError magCalFinish();       // fits, and on success applies and saves the result; stops collecting
+void magCalCancel();
+void magCalClear();               // forgets the calibration (raw readings from now on)
+MagCalInfo magCalInfo();
 
 }  // namespace imu

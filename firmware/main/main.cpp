@@ -392,11 +392,24 @@ static void initBle() {
 // Held while a record is built and sent: the GNSS task and the watchdog may meet when the GNSS resumes.
 static SemaphoreHandle_t recordMutex;
 
+// Result of the last magnetometer calibration, for the display (see logger::Status::magCalResult).
+static std::atomic<uint8_t> magCalResult{0};
+static std::atomic<int64_t> magCalResultAtUs{0};
+
 static void publishStatus(const record::Record* r) {
   static logger::Status ds = {};
   static int64_t slowAt = 0;
   static portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
+  const imu::MagCalInfo mc = imu::magCalInfo();
   taskENTER_CRITICAL(&lock);  // called from the GNSS task and the watchdog task
+  ds.magCalibrated = mc.calibrated;
+  ds.magField = mc.calibrated ? mc.cal.field : 0;
+  ds.magCollecting = mc.collecting;
+  ds.magCalSamples = mc.samples;
+  for (int k = 0; k < 3; k++) ds.magCoverage[k] = mc.coverage[k];
+  ds.magCalComplete = mc.complete;
+  ds.magCalResult = magCalResult;
+  ds.magCalResultAtUs = magCalResultAtUs;
   ds.configWindow = configWindowOpen;
   ds.wifiConfigured = wifiConfigured;
   ds.wifiUp = broadcastAddr != 0;
@@ -496,13 +509,14 @@ static void sendStatus() {
       json, sizeof(json),
       "{\"type\":\"status\",\"uptime_ms\":%lu,\"records\":%lu,"
       "\"gnss\":{\"configured\":%s,\"baud\":%lu,\"pvt\":%lu,\"checksum_errors\":%lu,\"other\":%lu,\"bytes\":%lu},"
-      "\"imu\":%s,\"mag\":%s,\"baro\":%s,\"rec\":%d,\"log\":\"%s\",\"udp_errors\":%lu,"
+      "\"imu\":%s,\"mag\":%s,\"mag_cal\":%s,\"baro\":%s,\"rec\":%d,\"log\":\"%s\",\"udp_errors\":%lu,"
       "\"wifi_configured\":%s,\"wifi_rssi\":%d,\"ip\":\"" IPSTR "\",\"free_heap\":%lu}",
       static_cast<unsigned long>(esp_timer_get_time() / 1000), static_cast<unsigned long>(records.load()),
       gs.configured ? "true" : "false", static_cast<unsigned long>(gs.baud), static_cast<unsigned long>(gs.pvt),
       static_cast<unsigned long>(gs.checksumErrors), static_cast<unsigned long>(gs.otherMsgs),
       static_cast<unsigned long>(gs.bytes), imuStatus.bmi270 ? "true" : "false",
-      imuStatus.bmm150 ? "true" : "false", imuStatus.bmp280 ? "true" : "false",
+      imuStatus.bmm150 ? "true" : "false", imu::magCalInfo().calibrated ? "true" : "false",
+      imuStatus.bmp280 ? "true" : "false",
       static_cast<int>(sdlog::state()), sdlog::fileName(), static_cast<unsigned long>(udpErrors.load()),
       wifiConfigured ? "true" : "false", rssi, IP2STR(&ip.ip), static_cast<unsigned long>(esp_get_free_heap_size()));
   if (n > 0 && static_cast<size_t>(n) < sizeof(json)) sendUdp(json, n);
@@ -534,6 +548,10 @@ static void watchdogTask(void*) {
 // Serial console (UART0, the M5Stack's USB port), one command per line:
 //   wifi-set<TAB><ssid><TAB><password>   save credentials to NVS and reconnect
 //   wifi-clear                           erase credentials
+//   mag-cal                              start the magnetometer calibration (rotate the unit in every
+//                                        direction), mag-cal-done to finish it
+//   mag-clear                            forget the magnetometer calibration
+//   mag                                  show the calibration and the latest reading
 
 static void handleCommand(char* line) {
   if (strncmp(line, "wifi-set\t", 9) == 0) {
@@ -554,6 +572,29 @@ static void handleCommand(char* line) {
     clearWifiCredentials();
     printf("OK wifi cleared\n");
     applyWifiConfig();
+  } else if (strcmp(line, "mag-cal") == 0) {
+    logger::onMagCalStart();
+    printf("OK rotate the unit slowly in every direction, then mag-cal-done\n");
+  } else if (strcmp(line, "mag-cal-done") == 0) {
+    logger::onMagCalFinish();
+    static const char* const kResult[] = {"", "OK", "ERR too few samples", "ERR not rotated enough", "ERR bad fit"};
+    const uint8_t res = magCalResult;
+    printf("%s\n", res < 5 ? kResult[res] : "ERR");
+  } else if (strcmp(line, "mag-clear") == 0) {
+    imu::magCalClear();
+    printf("OK mag calibration cleared\n");
+  } else if (strcmp(line, "mag") == 0) {
+    const imu::MagCalInfo mc = imu::magCalInfo();
+    imu::Sample s;
+    imu::latest(s);
+    if (mc.calibrated) {
+      printf("cal offset %.1f %.1f %.1f uT scale %.3f %.3f %.3f field %.1f uT\n", mc.cal.offset[0],
+             mc.cal.offset[1], mc.cal.offset[2], mc.cal.scale[0], mc.cal.scale[1], mc.cal.scale[2], mc.cal.field);
+    } else {
+      printf("cal none\n");
+    }
+    printf("mag %.1f %.1f %.1f uT (%s)%s\n", s.mx, s.my, s.mz, s.magCal ? "calibrated" : "raw",
+           mc.collecting ? " collecting" : "");
   } else if (line[0]) {
     printf("ERR unknown command\n");
   }
@@ -616,6 +657,18 @@ extern "C" void app_main() {
   xTaskCreate(watchdogTask, "watchdog", 6144, nullptr, 9, nullptr);
   xTaskCreate(consoleTask, "console", 4096, nullptr, 2, nullptr);
 }
+
+void logger::onMagCalStart() {
+  magCalResult = 0;
+  imu::magCalStart();
+}
+
+void logger::onMagCalFinish() {
+  magCalResult = static_cast<uint8_t>(imu::magCalFinish()) + 1;  // MagCalError::kNone -> 1 (ok)
+  magCalResultAtUs = esp_timer_get_time();
+}
+
+void logger::onMagCalCancel() { imu::magCalCancel(); }
 
 void logger::onLongPress() {
   if (sdlog::state() == sdlog::State::Rec) {
