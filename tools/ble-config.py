@@ -98,17 +98,35 @@ async def main() -> int:
             data = await when_encrypted(lambda: client.read_gatt_char(uuid))
             print(json.dumps(json.loads(data), indent=2, ensure_ascii=False))
         elif args.command == "wifi-list":
-            # Pages of at most 512 bytes: "next" is where to continue ("list=<next>", then read again)
-            networks = []
-            page = json.loads(await when_encrypted(lambda: client.read_gatt_char(WIFI)))
-            while True:
-                networks += page["networks"]
-                if page.get("next") is None:
+            # Pages of at most 512 bytes: "next" is where to continue ("list=<next>&gen=<gen>", then read
+            # again). If the list changes meanwhile (another client, the serial console), "gen" changes or the
+            # request is refused: start over.
+            for _attempt in range(4):
+                networks = []
+                page = json.loads(await when_encrypted(lambda: client.read_gatt_char(WIFI)))
+                gen = page.get("gen")
+                restart = False
+                while True:
+                    if page.get("gen") != gen:
+                        restart = True
+                        break
+                    networks += page["networks"]
+                    if page.get("next") is None:
+                        break
+                    req = f"list={page['next']}" + (f"&gen={gen}" if gen is not None else "")
+                    try:
+                        await client.write_gatt_char(WIFI, req.encode(), response=True)
+                    except BleakError:
+                        restart = True
+                        break
+                    page = json.loads(await client.read_gatt_char(WIFI))
+                if "next" in page:
+                    await client.write_gatt_char(WIFI, b"list=0", response=True)
+                if not restart:
                     break
-                await client.write_gatt_char(WIFI, f"list={page['next']}".encode(), response=True)
-                page = json.loads(await client.read_gatt_char(WIFI))
-            if "next" in page:
-                await client.write_gatt_char(WIFI, b"list=0", response=True)
+            else:
+                print("the list kept changing while being read", file=sys.stderr)
+                return 1
             print(json.dumps({"networks": networks}, indent=2, ensure_ascii=False))
         elif args.command == "ctrl":
             try:

@@ -70,14 +70,14 @@ void test_wifinets_sort_and_json() {
   TEST_ASSERT_EQUAL_STRING("low", e[2].ssid);  // stable
   TEST_ASSERT_EQUAL_STRING("low2", e[3].ssid);
   char buf[512];
-  TEST_ASSERT_GREATER_THAN(0, wifinets::listJson(e, 2, 0, buf, sizeof(buf)));
+  TEST_ASSERT_GREATER_THAN(0, wifinets::listJson(e, 2, 0, 7, buf, sizeof(buf)));
   TEST_ASSERT_EQUAL_STRING(
       "{\"networks\":[{\"ssid\":\"high\",\"prio\":20,\"secured\":true},{\"ssid\":\"mid\\\"q\",\"prio\":5,\"secured\":false}],"
-      "\"total\":2,\"next\":null}",
+      "\"total\":2,\"next\":null,\"gen\":7}",
       buf);
-  TEST_ASSERT_GREATER_THAN(0, wifinets::listJson(e, 0, 0, buf, sizeof(buf)));
-  TEST_ASSERT_EQUAL_STRING("{\"networks\":[],\"total\":0,\"next\":null}", buf);
-  TEST_ASSERT_EQUAL(0, wifinets::listJson(e, 4, 0, buf, 40));  // not even one entry fits
+  TEST_ASSERT_GREATER_THAN(0, wifinets::listJson(e, 0, 0, 7, buf, sizeof(buf)));
+  TEST_ASSERT_EQUAL_STRING("{\"networks\":[],\"total\":0,\"next\":null,\"gen\":7}", buf);
+  TEST_ASSERT_EQUAL(0, wifinets::listJson(e, 4, 0, 7, buf, 40));  // not even one entry fits
 }
 
 // 8 networks with 32-character SSIDs that all need escaping do not fit one 512-byte attribute: the pages
@@ -93,7 +93,7 @@ void test_wifinets_list_pages() {
   int start = 0, seen = 0, pages = 0;
   char buf[512];
   while (true) {
-    const size_t n = wifinets::listJson(e, wifinets::kMax, start, buf, sizeof(buf));
+    const size_t n = wifinets::listJson(e, wifinets::kMax, start, 3, buf, sizeof(buf));
     TEST_ASSERT_GREATER_THAN(0, n);
     TEST_ASSERT_LESS_THAN(512, n);
     pages++;
@@ -101,15 +101,27 @@ void test_wifinets_list_pages() {
     const char* next = strstr(buf, "\"next\":");
     TEST_ASSERT_NOT_NULL(next);
     if (!strncmp(next + 7, "null", 4)) break;
-    TEST_ASSERT_TRUE(wifinets::parseListRequest((std::string("list=") + std::to_string(atoi(next + 7))).c_str(), &start));
+    uint32_t gen;
+    bool hasGen;
+    TEST_ASSERT_TRUE(wifinets::parseListRequest(
+        (std::string("list=") + std::to_string(atoi(next + 7)) + "&gen=3").c_str(), &start, &gen, &hasGen));
+    TEST_ASSERT_TRUE(hasGen);
+    TEST_ASSERT_EQUAL_UINT32(3, gen);
   }
   TEST_ASSERT_EQUAL(wifinets::kMax, seen);
   TEST_ASSERT_GREATER_THAN(1, pages);
   int k;
-  TEST_ASSERT_FALSE(wifinets::parseListRequest("list=", &k));
-  TEST_ASSERT_FALSE(wifinets::parseListRequest("list=9", &k));
-  TEST_ASSERT_FALSE(wifinets::parseListRequest("list=1x", &k));
-  TEST_ASSERT_FALSE(wifinets::parseListRequest("ssid=a", &k));
+  uint32_t g;
+  bool hg;
+  TEST_ASSERT_TRUE(wifinets::parseListRequest("list=2", &k, &g, &hg));  // older clients: no gen
+  TEST_ASSERT_FALSE(hg);
+  TEST_ASSERT_EQUAL(2, k);
+  TEST_ASSERT_FALSE(wifinets::parseListRequest("list=", &k, &g, &hg));
+  TEST_ASSERT_FALSE(wifinets::parseListRequest("list=9", &k, &g, &hg));
+  TEST_ASSERT_FALSE(wifinets::parseListRequest("list=1x", &k, &g, &hg));
+  TEST_ASSERT_FALSE(wifinets::parseListRequest("list=1&gen=", &k, &g, &hg));
+  TEST_ASSERT_FALSE(wifinets::parseListRequest("list=1&gen=5x", &k, &g, &hg));
+  TEST_ASSERT_FALSE(wifinets::parseListRequest("ssid=a", &k, &g, &hg));
 }
 
 void runWifinetsTests() {

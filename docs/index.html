@@ -51,7 +51,7 @@
 </section>
 
 <section>
-  <p class="hint" style="margin:0">logbo の電源が入っていれば、いつでも「接続」から BLE で見つかります（同時に繋げるのは 1 台です）。接続時に OS がペアリングの確認を出したら許可してください（暗号化した接続で Wi-Fi のパスワードを送ります。登録は残りません）。</p>
+  <p class="hint" style="margin:0">logbo の電源が入っていれば、いつでも「接続」から BLE で見つかります（同時に 3 台まで繋げます）。接続時に OS がペアリングの確認を出したら許可してください（暗号化した接続で Wi-Fi のパスワードを送ります。登録は残りません）。</p>
 </section>
 
 <section>
@@ -254,18 +254,31 @@ $('rec_start').onclick = () => ctrl('rec=1', '記録の開始を指示しまし�
 $('rec_stop').onclick = () => ctrl('rec=0', '記録の停止を指示しました(「外してよい」になるまで待ってください)', 'rec_msg');
 
 // ---- Wi-Fi ----
-// 一覧は 512 バイトずつのページで返る("next" があれば "list=<next>" を書いて続きを読む)。古いファームウェアは 1 回で全部
+// 一覧は 512 バイトずつのページで返る("next" があれば "list=<next>&gen=<gen>" を書いて続きを読む)。
+// 途中で一覧が変わったら(別の端末やシリアルから)、"gen" が変わる / 古い gen の要求が断られるので、最初から読み直す。
+// 古いファームウェアは 1 回で全部
 async function readNetworks() {
-  const all = [];
-  let j = await readJson(ch.wifi);
-  for (let guard = 0; ; guard++) {
-    all.push(...j.networks);
-    if (j.next === undefined || j.next === null || guard > 8) break;
-    await write(ch.wifi, `list=${j.next}`);
-    j = await readJson(ch.wifi);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const all = [];
+    let j = await readJson(ch.wifi);
+    const gen = j.gen;
+    let restart = false;
+    for (let guard = 0; ; guard++) {
+      if (j.gen !== gen) { restart = true; break; }
+      all.push(...j.networks);
+      if (j.next === undefined || j.next === null || guard > 8) break;
+      try {
+        await write(ch.wifi, gen === undefined ? `list=${j.next}` : `list=${j.next}&gen=${gen}`);
+      } catch (e) {
+        restart = true; break; // 一覧が変わった
+      }
+      j = await readJson(ch.wifi);
+    }
+    if (j.next !== undefined) await write(ch.wifi, 'list=0').catch(() => {}); // 先頭に戻す
+    if (!restart) return { networks: all };
+    log('読み出し中に接続先の一覧が変わったので、最初から読み直します');
   }
-  if (j.next !== undefined) await write(ch.wifi, 'list=0').catch(() => {}); // 次に読む人のため先頭に戻す
-  return { networks: all };
+  throw new Error('一覧が変わり続けて読み出せませんでした');
 }
 
 async function refreshWifi() {

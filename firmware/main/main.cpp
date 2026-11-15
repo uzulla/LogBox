@@ -104,9 +104,65 @@ constexpr TickType_t kWifiJoinTimeout = pdMS_TO_TICKS(30000);  // association + 
 constexpr TickType_t kWifiRetryIdle = pdMS_TO_TICKS(10000);    // after every network failed
 static std::atomic<int> wifiCount{0};                           // networks in NVS
 static bool radioApOn = true, radioStaOn = true;                // this boot (see the radio switches below)
-// The list is read in pages of at most 512 bytes (the ATT limit): a client writes "list=<next>" and reads again.
-// Back to the top on a change of the list (from anywhere) and when the BLE client disconnects.
-static std::atomic<int> wifiListStart{0};
+// BLE clients of the config service: up to CONFIG_BT_NIMBLE_MAX_CONNECTIONS at once (advertising goes on while there
+// is room). Each has its own read position in the Wi-Fi list, which is read in pages of at most 512 bytes (the ATT
+// limit): a client writes "list=<next>" and reads again. Back to the top on a change of the list (from anywhere).
+struct BleClient {
+  uint16_t handle;
+  int listStart;
+};
+static BleClient bleClients[CONFIG_BT_NIMBLE_MAX_CONNECTIONS];
+static std::atomic<uint32_t> wifiListGen{1};  // bumped on every change of the list (shown as "gen")
+static int bleClientCount = 0;
+static portMUX_TYPE bleClientsLock = portMUX_INITIALIZER_UNLOCKED;
+
+static void bleClientAdd(uint16_t handle) {
+  taskENTER_CRITICAL(&bleClientsLock);
+  if (bleClientCount < CONFIG_BT_NIMBLE_MAX_CONNECTIONS) bleClients[bleClientCount++] = {handle, 0};
+  taskEXIT_CRITICAL(&bleClientsLock);
+}
+
+static void bleClientRemove(uint16_t handle) {
+  taskENTER_CRITICAL(&bleClientsLock);
+  for (int i = 0; i < bleClientCount; i++) {
+    if (bleClients[i].handle == handle) {
+      bleClients[i] = bleClients[--bleClientCount];
+      break;
+    }
+  }
+  taskEXIT_CRITICAL(&bleClientsLock);
+}
+
+static int bleClientsConnected() {
+  taskENTER_CRITICAL(&bleClientsLock);
+  const int n = bleClientCount;
+  taskEXIT_CRITICAL(&bleClientsLock);
+  return n;
+}
+
+static int wifiListStartOf(uint16_t handle) {
+  int start = 0;
+  taskENTER_CRITICAL(&bleClientsLock);
+  for (int i = 0; i < bleClientCount; i++) {
+    if (bleClients[i].handle == handle) start = bleClients[i].listStart;
+  }
+  taskEXIT_CRITICAL(&bleClientsLock);
+  return start;
+}
+
+static void setWifiListStart(uint16_t handle, int start) {
+  taskENTER_CRITICAL(&bleClientsLock);
+  for (int i = 0; i < bleClientCount; i++) {
+    if (bleClients[i].handle == handle) bleClients[i].listStart = start;
+  }
+  taskEXIT_CRITICAL(&bleClientsLock);
+}
+
+static void resetWifiListStarts() {
+  taskENTER_CRITICAL(&bleClientsLock);
+  for (int i = 0; i < bleClientCount; i++) bleClients[i].listStart = 0;
+  taskEXIT_CRITICAL(&bleClientsLock);
+}
 static std::atomic<bool> staAssociated{false};                  // between STA_CONNECTED and STA_DISCONNECTED
 static portMUX_TYPE wifiLock = portMUX_INITIALIZER_UNLOCKED;
 static char wifiTarget[33];  // network being tried or joined, "" if none (guarded by wifiLock)
@@ -127,7 +183,8 @@ static void wifiTargetCopy(char (&out)[33]) {
 // the top of the new list.
 static void wifiListChanged() {
   wifiCount = wifinets::count();
-  wifiListStart = 0;
+  wifiListGen++;
+  resetWifiListStarts();
   if (wifiEvents) xEventGroupSetBits(wifiEvents, kWifiChanged);
 }
 
@@ -418,7 +475,6 @@ static constexpr ble_uuid128_t kConfigCtrl = uuid128(
 
 static uint8_t ownAddrType;
 static std::atomic<bool> configWindowOpen{true};
-static std::atomic<uint16_t> configConnHandle{BLE_HS_CONN_HANDLE_NONE};
 
 // {"device":"logbo-CD0E","uptime_s":120,"free_heap":45000,
 //  "gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01.csv",
@@ -560,11 +616,12 @@ static int onConfigAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*)
 // wifi characteristic. read: one page of the list JSON (no passwords). write: one wifinets text command, or
 // "list=<index>" to read the list from that entry on; refused with ATT error 0x80 (invalid), 0x81 (8 networks
 // already), 0x82 (no such network to delete).
-static int onWifiAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
+static int onWifiAccess(uint16_t connHandle, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
     static wifinets::Entry list[wifinets::kMax];
     static char json[512];  // BLE host task only
-    const size_t n = wifinets::listJson(list, wifinets::load(list), wifiListStart.load(), json, sizeof(json));
+    const size_t n = wifinets::listJson(list, wifinets::load(list), wifiListStartOf(connHandle), wifiListGen.load(),
+                                        json, sizeof(json));
     return n && os_mbuf_append(ctxt->om, json, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
   if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
@@ -573,8 +630,12 @@ static int onWifiAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
     if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf) - 1, &len) != 0) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     buf[len] = '\0';
     int start;
-    if (wifinets::parseListRequest(buf, &start)) {
-      wifiListStart = start;
+    uint32_t gen;
+    bool hasGen;
+    if (wifinets::parseListRequest(buf, &start, &gen, &hasGen)) {
+      // A request for a page of an older list: refused (the client starts over); "list=0" always works
+      if (hasGen && gen != wifiListGen.load() && start != 0) return 0x83;
+      setWifiListStart(connHandle, start);
       return 0;
     }
     bool full = false, notFound = false;
@@ -608,7 +669,7 @@ static const ble_gatt_svc_def kConfigSvcs[] = {
 static int onConfigGapEvent(ble_gap_event* ev, void*);
 
 static void startConfigAdvertising() {
-  if (!configWindowOpen || configConnHandle != BLE_HS_CONN_HANDLE_NONE || ble_gap_adv_active()) {
+  if (!configWindowOpen || bleClientsConnected() >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS || ble_gap_adv_active()) {
     return;
   }
   ble_hs_adv_fields adv = {};
@@ -638,26 +699,24 @@ static void closeConfigWindow(void*) {
   configWindowOpen = false;
   ble_gap_adv_stop();
   ESP_LOGI(TAG, "Config window closed%s",
-           configConnHandle != BLE_HS_CONN_HANDLE_NONE ? " (client stays until it disconnects)" : "");
+           bleClientsConnected() ? " (clients stay until they disconnect)" : "");
 }
 
 static int onConfigGapEvent(ble_gap_event* ev, void*) {
   switch (ev->type) {
     case BLE_GAP_EVENT_CONNECT:
       if (ev->connect.status == 0) {
-        configConnHandle = ev->connect.conn_handle;
-        ESP_LOGI(TAG, "Config client connected");
+        bleClientAdd(ev->connect.conn_handle);
+        ESP_LOGI(TAG, "Config client connected (%d of %d)", bleClientsConnected(), CONFIG_BT_NIMBLE_MAX_CONNECTIONS);
         // Ask the client to pair right away; macOS does not start pairing on its
         // own when a read fails with "insufficient encryption".
         ble_gap_security_initiate(ev->connect.conn_handle);
-      } else {
-        startConfigAdvertising();
       }
+      startConfigAdvertising();  // advertising stops on a connection: go on while there is room for another client
       break;
     case BLE_GAP_EVENT_DISCONNECT:
-      configConnHandle = BLE_HS_CONN_HANDLE_NONE;
-      wifiListStart = 0;  // the next client reads the Wi-Fi list from the top
-      ESP_LOGI(TAG, "Config client disconnected, reason=0x%x", ev->disconnect.reason);
+      bleClientRemove(ev->disconnect.conn.conn_handle);
+      ESP_LOGI(TAG, "Config client disconnected, reason=0x%x (%d left)", ev->disconnect.reason, bleClientsConnected());
       startConfigAdvertising();
       break;
     case BLE_GAP_EVENT_ENC_CHANGE:
@@ -932,8 +991,8 @@ static void handleCommand(char* line) {
                                                              : "ERR NVS write failed");
   } else if (strcmp(line, "wifi-list") == 0) {
     static wifinets::Entry list[wifinets::kMax];
-    static char json[wifinets::kMax * (33 * 6 + 48) + 48];  // one page holds them all; static: ~2 KB
-    if (wifinets::listJson(list, wifinets::load(list), 0, json, sizeof(json))) printf("%s\n", json);
+    static char json[wifinets::kMax * (33 * 6 + 48) + 64];  // one page holds them all; static: ~2 KB
+    if (wifinets::listJson(list, wifinets::load(list), 0, wifiListGen.load(), json, sizeof(json))) printf("%s\n", json);
   } else if (strcmp(line, "wifi-clear") == 0) {
     if (wifinets::clear() != wifinets::StoreError::kNone) {
       printf("ERR NVS write failed\n");

@@ -120,11 +120,11 @@ size_t entryJson(const Entry& e, char* buf, size_t size) {
 
 }  // namespace
 
-size_t listJson(const Entry* e, int n, int start, char* buf, size_t size) {
+size_t listJson(const Entry* e, int n, int start, uint32_t gen, char* buf, size_t size) {
   if (start < 0) start = 0;
   if (start > n) start = n;
-  // Room kept for the tail: ],"total":8,"next":8}
-  constexpr size_t kTail = 32;
+  // Room kept for the tail: ],"total":8,"next":8,"gen":4294967295}
+  constexpr size_t kTail = 48;
   int k = snprintf(buf, size, "{\"networks\":[");
   if (k < 0 || static_cast<size_t>(k) + kTail >= size) return 0;
   size_t o = static_cast<size_t>(k);
@@ -141,15 +141,24 @@ size_t listJson(const Entry* e, int n, int start, char* buf, size_t size) {
   if (i == start && start < n) return 0;  // not even one entry fits
   char next[12] = "null";
   if (i < n) snprintf(next, sizeof(next), "%d", i);
-  k = snprintf(buf + o, size - o, "],\"total\":%d,\"next\":%s}", n, next);
+  k = snprintf(buf + o, size - o, "],\"total\":%d,\"next\":%s,\"gen\":%lu}", n, next, static_cast<unsigned long>(gen));
   return k > 0 && o + static_cast<size_t>(k) < size ? o + static_cast<size_t>(k) : 0;
 }
 
-bool parseListRequest(const char* text, int* start) {
+bool parseListRequest(const char* text, int* start, uint32_t* gen, bool* hasGen) {
   if (strncmp(text, "list=", 5) || !text[5]) return false;
   char* end;
   const long v = strtol(text + 5, &end, 10);
-  if (*end || v < 0 || v > kMax) return false;
+  if (end == text + 5 || v < 0 || v > kMax) return false;
+  *hasGen = false;
+  if (!strncmp(end, "&gen=", 5) && end[5]) {
+    const char* g = end + 5;
+    const unsigned long gv = strtoul(g, &end, 10);
+    if (end == g) return false;
+    *gen = static_cast<uint32_t>(gv);
+    *hasGen = true;
+  }
+  if (*end) return false;
   *start = static_cast<int>(v);
   return true;
 }
