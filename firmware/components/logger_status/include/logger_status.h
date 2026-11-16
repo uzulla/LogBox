@@ -8,7 +8,10 @@ namespace logger {
 
 struct Status {
   // Links
-  bool configWindow;     // BLE config service is being advertised
+  int bleClients;        // BLE config clients connected now
+  bool batteryValid;     // the power IC reports the battery (IP5306 with I2C); false: show nothing
+  uint8_t batteryLevel;  // 0, 25, 50, 75, 100 (4 steps, see imu::Battery)
+  bool batteryCharging, batteryFull;
   bool wifiConfigured;
   bool wifiUp;
   bool apOn, staOn;      // radio switches of this boot (off = not started)

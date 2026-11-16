@@ -69,4 +69,16 @@ bool magCalClear();               // stops any collection and forgets the calibr
                                   // (the old one comes back at the next reboot)
 MagCalInfo magCalInfo();
 
+// Battery of the M5Stack Gray, from its power IC (IP5306, I2C address 0x75 on the same bus). The IC only
+// reports the level in 4 steps (25/50/75/100 %; 0 = nearly empty), estimated from the battery voltage:
+// it jumps while charging or under load. Units with the IP5306 variant without I2C report nothing.
+struct Battery {
+  bool valid;     // false: no I2C power IC (or not read yet)
+  uint8_t level;  // 0, 25, 50, 75, 100
+  bool charging;  // USB power is in and the battery is charging
+  bool full;      // USB power is in and the battery is full
+};
+// Reads the IC at most every 5 s (cached in between); call after init(). Thread-safe.
+Battery battery();
+
 }  // namespace imu

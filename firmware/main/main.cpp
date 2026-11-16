@@ -477,17 +477,29 @@ static constexpr ble_uuid128_t kConfigCtrl = uuid128(
 static uint8_t ownAddrType;
 static std::atomic<bool> configWindowOpen{true};
 
+// {"level":75,"charging":false,"full":false}, or null without the I2C power IC.
+static void batteryJson(char* buf, size_t size) {
+  const imu::Battery b = imu::battery();
+  if (!b.valid) {
+    snprintf(buf, size, "null");
+    return;
+  }
+  snprintf(buf, size, "{\"level\":%u,\"charging\":%s,\"full\":%s}", b.level, b.charging ? "true" : "false",
+           b.full ? "true" : "false");
+}
+
 // {"device":"logbo-CD0E","uptime_s":120,"free_heap":45000,
 //  "gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01.csv",
 //  "records":3000,"imu":true,"mag":true,"baro":true,"wifi_ssid":"...","wifi_connected":true,"ip":"192.168.11.38",
-//  "rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0}
-// The earlier members keep their names and meaning (tools/ble-config.py). At most ~470 bytes even with an
+//  "rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0,"battery":{"level":75,"charging":false,"full":false}}
+// "battery" is null without the I2C power IC (level: 0/25/50/75/100, the IC's 4 steps).
+// The earlier members keep their names and meaning (tools/ble-config.py). At most ~490 bytes even with an
 // SSID of 32 characters that all need escaping, below the 512 bytes an attribute may have.
 static size_t statusJson(char* buf, size_t size) {
   static const char* const kRec[] = {"off", "rec", "saving", "safe", "failed"};
   char target[33];
   wifiTargetCopy(target);
-  char ssid[100];  // an SSID full of characters that need escaping is cut short: the reply must stay <= 512 bytes
+  char ssid[72];  // an SSID full of characters that need escaping is cut short: the reply must stay <= 512 bytes
   record::jsonEscape(target, ssid, sizeof(ssid));
   const bool connected = broadcastAddr != 0;
   char ip[24] = "null";
@@ -501,20 +513,22 @@ static size_t statusJson(char* buf, size_t size) {
   const bool fresh = lastPvtUs && esp_timer_get_time() - lastPvtUs < 2000000;
   const char* t = "true";
   const char* f = "false";
+  char bat[48];
+  batteryJson(bat, sizeof(bat));
   const int n = snprintf(
       buf, size,
       "{\"device\":\"%s\",\"uptime_s\":%lu,\"free_heap\":%lu,"
       "\"gnss\":{\"configured\":%s,\"messages\":%lu,\"baud\":%lu,\"fix\":%u,\"sats\":%u},"
       "\"rec\":\"%s\",\"log\":\"%s\",\"records\":%lu,\"imu\":%s,\"mag\":%s,\"baro\":%s,"
       "\"wifi_ssid\":\"%s\",\"wifi_connected\":%s,\"wifi_networks\":%d,\"ip\":%s,\"rssi\":%d,"
-      "\"ap_ssid\":\"%s\",\"ap_clients\":%d}",
+      "\"ap_ssid\":\"%s\",\"ap_clients\":%d,\"battery\":%s}",
       deviceName, static_cast<unsigned long>(esp_timer_get_time() / 1000000),
       static_cast<unsigned long>(esp_get_free_heap_size()), gs.configured ? t : f,
       static_cast<unsigned long>(gs.pvt), static_cast<unsigned long>(gs.baud), fresh ? lastFix.load() : 0,
       fresh ? lastSats.load() : 0, kRec[static_cast<int>(sdlog::state())], sdlog::fileName(),
       static_cast<unsigned long>(records.load()), imuStatus.bmi270 ? t : f, imuStatus.bmm150 ? t : f,
       imuStatus.bmp280 ? t : f, ssid, connected ? t : f, wifiCount.load(), ip, rssi, LOGBO_AP_SSID,
-      apClients.load());
+      apClients.load(), bat);
   return n > 0 && static_cast<size_t>(n) < size ? n : 0;
 }
 
@@ -815,7 +829,7 @@ static void publishStatus(const record::Record* r) {
   ds.magCalComplete = mc.complete;
   ds.magCalResult = magCalResult;
   ds.magCalResultAtUs = magCalResultAtUs;
-  ds.configWindow = configWindowOpen;
+  ds.bleClients = bleClientsConnected();
   ds.wifiConfigured = wifiCount > 0;
   ds.apOn = radioApOn;
   ds.staOn = radioStaOn;
@@ -870,7 +884,12 @@ static void publishStatus(const record::Record* r) {
     wifiTargetCopy(target);
     snprintf(copy.ssid, sizeof(copy.ssid), "%s", target);
     snprintf(copy.logName, sizeof(copy.logName), "%s", sdlog::fileName());
+    const imu::Battery bat = imu::battery();
     taskENTER_CRITICAL(&lock);
+    ds.batteryValid = copy.batteryValid = bat.valid;
+    ds.batteryLevel = copy.batteryLevel = bat.level;
+    ds.batteryCharging = copy.batteryCharging = bat.charging;
+    ds.batteryFull = copy.batteryFull = bat.full;
     ds.rssi = copy.rssi;
     memcpy(ds.ip, copy.ip, sizeof(ds.ip));
     memcpy(ds.ssid, copy.ssid, sizeof(ds.ssid));
@@ -929,13 +948,15 @@ static void sendStatus() {
   esp_netif_ip_info_t ip = {};
   staIpInfo(&ip);
 
+  char bat[48];
+  batteryJson(bat, sizeof(bat));
   char json[record::kMaxUdpPayload + 1];
   const int n = snprintf(
       json, sizeof(json),
       "{\"type\":\"status\",\"uptime_ms\":%lu,\"records\":%lu,"
       "\"gnss\":{\"configured\":%s,\"baud\":%lu,\"pvt\":%lu,\"checksum_errors\":%lu,\"other\":%lu,\"bytes\":%lu},"
       "\"imu\":%s,\"mag\":%s,\"mag_cal\":%s,\"baro\":%s,\"rec\":%d,\"log\":\"%s\",\"udp_errors\":%lu,"
-      "\"wifi_configured\":%s,\"wifi_rssi\":%d,\"ip\":\"" IPSTR "\",\"free_heap\":%lu}",
+      "\"wifi_configured\":%s,\"wifi_rssi\":%d,\"ip\":\"" IPSTR "\",\"free_heap\":%lu,\"battery\":%s}",
       static_cast<unsigned long>(esp_timer_get_time() / 1000), static_cast<unsigned long>(records.load()),
       gs.configured ? "true" : "false", static_cast<unsigned long>(gs.baud), static_cast<unsigned long>(gs.pvt),
       static_cast<unsigned long>(gs.checksumErrors), static_cast<unsigned long>(gs.otherMsgs),
@@ -943,7 +964,8 @@ static void sendStatus() {
       imuStatus.bmm150 ? "true" : "false", imu::magCalInfo().calibrated ? "true" : "false",
       imuStatus.bmp280 ? "true" : "false",
       static_cast<int>(sdlog::state()), sdlog::fileName(), static_cast<unsigned long>(udpErrors.load()),
-      wifiCount > 0 ? "true" : "false", rssi, IP2STR(&ip.ip), static_cast<unsigned long>(esp_get_free_heap_size()));
+      wifiCount > 0 ? "true" : "false", rssi, IP2STR(&ip.ip), static_cast<unsigned long>(esp_get_free_heap_size()),
+      bat);
   if (n > 0 && static_cast<size_t>(n) < sizeof(json)) sendUdp(json, n);
   ESP_LOGI(TAG, "%s", json);
 }

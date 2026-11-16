@@ -209,6 +209,17 @@ void drawRec(int x, int y, int rec, int scale, int64_t now) {
 
 bool gnssFresh(const Status& s, int64_t now) { return s.gnssAtUs && now - s.gnssAtUs < 2000000; }
 
+// Battery: 4 segments (the IC reports 25 % steps). Cyan while charging, green when full on USB.
+void drawBattery(int x, int y, const Status& s) {
+  const uint16_t c = s.batteryFull ? kGreen : s.batteryCharging ? kCyan
+                     : s.batteryLevel <= 25 ? kRed : s.batteryLevel <= 50 ? kAmber : kWhite;
+  fillRect(x, y, 22, 12, c);          // outline
+  fillRect(x + 1, y + 1, 20, 10, kBar);
+  fillRect(x + 22, y + 3, 2, 6, c);   // terminal
+  const int seg = s.batteryLevel / 25;
+  for (int i = 0; i < 4; i++) fillRect(x + 2 + i * 5, y + 2, 4, 8, i < seg ? c : kTrack);
+}
+
 // Top bar on every page: SD state, GNSS, Wi-Fi, clock (JST).
 void drawTopBar(const Status& s, int64_t now) {
   if (bandY >= 22) return;
@@ -224,8 +235,9 @@ void drawTopBar(const Status& s, int64_t now) {
   text(110, 4, b, 2, gc);
 
   const int bars = !s.wifiUp ? 0 : s.rssi > -55 ? 4 : s.rssi > -65 ? 3 : s.rssi > -75 ? 2 : 1;
-  drawSignal(204, 4, bars, s.wifiUp ? kGreen : s.apClients ? kCyan : kDim);
-  if (s.configWindow) text(222, 11, "BT", 1, kAmber);
+  drawSignal(190, 4, bars, s.wifiUp ? kGreen : s.apClients ? kCyan : kDim);
+  if (s.bleClients) text(208, 11, "BT", 1, kCyan);  // only while a config client is connected
+  if (s.batteryValid) drawBattery(226, 5, s);
 
   if (s.unixUs) {
     const time_t t = static_cast<time_t>((s.unixUs + (now - s.gnssAtUs)) / 1000000) + 9 * 3600;
@@ -361,7 +373,7 @@ void drawGPage(const Status& s, int64_t now) {
 
 void drawStatusPage(const Status& s, int64_t now, int rate) {
   char b[48];
-  constexpr int lx = 6, vx = 70, dy = 18;
+  constexpr int lx = 6, vx = 70, dy = 17;
   int y = 28;
   auto row = [&](const char* label, const char* value, uint16_t c) {
     text(lx, y, label, 2, kDim);
@@ -444,6 +456,12 @@ void drawStatusPage(const Status& s, int64_t now, int rate) {
   } else {
     snprintf(b, sizeof(b), "%s %d", s.ip, s.rssi);
     row("WIFI", b, kWhite);
+  }
+
+  // Battery (only with the I2C power IC)
+  if (s.batteryValid) {
+    snprintf(b, sizeof(b), "%d%%%s", s.batteryLevel, s.batteryFull ? " FULL" : s.batteryCharging ? " CHARGING" : "");
+    row("BAT", b, s.batteryCharging || s.batteryFull ? kCyan : s.batteryLevel <= 25 ? kRed : kWhite);
   }
 }
 
