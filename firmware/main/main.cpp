@@ -27,6 +27,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "host/ble_hs.h"
+#include "host/ble_store.h"
 #include "host/util/util.h"
 #include "lwip/sockets.h"
 #include "nimble/nimble_port.h"
@@ -588,11 +589,24 @@ static int onCtrlWrite(const char* cmd) {
   return 0;
 }
 
+// Appends a read reply; logs why when it can't be sent (shows up as "GATT operation failed" in a browser).
+static int replyRead(ble_gatt_access_ctxt* ctxt, const char* what, const char* json, size_t n) {
+  if (!n) {
+    ESP_LOGW(TAG, "BLE read %s: reply did not fit", what);
+    return BLE_ATT_ERR_INSUFFICIENT_RES;
+  }
+  if (os_mbuf_append(ctxt->om, json, n) != 0) {
+    ESP_LOGW(TAG, "BLE read %s: no buffer for %u bytes", what, static_cast<unsigned>(n));
+    return BLE_ATT_ERR_INSUFFICIENT_RES;
+  }
+  return 0;
+}
+
 static int onCtrlAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
     char json[384];
     const size_t n = ctrlJson(json, sizeof(json));
-    return n && os_mbuf_append(ctxt->om, json, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    return replyRead(ctxt, "ctrl", json, n);
   }
   if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
     char cmd[32];
@@ -608,7 +622,7 @@ static int onConfigAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*)
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
     char json[512];
     const size_t n = statusJson(json, sizeof(json));
-    return n && os_mbuf_append(ctxt->om, json, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    return replyRead(ctxt, "status", json, n);
   }
   return BLE_ATT_ERR_UNLIKELY;
 }
@@ -622,7 +636,7 @@ static int onWifiAccess(uint16_t connHandle, uint16_t, ble_gatt_access_ctxt* ctx
     static char json[512];  // BLE host task only
     const size_t n = wifinets::listJson(list, wifinets::load(list), wifiListStartOf(connHandle), wifiListGen.load(),
                                         json, sizeof(json));
-    return n && os_mbuf_append(ctxt->om, json, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    return replyRead(ctxt, "wifi", json, n);
   }
   if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
     char buf[352];  // "ssid=...&pass=...&prio=..." with every byte URL-encoded
@@ -720,9 +734,22 @@ static int onConfigGapEvent(ble_gap_event* ev, void*) {
       startConfigAdvertising();
       break;
     case BLE_GAP_EVENT_ENC_CHANGE:
-      ESP_LOGI(TAG, "Config link encryption: %s", ev->enc_change.status == 0 ? "on" : "failed");
+      ESP_LOGI(TAG, "Config link encryption (conn %d): %s (status %d)", ev->enc_change.conn_handle,
+               ev->enc_change.status == 0 ? "on" : "failed", ev->enc_change.status);
+      break;
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+      // The client still has keys from an earlier pairing that we don't keep (no bonds): forget its old bond
+      // (if any) and pair again instead of failing the encryption.
+      ble_gap_conn_desc desc;
+      if (ble_gap_conn_find(ev->repeat_pairing.conn_handle, &desc) == 0) ble_store_util_delete_peer(&desc.peer_id_addr);
+      ESP_LOGI(TAG, "Config client pairs again (conn %d)", ev->repeat_pairing.conn_handle);
+      return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
+    case BLE_GAP_EVENT_MTU:
+      ESP_LOGI(TAG, "Config client MTU %d (conn %d)", ev->mtu.value, ev->mtu.conn_handle);
       break;
     default:
+      ESP_LOGD(TAG, "Config GAP event %d", ev->type);
       break;
   }
   return 0;
