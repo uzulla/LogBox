@@ -560,15 +560,21 @@ uint8_t levelPercent(uint8_t reg) {
 
 void readBattery() {
   if (!gBatProbed) {
-    gBatProbed = true;
-    if (i2c_master_probe(gBus, ip5306::kAddr, kTimeoutMs) == ESP_OK) {
+    // Only "no ACK" (ESP_ERR_NOT_FOUND) means there is no I2C power IC; a timeout or a failed registration is
+    // tried again at the next period.
+    const esp_err_t err = i2c_master_probe(gBus, ip5306::kAddr, kTimeoutMs);
+    if (err == ESP_OK) {
       i2c_device_config_t cfg = {};
       cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
       cfg.device_address = ip5306::kAddr;
       cfg.scl_speed_hz = ip5306::kSclHz;
       if (i2c_master_bus_add_device(gBus, &cfg, &gBatDev) != ESP_OK) gBatDev = nullptr;
+      gBatProbed = gBatDev != nullptr;
+    } else {
+      gBatProbed = err == ESP_ERR_NOT_FOUND;
     }
-    ESP_LOGI(TAG, "power IC (IP5306, I2C): %s", gBatDev ? "found" : "not found, no battery level");
+    if (gBatProbed) ESP_LOGI(TAG, "power IC (IP5306, I2C): %s", gBatDev ? "found" : "not found, no battery level");
+    else ESP_LOGW(TAG, "power IC (IP5306): probe failed (%s), trying again", esp_err_to_name(err));
   }
   if (!gBatDev) return;
   uint8_t r0, r1, lv;

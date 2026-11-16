@@ -201,7 +201,11 @@ async function waitForPairing() {
   while (device?.gatt?.connected) {
     try {
       await readJson(ch.status);
-      if (asked) log('ペアリングできました');
+      if (asked) {
+        log('ペアリングできました');
+        $('connstate').textContent = `接続中: ${device.name || ''}`;
+        $('connstate').className = 'ok';
+      }
       return true;
     } catch (e) {
       if (Date.now() > until) {
