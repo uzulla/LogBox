@@ -531,6 +531,64 @@ bool storeCalib(const MagCal* cal) {
   return err == ESP_OK;
 }
 
+// ---- Battery (IP5306 power IC of the M5Stack Gray) ----
+
+namespace ip5306 {
+constexpr uint8_t kAddr = 0x75;
+constexpr uint32_t kSclHz = 100000;  // the IC is specified for 100 kHz (it runs on its own clock)
+constexpr uint8_t kRegRead0 = 0x70;  // bit 3: charging
+constexpr uint8_t kRegRead1 = 0x71;  // bit 3: charge full
+constexpr uint8_t kRegLevel = 0x78;  // bits 7..4: level, inverted thermometer code
+constexpr TickType_t kPeriod = pdMS_TO_TICKS(5000);
+}  // namespace ip5306
+
+SemaphoreHandle_t gBatMutex;
+i2c_master_dev_handle_t gBatDev;
+bool gBatProbed;
+Battery gBattery;
+TickType_t gBatAt;
+
+uint8_t levelPercent(uint8_t reg) {
+  switch (reg & 0xF0) {
+    case 0x00: return 100;
+    case 0x80: return 75;
+    case 0xC0: return 50;
+    case 0xE0: return 25;
+    default: return 0;
+  }
+}
+
+void readBattery() {
+  if (!gBatProbed) {
+    // Only "no ACK" (ESP_ERR_NOT_FOUND) means there is no I2C power IC; a timeout or a failed registration is
+    // tried again at the next period.
+    const esp_err_t err = i2c_master_probe(gBus, ip5306::kAddr, kTimeoutMs);
+    if (err == ESP_OK) {
+      i2c_device_config_t cfg = {};
+      cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+      cfg.device_address = ip5306::kAddr;
+      cfg.scl_speed_hz = ip5306::kSclHz;
+      if (i2c_master_bus_add_device(gBus, &cfg, &gBatDev) != ESP_OK) gBatDev = nullptr;
+      gBatProbed = gBatDev != nullptr;
+    } else {
+      gBatProbed = err == ESP_ERR_NOT_FOUND;
+    }
+    if (gBatProbed) ESP_LOGI(TAG, "power IC (IP5306, I2C): %s", gBatDev ? "found" : "not found, no battery level");
+    else ESP_LOGW(TAG, "power IC (IP5306): probe failed (%s), trying again", esp_err_to_name(err));
+  }
+  if (!gBatDev) return;
+  uint8_t r0, r1, lv;
+  if (!readRegs(gBatDev, ip5306::kRegRead0, &r0, 1) || !readRegs(gBatDev, ip5306::kRegRead1, &r1, 1) ||
+      !readRegs(gBatDev, ip5306::kRegLevel, &lv, 1)) {
+    gBattery.valid = false;
+    return;
+  }
+  gBattery.valid = true;
+  gBattery.full = r1 & 0x08;
+  gBattery.charging = (r0 & 0x08) && !gBattery.full;
+  gBattery.level = levelPercent(lv);
+}
+
 }  // namespace
 
 Status init() {
@@ -552,6 +610,7 @@ Status init() {
   }
   gStatus.bmp280 = initBmp280();
   gCalMutex = xSemaphoreCreateMutex();
+  gBatMutex = xSemaphoreCreateMutex();
   if (gStatus.bmm150) loadCalib();
   ESP_LOGI(TAG, "BMI270 %s, BMM150 %s, BMP280 %s", gStatus.bmi270 ? "ok" : "--", gStatus.bmm150 ? "ok" : "--",
            gStatus.bmp280 ? "ok" : "--");
@@ -668,6 +727,19 @@ MagCalInfo magCalInfo() {
   info.complete = gFit.complete();
   xSemaphoreGive(gCalMutex);
   return info;
+}
+
+Battery battery() {
+  if (!gBus || !gBatMutex) return {};
+  xSemaphoreTake(gBatMutex, portMAX_DELAY);
+  const TickType_t now = xTaskGetTickCount();
+  if (!gBatProbed || now - gBatAt >= ip5306::kPeriod) {
+    readBattery();
+    gBatAt = now;
+  }
+  const Battery b = gBattery;
+  xSemaphoreGive(gBatMutex);
+  return b;
 }
 
 }  // namespace imu
