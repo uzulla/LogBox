@@ -182,6 +182,7 @@ $('connect').onclick = async () => {
     setConnected(true);
     for (const id of ['rec_start', 'rec_stop', 'clearwifi', 'radio_save', 'mag_start', 'mag_done', 'mag_cancel', 'mag_clear', 'reboot']) $(id).disabled = !ch.ctrl;
     log('接続しました');
+    if (!await waitForPairing()) return;
     await tick();
     await refreshWifi().catch(e => log(`接続先の一覧を読めません(古いファームウェア?): ${e.message}`));
     if (ch.ctrl) await refreshRadio().catch(e => log(`無線設定を読めません: ${e.message}`));
@@ -190,6 +191,36 @@ $('connect').onclick = async () => {
   }
 };
 $('disconnect').onclick = () => device?.gatt?.disconnect();
+
+// 本体は接続するとすぐペアリング(暗号化)を求め、OS が許可ダイアログを出す。許可されるまでは読み出しが
+// "GATT operation failed for unknown reason" などで失敗するので、読めるようになるまで待つ
+const PAIRING_TIMEOUT_MS = 60000;
+async function waitForPairing() {
+  const until = Date.now() + PAIRING_TIMEOUT_MS;
+  let asked = false;
+  while (device?.gatt?.connected) {
+    try {
+      await readJson(ch.status);
+      if (asked) log('ペアリングできました');
+      return true;
+    } catch (e) {
+      if (Date.now() > until) {
+        log(`ペアリングできませんでした(${e.message})。切断して、もう一度「接続」を押してください`);
+        $('connstate').textContent = 'ペアリングできませんでした';
+        $('connstate').className = 'warn';
+        return false;
+      }
+      if (!asked) {
+        asked = true;
+        log('ペアリング待ち: OS の許可ダイアログ(Mac なら「接続」)を押してください');
+        $('connstate').textContent = 'ペアリング待ち: 許可ダイアログを押してください';
+        $('connstate').className = 'warn';
+      }
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  return false; // 待っている間に切断された
+}
 
 // ---- 状態(自動更新: 2 秒ごと。キャリブレーション中は 0.5 秒ごと) ----
 async function tick() {
@@ -231,6 +262,10 @@ async function refreshStatus() {
   ];
   if (s.ap_ssid !== undefined) { rows.push(['本体の AP', `${esc(s.ap_ssid)} <span class="muted">192.168.4.1  接続 ${s.ap_clients} 台</span>`]); $('ap_name').textContent = s.ap_ssid; }
   if (s.imu !== undefined) rows.push(['センサー', ['imu', 'mag', 'baro'].map(k => span(`${{ imu: 'IMU', mag: '地磁気', baro: '気圧' }[k]} ${s[k] ? 'OK' : 'なし'}`, s[k] ? 'ok' : 'warn')).join('  ')]);
+  if (s.battery) {
+    const b = s.battery, note = b.full ? ' 満充電' : b.charging ? ' 充電中' : '';
+    rows.push(['電池', `${span(`${b.level}%${note}`, b.charging || b.full ? 'ok' : b.level <= 25 ? 'warn' : '')} <span class="muted">(25% 刻みの目安)</span>`]);
+  }
   if (s.uptime_s !== undefined) rows.push(['稼働', esc(`${Math.floor(s.uptime_s / 3600)}h${String(Math.floor(s.uptime_s / 60) % 60).padStart(2, '0')}m  記録 ${s.records} 行  空きヒープ ${Math.round(s.free_heap / 1024)} KiB`)]);
   $('status_kv').innerHTML = rows.map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join('');
   return s;
