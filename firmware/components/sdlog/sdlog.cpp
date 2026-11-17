@@ -46,6 +46,47 @@ uint32_t gSeq;
 std::atomic<bool> gStarting{false};
 uint32_t gDropped;
 
+// boot_log.csv: lines from event(), written by the log task (the only one that touches the card).
+constexpr const char* kEventFile = "boot_log.csv";
+constexpr const char* kEventHeader = "boot,utc,uptime_s,event,detail\n";
+constexpr int kEventMax = 16, kEventLen = 160;
+char gEvents[kEventMax][kEventLen];
+uint32_t gEventFirst, gEventCount;  // sequence number of the oldest waiting line (slot: seq % kEventMax), count
+portMUX_TYPE gEventLock = portMUX_INITIALIZER_UNLOCKED;
+
+// Appends the waiting lines to boot_log.csv. Returns false on a write error (the lines stay for later).
+bool writeEvents() {
+  static char lines[kEventMax][kEventLen];  // the log task only
+  taskENTER_CRITICAL(&gEventLock);
+  const uint32_t first = gEventFirst;
+  const int n = static_cast<int>(gEventCount);
+  for (int i = 0; i < n; i++) memcpy(lines[i], gEvents[(first + i) % kEventMax], kEventLen);
+  taskEXIT_CRITICAL(&gEventLock);
+  if (!n) return true;
+  char path[40];
+  snprintf(path, sizeof(path), "%s/%s", kMount, kEventFile);
+  struct stat st;
+  const bool fresh = stat(path, &st) != 0 || st.st_size == 0;
+  FILE* f = fopen(path, "a");
+  if (!f) return false;
+  bool ok = !fresh || fputs(kEventHeader, f) >= 0;
+  for (int i = 0; ok && i < n; i++) ok = fputs(lines[i], f) >= 0 && fputc('\n', f) != EOF;
+  ok = fflush(f) == 0 && fsync(fileno(f)) == 0 && ok;
+  fclose(f);
+  if (!ok) return false;
+  // Remove exactly the lines written (sequence numbers first .. first + n - 1); event() may have dropped some
+  // of them (queue full) and added new ones meanwhile.
+  taskENTER_CRITICAL(&gEventLock);
+  const uint32_t end = first + n;
+  if (static_cast<int32_t>(end - gEventFirst) > 0) {
+    const uint32_t done = end - gEventFirst;
+    gEventFirst = end;
+    gEventCount -= done;
+  }
+  taskEXIT_CRITICAL(&gEventLock);
+  return true;
+}
+
 bool initBus() {
   spi_bus_config_t bus = {};
   bus.mosi_io_num = kSdMosi;
@@ -152,6 +193,7 @@ void logTask(void*) {
     const int64_t now = esp_timer_get_time();
     if (now - flushedAt >= kFlushUs) {
       flushedAt = now;
+      if (!writeEvents()) ESP_LOGW(TAG, "cannot write %s (errno %d)", kEventFile, errno);
       if (!flushFile()) {
         ESP_LOGE(TAG, "flush failed (errno %d), recording stopped", errno);
         failed = true;
@@ -166,6 +208,7 @@ void logTask(void*) {
       if (!writeRow(it, startUs)) break;
     }
     flushFile();
+    writeEvents();
   }
   closeAndUnmount();
   if (!failed) gState = State::Safe;
@@ -232,6 +275,18 @@ void requestStart() {
 }
 
 State state() { return gState; }
+
+void event(const char* line) {
+  taskENTER_CRITICAL(&gEventLock);
+  if (gEventCount == kEventMax) {  // full: drop the oldest
+    gEventFirst++;
+    gEventCount--;
+  }
+  char* slot = gEvents[(gEventFirst + gEventCount) % kEventMax];
+  strlcpy(slot, line, kEventLen);
+  gEventCount++;
+  taskEXIT_CRITICAL(&gEventLock);
+}
 
 const char* fileName() {
   const char* slash = strrchr(gPath, '/');
