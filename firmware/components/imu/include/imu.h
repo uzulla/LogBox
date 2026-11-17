@@ -36,7 +36,13 @@ struct Status {
 
 // Creates the I2C master bus on port 0 (GPIO21/22), initialises the three sensors and starts a sampling
 // task. Sensors that fail are reported in Status and skipped; never aborts. Call once.
+// Missing sensors are looked for again: once more at once after freeing the bus (a sensor may hold SDA low
+// when the ESP32 was reset in the middle of a transfer), then every 5 s by the sampling task.
 Status init();
+// Sensors running now (they may show up after init(), see above). Thread-safe.
+Status status();
+// Times the I2C bus was freed since boot.
+uint32_t busResets();
 
 // Mean of the accel/gyro samples since the previous call, plus the latest mag and baro values.
 // Thread-safe, non-blocking. When n is 0 the accel/gyro fields hold the latest single sample (zeros if

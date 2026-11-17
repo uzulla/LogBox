@@ -35,4 +35,9 @@ State state();
 // Name of the current / last log file ("log_0012_01.csv"), "" if none yet.
 const char* fileName();
 
+// Appends one CSV line (without the newline) to boot_log.csv on the card: the history of boots, resets and
+// sensor trouble, kept apart from the log files. Columns: see kEventHeader in sdlog.cpp. The card is only
+// written while recording, so lines wait in memory meanwhile (the oldest are dropped beyond 16).
+void event(const char* line);
+
 }  // namespace sdlog

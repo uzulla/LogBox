@@ -9,17 +9,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <atomic>
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
+#include "esp_app_desc.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_pm.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -66,7 +69,9 @@ static std::atomic<int> apClients{0};
 static std::atomic<uint32_t> udpErrors{0};
 static char deviceName[16];  // "logbo-XXXX" (BLE name, UDP "device")
 
-static imu::Status imuStatus;
+static uint32_t bootCount;            // boots since the NVS was erased (key sys/boots), for boot_log.csv
+static const char* resetReason = "";  // why this boot happened (esp_reset_reason)
+static std::atomic<int64_t> clockUnixUs{0}, clockAtUs{0};  // last valid GNSS UTC and when it came
 static std::atomic<uint32_t> records{0};
 static std::atomic<int64_t> lastPvtUs{0};
 static std::atomic<uint32_t> pvtCount{0};
@@ -515,6 +520,7 @@ static size_t statusJson(char* buf, size_t size) {
   const char* f = "false";
   char bat[48];
   batteryJson(bat, sizeof(bat));
+  const imu::Status imuStatus = imu::status();
   const int n = snprintf(
       buf, size,
       "{\"device\":\"%s\",\"uptime_s\":%lu,\"free_heap\":%lu,"
@@ -819,6 +825,8 @@ static void publishStatus(const record::Record* r) {
   static int64_t slowAt = 0;
   static portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
   const imu::MagCalInfo mc = imu::magCalInfo();
+  const int bleClients = bleClientsConnected();  // outside the critical section (it takes its own lock)
+  const imu::Status imuStatus = imu::status();
   taskENTER_CRITICAL(&lock);  // called from the GNSS task and the watchdog task
   ds.magCalibrated = mc.calibrated;
   ds.magField = mc.calibrated ? mc.cal.field : 0;
@@ -829,7 +837,7 @@ static void publishStatus(const record::Record* r) {
   ds.magCalComplete = mc.complete;
   ds.magCalResult = magCalResult;
   ds.magCalResultAtUs = magCalResultAtUs;
-  ds.bleClients = bleClientsConnected();
+  ds.bleClients = bleClients;
   ds.wifiConfigured = wifiCount > 0;
   ds.apOn = radioApOn;
   ds.staOn = radioStaOn;
@@ -934,14 +942,100 @@ static void emitRecord(const gnss::Pvt* pvt) {
 
 static void onPvt(const gnss::Pvt& p) {
   lastPvtUs = esp_timer_get_time();
+  if (const int64_t u = record::unixMicros(p)) {
+    clockUnixUs = u;
+    clockAtUs = lastPvtUs.load();
+  }
   pvtCount++;
   lastFix = p.fixOk() ? p.fixType : 0;
   lastSats = p.numSV;
   emitRecord(&p);
 }
 
+// ---------------------------------------------------------------------------
+// boot_log.csv on the SD card (see sdlog::event): boots with their reset reason, sensors lost / found,
+// the first GNSS time of the boot (to date the boot) and each log file started.
+
+static const char* resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON: return "poweron";
+    case ESP_RST_EXT: return "external";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "unknown";
+  }
+}
+
+// Columns: boot,utc,uptime_s,event,detail (utc empty until the GNSS gave the time in this boot).
+static void bootEvent(const char* event, const char* detail) {
+  char utc[24] = "";
+  const int64_t u = clockUnixUs, at = clockAtUs, now = esp_timer_get_time();
+  if (u) {
+    const time_t t = static_cast<time_t>((u + (now - at)) / 1000000);
+    tm g;
+    gmtime_r(&t, &g);
+    strftime(utc, sizeof(utc), "%Y-%m-%dT%H:%M:%SZ", &g);
+  }
+  char line[160];
+  snprintf(line, sizeof(line), "%lu,%s,%lu,%s,%s", static_cast<unsigned long>(bootCount), utc,
+           static_cast<unsigned long>(now / 1000000), event, detail);
+  sdlog::event(line);
+  ESP_LOGI(TAG, "boot_log: %s", line);
+}
+
+// Counts the boot in NVS and logs it with the reset reason. After nvs_flash_init().
+static void noteBoot() {
+  nvs_handle_t h;
+  if (nvs_open("sys", NVS_READWRITE, &h) == ESP_OK) {
+    nvs_get_u32(h, "boots", &bootCount);
+    bootCount++;
+    nvs_set_u32(h, "boots", bootCount);
+    nvs_commit(h);
+    nvs_close(h);
+  }
+  resetReason = resetReasonName(esp_reset_reason());
+  char detail[80];
+  snprintf(detail, sizeof(detail), "reset=%s;fw=%s", resetReason, esp_app_get_description()->version);
+  bootEvent("boot", detail);
+}
+
+// Once a second: notes what changed since the last call.
+static void watchEvents() {
+  static bool first = true;
+  static imu::Status last;
+  const imu::Status st = imu::status();
+  if (first || st.bmi270 != last.bmi270 || st.bmm150 != last.bmm150 || st.bmp280 != last.bmp280) {
+    char detail[96];
+    snprintf(detail, sizeof(detail), "bmi270=%s;bmm150=%s;bmp280=%s;i2c_resets=%lu", st.bmi270 ? "ok" : "missing",
+             st.bmm150 ? "ok" : "missing", st.bmp280 ? "ok" : "missing",
+             static_cast<unsigned long>(imu::busResets()));
+    bootEvent(first ? "sensors" : "sensors_changed", detail);
+    last = st;
+  }
+  first = false;
+  static bool clockNoted = false;
+  if (!clockNoted && clockUnixUs) {
+    clockNoted = true;
+    bootEvent("clock", "gnss");
+  }
+  static char lastFile[24] = "";
+  const char* file = sdlog::fileName();
+  if (*file && strcmp(file, lastFile) != 0) {
+    snprintf(lastFile, sizeof(lastFile), "%s", file);
+    bootEvent("rec", lastFile);
+  }
+}
+
 static void sendStatus() {
+  watchEvents();
   const gnss::Stats gs = gnss::stats();
+  const imu::Status imuStatus = imu::status();
   int rssi = 0;
   wifi_ap_record_t ap;
   if (broadcastAddr && esp_wifi_sta_get_ap_info(&ap) == ESP_OK) rssi = ap.rssi;
@@ -956,7 +1050,8 @@ static void sendStatus() {
       "{\"type\":\"status\",\"uptime_ms\":%lu,\"records\":%lu,"
       "\"gnss\":{\"configured\":%s,\"baud\":%lu,\"pvt\":%lu,\"checksum_errors\":%lu,\"other\":%lu,\"bytes\":%lu},"
       "\"imu\":%s,\"mag\":%s,\"mag_cal\":%s,\"baro\":%s,\"rec\":%d,\"log\":\"%s\",\"udp_errors\":%lu,"
-      "\"wifi_configured\":%s,\"wifi_rssi\":%d,\"ip\":\"" IPSTR "\",\"free_heap\":%lu,\"battery\":%s}",
+      "\"wifi_configured\":%s,\"wifi_rssi\":%d,\"ip\":\"" IPSTR "\",\"free_heap\":%lu,\"battery\":%s,"
+      "\"boot\":%lu,\"reset\":\"%s\",\"i2c_resets\":%lu}",
       static_cast<unsigned long>(esp_timer_get_time() / 1000), static_cast<unsigned long>(records.load()),
       gs.configured ? "true" : "false", static_cast<unsigned long>(gs.baud), static_cast<unsigned long>(gs.pvt),
       static_cast<unsigned long>(gs.checksumErrors), static_cast<unsigned long>(gs.otherMsgs),
@@ -965,7 +1060,7 @@ static void sendStatus() {
       imuStatus.bmp280 ? "true" : "false",
       static_cast<int>(sdlog::state()), sdlog::fileName(), static_cast<unsigned long>(udpErrors.load()),
       wifiCount > 0 ? "true" : "false", rssi, IP2STR(&ip.ip), static_cast<unsigned long>(esp_get_free_heap_size()),
-      bat);
+      bat, static_cast<unsigned long>(bootCount), resetReason, static_cast<unsigned long>(imu::busResets()));
   if (n > 0 && static_cast<size_t>(n) < sizeof(json)) sendUdp(json, n);
   ESP_LOGI(TAG, "%s", json);
 }
@@ -1150,7 +1245,8 @@ extern "C" void app_main() {
   initConsole();
   sdlog::init();  // before the display: the LCD shares its SPI bus
   logger::displayStart();
-  imuStatus = imu::init();
+  noteBoot();
+  const imu::Status imuStatus = imu::init();
   ESP_LOGI(TAG, "IMU: BMI270 %s, BMM150 %s, BMP280 %s", imuStatus.bmi270 ? "ok" : "MISSING",
            imuStatus.bmm150 ? "ok" : "MISSING", imuStatus.bmp280 ? "ok" : "MISSING");
   initWifi();

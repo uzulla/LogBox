@@ -28,6 +28,7 @@ constexpr uint8_t kBmmAuxAddr = 0x10;  // on the BMI270's auxiliary bus, not on 
 
 constexpr int kTaskPrio = 5;  // below the GNSS UART task
 constexpr int kTaskStack = 4096;
+constexpr TickType_t kRetryPeriod = pdMS_TO_TICKS(5000);  // looking for missing sensors again
 constexpr TickType_t kPeriod = pdMS_TO_TICKS(20);  // FIFO every 20 ms (4 samples), mag/baro every 40 ms
 
 // BMI270 registers
@@ -99,7 +100,9 @@ struct BmpCalib {
 
 i2c_master_bus_handle_t gBus;
 i2c_master_dev_handle_t gBmi, gBmp;
-Status gStatus;
+Status gStatus;       // written by init() and then by the sampling task only; read by others under gLock
+bool gQuiet;          // detecting again in the background: no "not found" warnings every few seconds
+uint32_t gBusResets;  // times the bus was freed (see recoverBus())
 BmmTrim gTrim;
 BmpCalib gCal;
 uint8_t gFifo[bmi::kFifoSize];
@@ -144,8 +147,10 @@ bool writeReg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t val) {
   return i2c_master_transmit(dev, b, sizeof(b), kTimeoutMs) == ESP_OK;
 }
 
+// Registers the device once; a later call (detecting it again) only probes it.
 bool addDevice(uint8_t addr, i2c_master_dev_handle_t* dev) {
   if (i2c_master_probe(gBus, addr, kTimeoutMs) != ESP_OK) return false;
+  if (*dev) return true;
   i2c_device_config_t cfg = {};
   cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
   cfg.device_address = addr;
@@ -171,7 +176,7 @@ bool uploadConfig() {
 
 bool initBmi270() {
   if (!addDevice(kBmiAddr, &gBmi)) {
-    ESP_LOGW(TAG, "BMI270 not found");
+    if (!gQuiet) ESP_LOGW(TAG, "BMI270 not found");
     return false;
   }
   uint8_t id = 0;
@@ -322,7 +327,7 @@ bool compensateMag(const uint8_t* d, float* out) {
 
 bool initBmp280() {
   if (!addDevice(kBmpAddr, &gBmp)) {
-    ESP_LOGW(TAG, "BMP280 not found");
+    if (!gQuiet) ESP_LOGW(TAG, "BMP280 not found");
     return false;
   }
   uint8_t id = 0;
@@ -458,10 +463,57 @@ void readBaro() {
   taskEXIT_CRITICAL(&gLock);
 }
 
+// A sensor that was in the middle of a transfer when the ESP32 was reset (crash, watchdog, brownout; the
+// sensors stay powered) may hold SDA low: every device on the bus then looks missing until the power is cut.
+// Clocking SCL frees it (i2c_master_bus_reset: up to 9 pulses and a STOP).
+void recoverBus() {
+  const esp_err_t err = i2c_master_bus_reset(gBus);
+  taskENTER_CRITICAL(&gLock);
+  gBusResets++;
+  taskEXIT_CRITICAL(&gLock);
+  ESP_LOGW(TAG, "I2C bus reset: %s", esp_err_to_name(err));
+}
+
+void loadCalib();  // below, with the NVS helpers
+
+void setStatus(const Status& st) {
+  taskENTER_CRITICAL(&gLock);
+  gStatus = st;
+  taskEXIT_CRITICAL(&gLock);
+}
+
+// Initialises the sensors that are not running. The BMM150 sits behind the BMI270, so it is only tried
+// together with it (a BMI270 that runs without a BMM150 is left alone).
+void detect() {
+  Status st = gStatus;
+  if (!st.bmi270) {
+    st.bmi270 = initBmi270();
+    st.bmm150 = st.bmi270 && initBmm150();
+    if (st.bmi270 && !startBmi270(st.bmm150)) st.bmi270 = st.bmm150 = false;
+    if (st.bmm150 && !gStatus.bmm150) loadCalib();
+  }
+  if (!st.bmp280) st.bmp280 = initBmp280();
+  setStatus(st);
+}
+
+bool allFound() { return gStatus.bmi270 && gStatus.bmm150 && gStatus.bmp280; }
+
 void sampleTask(void*) {
   TickType_t wake = xTaskGetTickCount();
+  TickType_t retryAt = wake + kRetryPeriod;
   for (uint32_t loop = 0;; loop++) {
     xTaskDelayUntil(&wake, kPeriod);
+    if ((!gStatus.bmi270 || !gStatus.bmp280) && static_cast<int32_t>(wake - retryAt) >= 0) {
+      retryAt = wake + kRetryPeriod;
+      const Status before = gStatus;
+      recoverBus();
+      detect();
+      if (gStatus.bmi270 != before.bmi270 || gStatus.bmm150 != before.bmm150 || gStatus.bmp280 != before.bmp280) {
+        ESP_LOGW(TAG, "sensors found again: BMI270 %s, BMM150 %s, BMP280 %s", gStatus.bmi270 ? "ok" : "--",
+                 gStatus.bmm150 ? "ok" : "--", gStatus.bmp280 ? "ok" : "--");
+      }
+      wake = xTaskGetTickCount();
+    }
     if (gStatus.bmi270) readFifo();
     if (loop & 1) {
       if (gStatus.bmm150) readMag();
@@ -603,18 +655,18 @@ Status init() {
     ESP_LOGE(TAG, "I2C bus: %s", esp_err_to_name(err));
     return gStatus;
   }
-  gStatus.bmi270 = initBmi270();
-  if (gStatus.bmi270) {
-    gStatus.bmm150 = initBmm150();
-    if (!startBmi270(gStatus.bmm150)) gStatus.bmi270 = gStatus.bmm150 = false;
-  }
-  gStatus.bmp280 = initBmp280();
   gCalMutex = xSemaphoreCreateMutex();
   gBatMutex = xSemaphoreCreateMutex();
-  if (gStatus.bmm150) loadCalib();
+  detect();
+  if (!allFound()) {  // maybe a sensor holds the bus since a reset: free it and try once more
+    recoverBus();
+    detect();
+  }
   ESP_LOGI(TAG, "BMI270 %s, BMM150 %s, BMP280 %s", gStatus.bmi270 ? "ok" : "--", gStatus.bmm150 ? "ok" : "--",
            gStatus.bmp280 ? "ok" : "--");
-  if (gStatus.bmi270 || gStatus.bmp280) xTaskCreate(sampleTask, "imu", kTaskStack, nullptr, kTaskPrio, nullptr);
+  gQuiet = true;
+  // Always started: it also looks for missing sensors again every few seconds.
+  xTaskCreate(sampleTask, "imu", kTaskStack, nullptr, kTaskPrio, nullptr);
   return gStatus;
 }
 
@@ -727,6 +779,20 @@ MagCalInfo magCalInfo() {
   info.complete = gFit.complete();
   xSemaphoreGive(gCalMutex);
   return info;
+}
+
+Status status() {
+  taskENTER_CRITICAL(&gLock);
+  const Status st = gStatus;
+  taskEXIT_CRITICAL(&gLock);
+  return st;
+}
+
+uint32_t busResets() {
+  taskENTER_CRITICAL(&gLock);
+  const uint32_t n = gBusResets;
+  taskEXIT_CRITICAL(&gLock);
+  return n;
 }
 
 Battery battery() {
