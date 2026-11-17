@@ -123,6 +123,7 @@ bool gMagCalApplied;  // gMag is calibrated
 MagCal gCalib;
 bool gHaveCalib;
 SemaphoreHandle_t gCalMutex;
+SemaphoreHandle_t gBatMutex;  // battery reads (see battery()) and the bus reset
 bool gCollecting;
 uint32_t gCalSession;  // counts the starts, so the display can tell a restarted collection from the old one
 MagCalFit gFit;
@@ -466,8 +467,12 @@ void readBaro() {
 // A sensor that was in the middle of a transfer when the ESP32 was reset (crash, watchdog, brownout; the
 // sensors stay powered) may hold SDA low: every device on the bus then looks missing until the power is cut.
 // Clocking SCL frees it (i2c_master_bus_reset: up to 9 pulses and a STOP).
+// The reset does not wait for a transfer in progress: the battery reads (another task) are held off with
+// gBatMutex; the sensors are only used by the sampling task, which is the caller.
 void recoverBus() {
+  if (gBatMutex) xSemaphoreTake(gBatMutex, portMAX_DELAY);
   const esp_err_t err = i2c_master_bus_reset(gBus);
+  if (gBatMutex) xSemaphoreGive(gBatMutex);
   taskENTER_CRITICAL(&gLock);
   gBusResets++;
   taskEXIT_CRITICAL(&gLock);
@@ -482,11 +487,20 @@ void setStatus(const Status& st) {
   taskEXIT_CRITICAL(&gLock);
 }
 
-// Initialises the sensors that are not running. The BMM150 sits behind the BMI270, so it is only tried
-// together with it (a BMI270 that runs without a BMM150 is left alone).
+// The BMM150 sits behind the BMI270 (auxiliary interface), so trying it again means setting up the BMI270
+// again too (soft reset, config upload: accel / gyro pause for a moment). With a running BMI270 that is only
+// done a few times, so a unit without a working BMM150 does not pause the IMU every few seconds forever.
+constexpr int kMagOnlyRetries = 5;
+int gMagOnlyRetries;
+
+bool magRetryAllowed() { return gStatus.bmi270 && !gStatus.bmm150 && gMagOnlyRetries < kMagOnlyRetries; }
+
+// Initialises the sensors that are not running.
 void detect() {
   Status st = gStatus;
-  if (!st.bmi270) {
+  const bool magOnly = magRetryAllowed();
+  if (magOnly) gMagOnlyRetries++;
+  if (!st.bmi270 || magOnly) {
     st.bmi270 = initBmi270();
     st.bmm150 = st.bmi270 && initBmm150();
     if (st.bmi270 && !startBmi270(st.bmm150)) st.bmi270 = st.bmm150 = false;
@@ -497,13 +511,14 @@ void detect() {
 }
 
 bool allFound() { return gStatus.bmi270 && gStatus.bmm150 && gStatus.bmp280; }
+bool needRetry() { return !gStatus.bmi270 || !gStatus.bmp280 || magRetryAllowed(); }
 
 void sampleTask(void*) {
   TickType_t wake = xTaskGetTickCount();
   TickType_t retryAt = wake + kRetryPeriod;
   for (uint32_t loop = 0;; loop++) {
     xTaskDelayUntil(&wake, kPeriod);
-    if ((!gStatus.bmi270 || !gStatus.bmp280) && static_cast<int32_t>(wake - retryAt) >= 0) {
+    if (needRetry() && static_cast<int32_t>(wake - retryAt) >= 0) {
       retryAt = wake + kRetryPeriod;
       const Status before = gStatus;
       recoverBus();
@@ -547,19 +562,27 @@ void fillLast(Sample& out) {
 constexpr char kNvsNs[] = "imu", kNvsKey[] = "magcal";
 constexpr uint8_t kCalVersion = 1;
 
+// May run while the unit is in use (a BMM150 found late): serialised with start / finish / clear by
+// gCalMutex, so a clear cannot be undone by an old blob read just before it.
 void loadCalib() {
+  xSemaphoreTake(gCalMutex, portMAX_DELAY);
   nvs_handle_t h;
-  if (nvs_open(kNvsNs, NVS_READONLY, &h) != ESP_OK) return;
-  uint8_t blob[1 + sizeof(MagCal)];
-  size_t len = sizeof(blob);
-  if (nvs_get_blob(h, kNvsKey, blob, &len) == ESP_OK && len == sizeof(blob) && blob[0] == kCalVersion) {
-    memcpy(&gCalib, blob + 1, sizeof(MagCal));
-    gHaveCalib = true;
-    ESP_LOGI(TAG, "mag calibration: offset %.1f %.1f %.1f uT, scale %.3f %.3f %.3f, field %.1f uT",
-             gCalib.offset[0], gCalib.offset[1], gCalib.offset[2], gCalib.scale[0], gCalib.scale[1],
-             gCalib.scale[2], gCalib.field);
+  if (nvs_open(kNvsNs, NVS_READONLY, &h) == ESP_OK) {
+    uint8_t blob[1 + sizeof(MagCal)];
+    size_t len = sizeof(blob);
+    if (nvs_get_blob(h, kNvsKey, blob, &len) == ESP_OK && len == sizeof(blob) && blob[0] == kCalVersion) {
+      MagCal cal;
+      memcpy(&cal, blob + 1, sizeof(MagCal));
+      taskENTER_CRITICAL(&gLock);
+      gCalib = cal;
+      gHaveCalib = true;
+      taskEXIT_CRITICAL(&gLock);
+      ESP_LOGI(TAG, "mag calibration: offset %.1f %.1f %.1f uT, scale %.3f %.3f %.3f, field %.1f uT", cal.offset[0],
+               cal.offset[1], cal.offset[2], cal.scale[0], cal.scale[1], cal.scale[2], cal.field);
+    }
+    nvs_close(h);
   }
-  nvs_close(h);
+  xSemaphoreGive(gCalMutex);
 }
 
 // Writes (cal != nullptr) or erases the stored calibration. False when NVS failed (logged).
@@ -594,7 +617,6 @@ constexpr uint8_t kRegLevel = 0x78;  // bits 7..4: level, inverted thermometer c
 constexpr TickType_t kPeriod = pdMS_TO_TICKS(5000);
 }  // namespace ip5306
 
-SemaphoreHandle_t gBatMutex;
 i2c_master_dev_handle_t gBatDev;
 bool gBatProbed;
 Battery gBattery;

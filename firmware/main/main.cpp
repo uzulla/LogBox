@@ -71,7 +71,9 @@ static char deviceName[16];  // "logbo-XXXX" (BLE name, UDP "device")
 
 static uint32_t bootCount;            // boots since the NVS was erased (key sys/boots), for boot_log.csv
 static const char* resetReason = "";  // why this boot happened (esp_reset_reason)
-static std::atomic<int64_t> clockUnixUs{0}, clockAtUs{0};  // last valid GNSS UTC and when it came
+// GNSS UTC minus esp_timer_get_time() at the last valid PVT (one value, so UTC and its time stay a pair);
+// 0 = no time yet in this boot.
+static std::atomic<int64_t> clockOffsetUs{0};
 static std::atomic<uint32_t> records{0};
 static std::atomic<int64_t> lastPvtUs{0};
 static std::atomic<uint32_t> pvtCount{0};
@@ -942,10 +944,7 @@ static void emitRecord(const gnss::Pvt* pvt) {
 
 static void onPvt(const gnss::Pvt& p) {
   lastPvtUs = esp_timer_get_time();
-  if (const int64_t u = record::unixMicros(p)) {
-    clockUnixUs = u;
-    clockAtUs = lastPvtUs.load();
-  }
+  if (const int64_t unixUs = record::unixMicros(p)) clockOffsetUs = unixUs - lastPvtUs.load();
   pvtCount++;
   lastFix = p.fixOk() ? p.fixType : 0;
   lastSats = p.numSV;
@@ -975,9 +974,10 @@ static const char* resetReasonName(esp_reset_reason_t r) {
 // Columns: boot,utc,uptime_s,event,detail (utc empty until the GNSS gave the time in this boot).
 static void bootEvent(const char* event, const char* detail) {
   char utc[24] = "";
-  const int64_t u = clockUnixUs, at = clockAtUs, now = esp_timer_get_time();
-  if (u) {
-    const time_t t = static_cast<time_t>((u + (now - at)) / 1000000);
+  const int64_t offset = clockOffsetUs;
+  const int64_t now = esp_timer_get_time();
+  if (offset) {
+    const time_t t = static_cast<time_t>((offset + now) / 1000000);
     tm g;
     gmtime_r(&t, &g);
     strftime(utc, sizeof(utc), "%Y-%m-%dT%H:%M:%SZ", &g);
@@ -1020,7 +1020,7 @@ static void watchEvents() {
   }
   first = false;
   static bool clockNoted = false;
-  if (!clockNoted && clockUnixUs) {
+  if (!clockNoted && clockOffsetUs) {
     clockNoted = true;
     bootEvent("clock", "gnss");
   }

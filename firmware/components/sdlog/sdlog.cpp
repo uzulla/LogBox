@@ -51,15 +51,16 @@ constexpr const char* kEventFile = "boot_log.csv";
 constexpr const char* kEventHeader = "boot,utc,uptime_s,event,detail\n";
 constexpr int kEventMax = 16, kEventLen = 160;
 char gEvents[kEventMax][kEventLen];
-int gEventHead, gEventCount;
+uint32_t gEventFirst, gEventCount;  // sequence number of the oldest waiting line (slot: seq % kEventMax), count
 portMUX_TYPE gEventLock = portMUX_INITIALIZER_UNLOCKED;
 
 // Appends the waiting lines to boot_log.csv. Returns false on a write error (the lines stay for later).
 bool writeEvents() {
   static char lines[kEventMax][kEventLen];  // the log task only
   taskENTER_CRITICAL(&gEventLock);
-  const int n = gEventCount;
-  for (int i = 0; i < n; i++) memcpy(lines[i], gEvents[(gEventHead + i) % kEventMax], kEventLen);
+  const uint32_t first = gEventFirst;
+  const int n = static_cast<int>(gEventCount);
+  for (int i = 0; i < n; i++) memcpy(lines[i], gEvents[(first + i) % kEventMax], kEventLen);
   taskEXIT_CRITICAL(&gEventLock);
   if (!n) return true;
   char path[40];
@@ -73,10 +74,15 @@ bool writeEvents() {
   ok = fflush(f) == 0 && fsync(fileno(f)) == 0 && ok;
   fclose(f);
   if (!ok) return false;
+  // Remove exactly the lines written (sequence numbers first .. first + n - 1); event() may have dropped some
+  // of them (queue full) and added new ones meanwhile.
   taskENTER_CRITICAL(&gEventLock);
-  const int done = n <= gEventCount ? n : gEventCount;  // event() may have dropped some meanwhile
-  gEventHead = (gEventHead + done) % kEventMax;
-  gEventCount -= done;
+  const uint32_t end = first + n;
+  if (static_cast<int32_t>(end - gEventFirst) > 0) {
+    const uint32_t done = end - gEventFirst;
+    gEventFirst = end;
+    gEventCount -= done;
+  }
   taskEXIT_CRITICAL(&gEventLock);
   return true;
 }
@@ -273,10 +279,10 @@ State state() { return gState; }
 void event(const char* line) {
   taskENTER_CRITICAL(&gEventLock);
   if (gEventCount == kEventMax) {  // full: drop the oldest
-    gEventHead = (gEventHead + 1) % kEventMax;
+    gEventFirst++;
     gEventCount--;
   }
-  char* slot = gEvents[(gEventHead + gEventCount) % kEventMax];
+  char* slot = gEvents[(gEventFirst + gEventCount) % kEventMax];
   strlcpy(slot, line, kEventLen);
   gEventCount++;
   taskEXIT_CRITICAL(&gEventLock);
