@@ -555,11 +555,12 @@ static size_t magCalJsonOnly(char* buf, size_t size) {
   return n > 0 && static_cast<size_t>(n) < size ? n : 0;
 }
 
-// ctrl read: {"magcal":{...magCalJsonOnly},"radio":{...radioJson}}
+// ctrl read: {"magcal":{...magCalJsonOnly},"radio":{...radioJson},"backlight":{"level":5,"levels":5}}
 static size_t ctrlJson(char* buf, size_t size) {
   char mag[256], radio[96];
   if (!magCalJsonOnly(mag, sizeof(mag)) || !radioJson(radio, sizeof(radio))) return 0;
-  const int n = snprintf(buf, size, "{\"magcal\":%s,\"radio\":%s}", mag, radio);
+  const int n = snprintf(buf, size, "{\"magcal\":%s,\"radio\":%s,\"backlight\":{\"level\":%d,\"levels\":%d}}", mag,
+                         radio, logger::displayBacklight(), logger::kBacklightLevels);
   return n > 0 && static_cast<size_t>(n) < size ? n : 0;
 }
 
@@ -578,6 +579,7 @@ static void rebootSoon() {
 //   mag=start / done / cancel / clear  magnetometer calibration (as the STATUS page and the serial console)
 //   wifi=clear                         forget all Wi-Fi networks
 //   ap=0 / ap=1, sta=0 / sta=1         turn the soft AP / the STA off or on from the next boot
+//   bl=1 .. bl=5                       backlight brightness (saved; also A / C held on the unit)
 //   reboot=1
 // Unknown commands, and a calibration finish that fails, are refused with ATT error 0x13 (value not allowed);
 // the calibration's result is in the ctrl read (ctrlJson) either way.
@@ -602,6 +604,10 @@ static int onCtrlWrite(const char* cmd) {
     const char* v = strchr(cmd, '=') + 1;
     if (strcmp(v, "0") && strcmp(v, "1")) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
     if (!radioSave(cmd[0] == 'a' ? "ap" : "sta", v[0] == '1')) return BLE_ATT_ERR_UNLIKELY;
+  } else if (!strncmp(cmd, "bl=", 3)) {
+    const char* v = cmd + 3;
+    if (v[0] < '1' || v[0] > '0' + logger::kBacklightLevels || v[1]) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+    if (!logger::displaySetBacklight(v[0] - '0')) return BLE_ATT_ERR_UNLIKELY;  // applied, not saved
   } else if (strcmp(cmd, "reboot=1") == 0) {
     rebootSoon();
   } else {
@@ -626,7 +632,7 @@ static int replyRead(ble_gatt_access_ctxt* ctxt, const char* what, const char* j
 
 static int onCtrlAccess(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-    char json[384];
+    char json[480];  // magcal (<256) + radio (<96) + backlight
     const size_t n = ctrlJson(json, sizeof(json));
     return replyRead(ctxt, "ctrl", json, n);
   }
@@ -1099,6 +1105,7 @@ static void watchdogTask(void*) {
 //                                        direction), mag-cal-done to finish it
 //   mag-clear                            forget the magnetometer calibration
 //   mag                                  show the calibration and the latest reading
+//   backlight [1-5]                      show / set the backlight brightness (saved)
 
 static void handleCommand(char* line) {
   if (strncmp(line, "wifi-set\t", 9) == 0) {
@@ -1156,6 +1163,15 @@ static void handleCommand(char* line) {
     } else {
       printf(radioSave(cmd[0] == 'a' ? "ap" : "sta", v[0] == '1') ? "OK saved; takes effect after reboot\n"
                                                                   : "ERR NVS write failed\n");
+    }
+  } else if (!strncmp(line, "backlight", 9) && (!line[9] || line[9] == ' ')) {
+    const char* v = line[9] ? line + 10 : "";
+    if (!*v) {
+      printf("backlight %d (1-%d)\n", logger::displayBacklight(), logger::kBacklightLevels);
+    } else if (v[0] < '1' || v[0] > '0' + logger::kBacklightLevels || v[1]) {
+      printf("ERR usage: backlight 1-%d\n", logger::kBacklightLevels);
+    } else {
+      printf(logger::displaySetBacklight(v[0] - '0') ? "OK\n" : "ERR applied but not saved\n");
     }
   } else if (strcmp(line, "reboot") == 0) {
     printf("OK rebooting\n");

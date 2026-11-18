@@ -124,6 +124,17 @@
 </section>
 
 <section>
+  <h2>画面の明るさ</h2>
+  <p class="hint">暗くすると電池が長持ちします。本体でも A（左）/ C（右）ボタンの長押しで暗く / 明るくできます。設定は保存されます。</p>
+  <div class="row">
+    <span>暗い</span>
+    <input type="range" id="bl_level" min="1" max="5" step="1" value="5" disabled style="width:200px">
+    <span>明るい</span>
+    <span id="bl_msg" class="muted"></span>
+  </div>
+</section>
+
+<section>
   <h2>本体</h2>
   <div class="row">
     <button id="reboot" disabled>再起動</button>
@@ -156,7 +167,7 @@ function gatt(fn) { const p = busy.then(fn, fn); busy = p.catch(() => {}); retur
 const readJson = c => gatt(async () => JSON.parse(dec.decode(await c.readValue())));
 const write = (c, text) => gatt(() => c.writeValueWithResponse(enc.encode(text)));
 
-const CONTROLS = ['disconnect', 'refresh', 'rec_start', 'rec_stop', 'setwifi', 'clearwifi', 'radio_save', 'mag_start', 'mag_done', 'mag_cancel', 'mag_clear', 'reboot'];
+const CONTROLS = ['disconnect', 'refresh', 'rec_start', 'rec_stop', 'setwifi', 'clearwifi', 'radio_save', 'mag_start', 'mag_done', 'mag_cancel', 'mag_clear', 'bl_level', 'reboot'];
 function setConnected(on) {
   for (const id of CONTROLS) $(id).disabled = !on;
   $('connect').disabled = on || !navigator.bluetooth;
@@ -180,12 +191,13 @@ $('connect').onclick = async () => {
     ch.wifi = await svc.getCharacteristic(WIFI);
     try { ch.ctrl = await svc.getCharacteristic(CTRL); } catch (e) { ch.ctrl = null; log('このファームウェアには操作用の characteristic がありません(状態と Wi-Fi だけ使えます)'); }
     setConnected(true);
-    for (const id of ['rec_start', 'rec_stop', 'clearwifi', 'radio_save', 'mag_start', 'mag_done', 'mag_cancel', 'mag_clear', 'reboot']) $(id).disabled = !ch.ctrl;
+    for (const id of ['rec_start', 'rec_stop', 'clearwifi', 'radio_save', 'mag_start', 'mag_done', 'mag_cancel', 'mag_clear', 'bl_level', 'reboot']) $(id).disabled = !ch.ctrl;
     log('接続しました');
     if (!await waitForPairing()) return;
     await tick();
     await refreshWifi().catch(e => log(`接続先の一覧を読めません(古いファームウェア?): ${e.message}`));
     if (ch.ctrl) await refreshRadio().catch(e => log(`無線設定を読めません: ${e.message}`));
+    if (ch.ctrl) await refreshBacklight().catch(e => log(`画面の明るさを読めません: ${e.message}`));
   } catch (e) {
     log(`接続失敗: ${e.message}`);
   }
@@ -238,11 +250,12 @@ async function tick() {
   }
   if ($('auto').checked && device?.gatt?.connected) timer = setTimeout(tick, lastMag?.collecting ? 500 : 2000);
 }
-// 「更新」は状態に加えて、接続先の一覧と無線の設定も読み直す
+// 「更新」は状態に加えて、接続先の一覧と無線・画面の明るさの設定も読み直す(明るさは本体のボタンでも変わる)
 $('refresh').onclick = async () => {
   await tick();
   try { await refreshWifi(); wifiListStale = false; } catch (e) { log(`接続先の一覧を読めません: ${e.message}`); }
   if (ch.ctrl) await refreshRadio().catch(e => log(`無線設定を読めません: ${e.message}`));
+  if (ch.ctrl) await refreshBacklight().catch(e => log(`画面の明るさを読めません: ${e.message}`));
 };
 let wifiListStale = false; // 保存後に一覧を読み直せなかった(「更新」で読み直すまで警告を残す)
 $('auto').onchange = () => { if ($('auto').checked) tick(); };
@@ -414,6 +427,20 @@ $('radio_save').onclick = async () => {
       ? `失敗: ${e.message}(一部だけ保存された可能性があります。上のチェックは本体に保存されている値です)`
       : `失敗: ${e.message}(本体に保存された値を確認できませんでした。上のチェックは本体の値と違う可能性があります。「更新」で読み直してください)`;
   }
+};
+
+// ---- 画面の明るさ ----
+async function refreshBacklight() {
+  const b = (await readJson(ch.ctrl)).backlight;
+  if (!b) { $('bl_msg').textContent = 'このファームウェアは明るさの設定に対応していません'; $('bl_level').disabled = true; return; }
+  $('bl_level').max = b.levels;
+  $('bl_level').value = b.level;
+  $('bl_msg').textContent = `${b.level} / ${b.levels}`;
+}
+$('bl_level').onchange = async () => {
+  const v = $('bl_level').value;
+  if (await ctrl(`bl=${v}`, `画面の明るさを ${v} にしました`)) $('bl_msg').textContent = `${v} / ${$('bl_level').max}`;
+  else refreshBacklight().catch(() => {});
 };
 
 // ---- 地磁気キャリブレーション ----

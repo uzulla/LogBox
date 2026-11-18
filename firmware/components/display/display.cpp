@@ -5,7 +5,8 @@
 // drawn in horizontal bands instead: the whole scene is drawn once per band, clipped to it, into one of
 // two band buffers, and sent by DMA while the next band is drawn.
 //
-// Buttons: A (left) / C (right) switch pages, B (middle) held for 1.5 s stops / starts the SD recording;
+// Buttons: A (left) / C (right) switch pages (held 0.8 s: backlight darker / brighter, repeating while held),
+// B (middle) held for 1.5 s stops / starts the SD recording;
 // a short press of B on the G page resets the peak values, on the STATUS page it starts the magnetometer
 // calibration (a page of its own until it ends: B finishes, A / C cancel).
 //
@@ -19,8 +20,10 @@
 #include <time.h>
 
 #include <algorithm>
+#include <atomic>
 
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_io.h"
@@ -32,6 +35,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs.h"
 #include "gnss.h"
 
 namespace logger {
@@ -622,6 +626,62 @@ void drawMagCal(const Status& s) {
 }
 
 // ---------------------------------------------------------------------------
+// Backlight: PWM on the BL pin (LEDC from the 1 MHz REF_TICK, so DFS does not change it), level in NVS
+
+constexpr uint8_t kBlDuty[kBacklightLevels] = {8, 20, 50, 110, 255};  // of 255, roughly even steps to the eye
+constexpr int64_t kBlShowUs = 1500000;  // the level stays on the screen this long after a change
+std::atomic<int> blLevel{kBacklightLevels};
+std::atomic<int64_t> blShownAt{0};
+bool blOn = false;  // off until the first frame is drawn
+
+void blApply() {
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, blOn ? kBlDuty[blLevel - 1] : 0);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+bool blSave(int level) {
+  nvs_handle_t h;
+  if (nvs_open("disp", NVS_READWRITE, &h) != ESP_OK) return false;
+  const bool ok = nvs_set_u8(h, "bl", static_cast<uint8_t>(level)) == ESP_OK && nvs_commit(h) == ESP_OK;
+  nvs_close(h);
+  return ok;
+}
+
+void blInit() {
+  nvs_handle_t h;
+  uint8_t v;
+  if (nvs_open("disp", NVS_READONLY, &h) == ESP_OK) {
+    if (nvs_get_u8(h, "bl", &v) == ESP_OK && v >= 1 && v <= kBacklightLevels) blLevel = v;
+    nvs_close(h);
+  }
+  ledc_timer_config_t t = {};
+  t.speed_mode = LEDC_LOW_SPEED_MODE;
+  t.duty_resolution = LEDC_TIMER_8_BIT;
+  t.timer_num = LEDC_TIMER_0;
+  t.freq_hz = 2000;
+  t.clk_cfg = LEDC_USE_REF_TICK;
+  ESP_ERROR_CHECK(ledc_timer_config(&t));
+  ledc_channel_config_t c = {};
+  c.gpio_num = kBl;
+  c.speed_mode = LEDC_LOW_SPEED_MODE;
+  c.channel = LEDC_CHANNEL_0;
+  c.timer_sel = LEDC_TIMER_0;
+  c.duty = 0;
+  ESP_ERROR_CHECK(ledc_channel_config(&c));
+}
+
+// The level while it is being changed: a box in the middle of the screen.
+void drawBacklightLevel(int64_t now) {
+  if (now - blShownAt >= kBlShowUs) return;
+  constexpr int bw = 200, bh = 60, bx = (W - bw) / 2, by = (H - bh) / 2;
+  fillRect(bx, by, bw, bh, kCyan);
+  fillRect(bx + 2, by + 2, bw - 4, bh - 4, kBar);
+  textCenter(W / 2, by + 8, "BRIGHTNESS", 2, kWhite);
+  const int lv = blLevel;
+  for (int i = 0; i < kBacklightLevels; i++) fillRect(bx + 20 + i * 33, by + 32, 28, 18, i < lv ? kCyan : kTrack);
+}
+
+// ---------------------------------------------------------------------------
 // LCD, buttons, task
 
 bool onTxDone(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t*, void*) {
@@ -631,11 +691,7 @@ bool onTxDone(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t*, void*) 
 }
 
 void initLcd() {
-  gpio_config_t bl = {};
-  bl.pin_bit_mask = 1ULL << kBl;
-  bl.mode = GPIO_MODE_OUTPUT;
-  gpio_config(&bl);
-  gpio_set_level(kBl, 0);
+  blInit();
   gpio_config_t btn = {};  // GPIO37-39 are input only, the board has pull-ups
   btn.pin_bit_mask = (1ULL << kBtnA) | (1ULL << kBtnB) | (1ULL << kBtnC);
   btn.mode = GPIO_MODE_INPUT;
@@ -692,13 +748,33 @@ void magCalEnd(bool finish, int64_t now) {
   magLocalAt = now;
 }
 
-// A / C: previous / next page on release. B held 1.5 s: SD stop / start; B short on the G page: reset peaks.
+// A / C: previous / next page on release; held 0.8 s: backlight darker / brighter (again every 0.5 s while
+// held, saved on release). B held 1.5 s: SD stop / start; B short on the G page: reset peaks.
 void pollButtons(int64_t now) {
-  static bool prevA, prevC;
+  static bool prevA, prevC, held;
+  static int64_t acDownAt, stepAt;
   const bool a = gpio_get_level(kBtnA) == 0, c = gpio_get_level(kBtnC) == 0;
+  if ((a && !prevA) || (c && !prevC)) {
+    acDownAt = now;
+    held = false;
+  }
+  if ((a || c) && !(a && c) && !magCollecting && now - acDownAt >= 800000 && (!held || now - stepAt >= 500000)) {
+    const int lv = std::clamp(blLevel + (c ? 1 : -1), 1, kBacklightLevels);
+    if (lv != blLevel) {
+      blLevel = lv;
+      blApply();
+    }
+    blShownAt = now;
+    held = true;
+    stepAt = now;
+  }
   if ((prevA && !a) || (prevC && !c)) {
     if (magCollecting) {
       magCalEnd(false, now);
+    } else if (held) {
+      if (!a && !c) {
+        if (!blSave(blLevel)) ESP_LOGW(TAG, "backlight level not saved");
+      }
     } else if (prevA && !a) {
       page = (page + kPages - 1) % kPages;
     } else {
@@ -786,7 +862,12 @@ void displayTask(void*) {
     // At once on a page change or when the calibration starts / ends, otherwise at the page's rate.
     static int drawnPage = -1, sinceDraw = 0;
     const int drawPage = s.magCollecting ? -2 : page;  // the calibration page: every frame
-    const bool redraw = drawPage != drawnPage || ++sinceDraw >= (s.magCollecting ? 1 : kRedrawFrames[page]);
+    // While the backlight level shows (and once after, to remove it): every frame.
+    static bool blShowing = false;
+    const bool blShow = now - blShownAt < kBlShowUs, blChanged = blShow || blShowing;
+    blShowing = blShow;
+    const bool redraw = drawPage != drawnPage || blChanged ||
+                        ++sinceDraw >= (s.magCollecting ? 1 : kRedrawFrames[page]);
     if (redraw) {
       drawnPage = drawPage;
       sinceDraw = 0;
@@ -810,11 +891,12 @@ void displayTask(void*) {
         drawStatusPage(s, now, rate);
       }
       drawButtonBar(s);
+      drawBacklightLevel(now);
       esp_lcd_panel_draw_bitmap(panel, 0, bandY, W, bandY + kBandH, cv);
     }
-    if (!backlight) {
-      gpio_set_level(kBl, 1);
-      backlight = true;
+    if (!backlight) {  // after the first frame
+      blOn = backlight = true;
+      blApply();
     }
     vTaskDelayUntil(&wake, pdMS_TO_TICKS(kFrameMs));
   }
@@ -826,6 +908,16 @@ void displayStart() {
   initLcd();
   xTaskCreate(displayTask, "display", 6144, nullptr, 3, nullptr);
   ESP_LOGI(TAG, "LCD ready");
+}
+
+int displayBacklight() { return blLevel; }
+
+bool displaySetBacklight(int level) {
+  if (level < 1 || level > kBacklightLevels) return false;
+  blLevel = level;
+  blApply();
+  blShownAt = esp_timer_get_time();
+  return blSave(level);
 }
 
 void displayUpdate(const Status& s) {
