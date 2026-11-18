@@ -862,6 +862,7 @@ static void publishStatus(const record::Record* r) {
     ds.unixUs = r->hasPvt ? record::unixMicros(p) : 0;
     ds.fix = p.fixType;
     ds.fixOk = p.fixOk();
+    ds.posOk = p.posOk();
     ds.sats = p.numSV;
     ds.lat = p.lat;
     ds.lon = p.lon;

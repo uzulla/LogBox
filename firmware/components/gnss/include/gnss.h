@@ -35,6 +35,8 @@ struct Pvt {  // UBX-NAV-PVT, raw protocol units
 
   bool dateTimeValid() const { return (valid & 0x07) == 0x07; }
   bool fixOk() const { return (fixType == 3 || fixType == 4) && (flags & 0x01); }
+  // Valid horizontal position: also a 2D fix (whose altitude is only the last one held).
+  bool posOk() const { return fixType >= 2 && fixType <= 4 && (flags & 0x01); }
   // headVehValid is only ever set by sensor-fusion (ADR/UDR) receivers; a plain
   // NEO-M9N never sets it, so headMot is also accepted when there is a good fix
   // and the ground speed exceeds kHeadingMinSpeedMmps.
@@ -50,6 +52,30 @@ struct Stats {
   uint16_t rateHz;   // measurement rate in effect (after any fallback), 0 if not configured
 };
 
+// Satellites in view (UBX-NAV-SAT) and the dilutions of precision (UBX-NAV-DOP), both requested about
+// once a second, for the display.
+struct Sat {
+  uint8_t gnssId;   // 0 GPS, 1 SBAS, 2 Galileo, 3 BeiDou, 5 QZSS, 6 GLONASS
+  uint8_t svId;
+  uint8_t cno;      // dBHz, 0 = no signal
+  int8_t elev;      // deg, -90..90 (out of range: unknown)
+  int16_t azim;     // deg, 0..360 (unknown when the elevation is)
+  bool used;        // used in the navigation solution
+};
+constexpr int kMaxSats = 64;
+
+struct Sky {
+  uint32_t iTOW;
+  int numSvs;            // entries in sats (the receiver may report more than kMaxSats; the rest are dropped)
+  Sat sats[kMaxSats];
+  // Counts over every satellite of the message (not only the kept ones), per gnssId (0..7) and in total.
+  int totalSvs, totalUsed, totalSignal;
+  uint8_t viewBy[8], usedBy[8];
+  int64_t satAtUs;       // esp_timer time of the last NAV-SAT, 0 = none yet
+  uint16_t gDOP, pDOP, tDOP, vDOP, hDOP;  // * 0.01
+  int64_t dopAtUs;       // same, NAV-DOP; 0 again whenever a NAV-PVT has no valid fix (DOP of an earlier fix)
+};
+
 using Callback = void (*)(const Pvt&);
 
 // Installs the UART driver (UART_NUM_2) and starts the GNSS task (priority 10).
@@ -57,5 +83,7 @@ using Callback = void (*)(const Pvt&);
 // NAV-PVT; keep it fast. Call once.
 void start(int rxPin, int txPin, int rateHz, Callback cb);
 Stats stats();
+// Copies the latest satellites / DOP into out (about 1 KB: keep it static).
+void sky(Sky& out);
 
 }  // namespace gnss

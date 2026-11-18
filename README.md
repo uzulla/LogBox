@@ -45,7 +45,9 @@ mise run fw:ap          # soft-AP SSID / password of the last build
 
 - A / C: previous / next page. Pages: **SPEED** (km/h, total horizontal G bar), **G** (G circle with a 2 s trail and peaks;
   short press B resets the peaks), **STATUS** (GNSS fix / satellites / rate, position, accel, baro, mag and its
-  calibration, SD, Wi-Fi; short press B starts the magnetometer calibration, below).
+  calibration, SD, Wi-Fi; short press B starts the magnetometer calibration, below), **GNSS** (position, altitude,
+  speed, course, date / time, HDOP / PDOP, accuracy, update rate, and a sky plot of the satellites: filled = used in
+  the fix, ring = tracked only, colour = signal strength; counts per constellation).
 - **Hold B for 1.5 s** to stop recording: the top bar shows `SAVING` then `SAFE`; only then pull the card. Holding B again
   (from `SAFE`, `SD ERR` or `NO SD` after inserting a card) records to the next file.
 - Top bar: SD state (blinking dot while recording), GNSS fix and satellites, Wi-Fi bars (`BT` while the BLE config

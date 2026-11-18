@@ -39,6 +39,9 @@ std::atomic<uint32_t> g_pvt{0}, g_other{0}, g_bytes{0}, g_ckErr{0}, g_baud{0};
 std::atomic<uint16_t> g_rate{0};
 std::atomic<bool> g_configured{false};
 
+Sky g_sky;  // decoded in place by the GNSS task under g_skyLock, copied out by sky()
+portMUX_TYPE g_skyLock = portMUX_INITIALIZER_UNLOCKED;
+
 void handleFrame() {
   g_ubxFrames++;
   const uint8_t cls = g_parser.msgClass(), id = g_parser.msgId();
@@ -47,9 +50,26 @@ void handleFrame() {
     if (ubx::decodeNavPvt(g_parser.payload(), g_parser.payloadLen(), pvt)) {
       g_pvt++;
       g_lastPvtUs = esp_timer_get_time();
+      if (!pvt.posOk()) {  // a DOP from before the fix was lost must not be shown with the next fix
+        taskENTER_CRITICAL(&g_skyLock);
+        g_sky.dopAtUs = 0;
+        taskEXIT_CRITICAL(&g_skyLock);
+      }
       if (g_cb) g_cb(pvt);
       return;
     }
+  } else if (cls == ubx::kClsNav && id == ubx::kIdNavSat) {
+    taskENTER_CRITICAL(&g_skyLock);  // decoded in place: a few microseconds for 64 satellites
+    const bool ok = ubx::decodeNavSat(g_parser.payload(), g_parser.payloadLen(), g_parser.frameLen(), g_sky);
+    if (ok) g_sky.satAtUs = esp_timer_get_time();
+    taskEXIT_CRITICAL(&g_skyLock);
+    if (ok) return;
+  } else if (cls == ubx::kClsNav && id == ubx::kIdNavDop) {
+    taskENTER_CRITICAL(&g_skyLock);
+    const bool ok = ubx::decodeNavDop(g_parser.payload(), g_parser.payloadLen(), g_sky);
+    if (ok) g_sky.dopAtUs = esp_timer_get_time();
+    taskEXIT_CRITICAL(&g_skyLock);
+    if (ok) return;
   } else if (cls == ubx::kClsAck && g_parser.payloadLen() >= 2) {
     g_ackCls = g_parser.payload()[0];
     g_ackId = g_parser.payload()[1];
@@ -142,9 +162,13 @@ bool detect() {
   return false;
 }
 
+// Also sets NAV-SAT / NAV-DOP to every hz-th epoch, i.e. about once a second at any rate.
 bool setRate(int hz) {
-  const ubx::KeyValue kv[] = {{ubx::kCfgRateMeas, uint64_t(1000 / hz)}, {ubx::kCfgRateNav, 1}};
-  const Ack a = valset(kv, 2);
+  const ubx::KeyValue kv[] = {{ubx::kCfgRateMeas, uint64_t(1000 / hz)},
+                              {ubx::kCfgRateNav, 1},
+                              {ubx::kCfgMsgoutNavSatUart1, uint64_t(hz)},
+                              {ubx::kCfgMsgoutNavDopUart1, uint64_t(hz)}};
+  const Ack a = valset(kv, 4);
   ESP_LOGI(TAG, "rate %d Hz (%d ms): %s", hz, 1000 / hz, ackName(a));
   if (a == Ack::Ack) g_rate = uint16_t(hz);
   return a == Ack::Ack;
@@ -234,6 +258,12 @@ void task(void*) {
 }
 
 }  // namespace
+
+void sky(Sky& out) {
+  taskENTER_CRITICAL(&g_skyLock);
+  out = g_sky;
+  taskEXIT_CRITICAL(&g_skyLock);
+}
 
 void start(int rxPin, int txPin, int rateHz, Callback cb) {
   static bool started = false;
