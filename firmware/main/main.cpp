@@ -1257,6 +1257,10 @@ extern "C" void app_main() {
   esp_pm_config_t pm = {};
   pm.max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
   pm.min_freq_mhz = CONFIG_LOGBO_CPU_MIN_MHZ;
+  if (pm.min_freq_mhz > pm.max_freq_mhz) {  // e.g. an old sdkconfig with 240 as the minimum, 160 now the maximum
+    ESP_LOGW(TAG, "LOGBO_CPU_MIN_MHZ %d > maximum %d MHz, using %d", pm.min_freq_mhz, pm.max_freq_mhz, pm.max_freq_mhz);
+    pm.min_freq_mhz = pm.max_freq_mhz;
+  }
   pm.light_sleep_enable = false;
   ESP_ERROR_CHECK(esp_pm_configure(&pm));
 

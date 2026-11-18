@@ -15,7 +15,8 @@ config LOGBO_CPU_MIN_MHZ
     int "Minimum CPU frequency for dynamic frequency scaling (MHz)"
     default 80
     help
-        One of 40, 80, 160, 240. The maximum is the default CPU frequency.
+        One of 40, 80, 160, 240, at most the maximum (the default CPU frequency, 160 MHz unless changed);
+        a larger value is lowered to the maximum at boot.
 
 config LOGBO_CONFIG_WINDOW_S
     int "Seconds after boot during which the BLE config service is advertised (0 = always)"

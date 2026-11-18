@@ -630,11 +630,15 @@ void drawMagCal(const Status& s) {
 
 constexpr uint8_t kBlDuty[kBacklightLevels] = {8, 20, 50, 110, 255};  // of 255, roughly even steps to the eye
 constexpr int64_t kBlShowUs = 1500000;  // the level stays on the screen this long after a change
-std::atomic<int> blLevel{kBacklightLevels};
-std::atomic<int64_t> blShownAt{0};
-bool blOn = false;  // off until the first frame is drawn
+// Every change of the level, its PWM and its saving happen under blMutex, in that order, whoever makes it
+// (buttons in the display task, BLE, serial console): the last change is what is lit and what is saved.
+SemaphoreHandle_t blMutex;
+std::atomic<int> blLevel{kBacklightLevels};  // written under blMutex
+std::atomic<int64_t> blShownAt{0};           // last change, 0 = none since boot (nothing to show)
+bool blOn = false;     // off until the first frame is drawn (under blMutex)
+bool blDirty = false;  // changed by the buttons, not saved yet (under blMutex)
 
-void blApply() {
+void blApplyLocked() {
   ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, blOn ? kBlDuty[blLevel - 1] : 0);
   ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
@@ -668,11 +672,47 @@ void blInit() {
   c.timer_sel = LEDC_TIMER_0;
   c.duty = 0;
   ESP_ERROR_CHECK(ledc_channel_config(&c));
+  blMutex = xSemaphoreCreateMutex();
+}
+
+// Turns the backlight on at the current level (after the first frame).
+void blTurnOn() {
+  xSemaphoreTake(blMutex, portMAX_DELAY);
+  blOn = true;
+  blApplyLocked();
+  xSemaphoreGive(blMutex);
+}
+
+// One step darker (-1) / brighter (+1) from the buttons; saved by blFlush() once both are released.
+void blStep(int dir, int64_t now) {
+  xSemaphoreTake(blMutex, portMAX_DELAY);
+  const int lv = std::clamp(blLevel + dir, 1, kBacklightLevels);
+  if (lv != blLevel) {
+    blLevel = lv;
+    blApplyLocked();
+    blDirty = true;
+  }
+  blShownAt = now;
+  xSemaphoreGive(blMutex);
+}
+
+void blFlush() {
+  xSemaphoreTake(blMutex, portMAX_DELAY);
+  if (blDirty) {
+    if (!blSave(blLevel)) ESP_LOGW(TAG, "backlight level not saved");
+    blDirty = false;
+  }
+  xSemaphoreGive(blMutex);
+}
+
+bool blShowing(int64_t now) {
+  const int64_t at = blShownAt;
+  return at && now - at < kBlShowUs;
 }
 
 // The level while it is being changed: a box in the middle of the screen.
-void drawBacklightLevel(int64_t now) {
-  if (now - blShownAt >= kBlShowUs) return;
+void drawBacklightLevel(bool show) {
+  if (!show) return;
   constexpr int bw = 200, bh = 60, bx = (W - bw) / 2, by = (H - bh) / 2;
   fillRect(bx, by, bw, bh, kCyan);
   fillRect(bx + 2, by + 2, bw - 4, bh - 4, kBar);
@@ -749,40 +789,50 @@ void magCalEnd(bool finish, int64_t now) {
 }
 
 // A / C: previous / next page on release; held 0.8 s: backlight darker / brighter (again every 0.5 s while
-// held, saved on release). B held 1.5 s: SD stop / start; B short on the G page: reset peaks.
-void pollButtons(int64_t now) {
-  static bool prevA, prevC, held;
-  static int64_t acDownAt, stepAt;
-  const bool a = gpio_get_level(kBtnA) == 0, c = gpio_get_level(kBtnC) == 0;
-  if ((a && !prevA) || (c && !prevC)) {
-    acDownAt = now;
-    held = false;
+// held, saved once both are released). B held 1.5 s: SD stop / start; B short on the G page: reset peaks.
+constexpr int64_t kBlHoldUs = 800000, kBlRepeatUs = 500000;
+struct PageButton {
+  gpio_num_t pin;
+  int dir;  // page and backlight direction: A -1, C +1
+  bool prev = false, held = false;
+  int64_t downAt = 0, stepAt = 0;
+};
+PageButton btnA{kBtnA, -1}, btnC{kBtnC, +1};
+
+void pollPageButton(PageButton& k, const PageButton& other, int64_t now) {
+  const bool down = gpio_get_level(k.pin) == 0, otherDown = gpio_get_level(other.pin) == 0;
+  if (down && !k.prev) {
+    k.downAt = now;
+    k.held = false;
   }
-  if ((a || c) && !(a && c) && !magCollecting && now - acDownAt >= 800000 && (!held || now - stepAt >= 500000)) {
-    const int lv = std::clamp(blLevel + (c ? 1 : -1), 1, kBacklightLevels);
-    if (lv != blLevel) {
-      blLevel = lv;
-      blApply();
-    }
-    blShownAt = now;
-    held = true;
-    stepAt = now;
+  if (down && !otherDown && !magCollecting && now - k.downAt >= kBlHoldUs &&
+      (!k.held || now - k.stepAt >= kBlRepeatUs)) {
+    blStep(k.dir, now);
+    k.held = true;
+    k.stepAt = now;
   }
-  if ((prevA && !a) || (prevC && !c)) {
+  if (k.prev && !down) {
     if (magCollecting) {
       magCalEnd(false, now);
-    } else if (held) {
-      if (!a && !c) {
-        if (!blSave(blLevel)) ESP_LOGW(TAG, "backlight level not saved");
+    } else if (!k.held && !otherDown && !other.held) {
+      // Polled every 100 ms: a press seen to last the hold time only at its release is a hold too.
+      if (now - k.downAt >= kBlHoldUs) {
+        blStep(k.dir, now);
+      } else {
+        page = (page + kPages + k.dir) % kPages;
       }
-    } else if (prevA && !a) {
-      page = (page + kPages - 1) % kPages;
-    } else {
-      page = (page + 1) % kPages;
     }
   }
-  prevA = a;
-  prevC = c;
+  k.prev = down;
+}
+
+void pollButtons(int64_t now) {
+  pollPageButton(btnA, btnC, now);
+  pollPageButton(btnC, btnA, now);
+  if (!btnA.prev && !btnC.prev) {
+    btnA.held = btnC.held = false;
+    blFlush();
+  }
 
   static int64_t downAt = 0;
   static bool longDone = false;
@@ -863,9 +913,9 @@ void displayTask(void*) {
     static int drawnPage = -1, sinceDraw = 0;
     const int drawPage = s.magCollecting ? -2 : page;  // the calibration page: every frame
     // While the backlight level shows (and once after, to remove it): every frame.
-    static bool blShowing = false;
-    const bool blShow = now - blShownAt < kBlShowUs, blChanged = blShow || blShowing;
-    blShowing = blShow;
+    static bool blShown = false;
+    const bool blShow = blShowing(now), blChanged = blShow || blShown;
+    blShown = blShow;
     const bool redraw = drawPage != drawnPage || blChanged ||
                         ++sinceDraw >= (s.magCollecting ? 1 : kRedrawFrames[page]);
     if (redraw) {
@@ -891,12 +941,12 @@ void displayTask(void*) {
         drawStatusPage(s, now, rate);
       }
       drawButtonBar(s);
-      drawBacklightLevel(now);
+      drawBacklightLevel(blShow);
       esp_lcd_panel_draw_bitmap(panel, 0, bandY, W, bandY + kBandH, cv);
     }
     if (!backlight) {  // after the first frame
-      blOn = backlight = true;
-      blApply();
+      backlight = true;
+      blTurnOn();
     }
     vTaskDelayUntil(&wake, pdMS_TO_TICKS(kFrameMs));
   }
@@ -913,11 +963,15 @@ void displayStart() {
 int displayBacklight() { return blLevel; }
 
 bool displaySetBacklight(int level) {
-  if (level < 1 || level > kBacklightLevels) return false;
+  if (level < 1 || level > kBacklightLevels || !blMutex) return false;
+  xSemaphoreTake(blMutex, portMAX_DELAY);
   blLevel = level;
-  blApply();
+  blApplyLocked();
   blShownAt = esp_timer_get_time();
-  return blSave(level);
+  const bool ok = blSave(level);
+  blDirty = false;  // this is the latest level, saved (or not: then the caller is told)
+  xSemaphoreGive(blMutex);
+  return ok;
 }
 
 void displayUpdate(const Status& s) {

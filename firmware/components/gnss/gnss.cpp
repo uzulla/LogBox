@@ -287,7 +287,9 @@ void start(int rxPin, int txPin, int rateHz, Callback cb) {
   // 80 MHz, as both use the same PLL.
   esp_pm_lock_handle_t pm;
   if (esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "gnss_uart", &pm) == ESP_OK) esp_pm_lock_acquire(pm);
-  ESP_ERROR_CHECK(uart_driver_install(kUart, 4096, 0, 0, nullptr, 0));
+  // ISR in IRAM (CONFIG_UART_ISR_IN_IRAM): it keeps emptying the 128-byte FIFO (~11 ms at 115200) while a
+  // flash write / erase (NVS) has the cache off.
+  ESP_ERROR_CHECK(uart_driver_install(kUart, 4096, 0, 0, nullptr, ESP_INTR_FLAG_IRAM));
   ESP_ERROR_CHECK(uart_param_config(kUart, &cfg));
   ESP_ERROR_CHECK(uart_set_pin(kUart, txPin, rxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
   xTaskCreate(task, "gnss", 4096, nullptr, 10, nullptr);
