@@ -75,8 +75,16 @@ static void test_nav_sat_decode() {
     put32(b + 8, sv[i].flags);
   }
   gnss::Sky d = {};
-  TEST_ASSERT_TRUE(decodeNavSat(p.data(), p.size(), d));
+  TEST_ASSERT_TRUE(decodeNavSat(p.data(), p.size(), p.size(), d));
   TEST_ASSERT_EQUAL_UINT32(1000, d.iTOW);
+  TEST_ASSERT_EQUAL_INT(3, d.totalSvs);
+  TEST_ASSERT_EQUAL_INT(1, d.totalUsed);
+  TEST_ASSERT_EQUAL_INT(2, d.totalSignal);
+  TEST_ASSERT_EQUAL_UINT8(1, d.viewBy[0]);
+  TEST_ASSERT_EQUAL_UINT8(1, d.usedBy[0]);
+  TEST_ASSERT_EQUAL_UINT8(1, d.viewBy[6]);
+  TEST_ASSERT_EQUAL_UINT8(0, d.usedBy[6]);
+  TEST_ASSERT_EQUAL_UINT8(1, d.viewBy[2]);
   TEST_ASSERT_EQUAL_INT(3, d.numSvs);
   TEST_ASSERT_EQUAL_UINT8(0, d.sats[0].gnssId);
   TEST_ASSERT_EQUAL_UINT8(5, d.sats[0].svId);
@@ -88,17 +96,58 @@ static void test_nav_sat_decode() {
   TEST_ASSERT_EQUAL_INT16(350, d.sats[1].azim);
   TEST_ASSERT_EQUAL_INT8(-91, d.sats[2].elev);
   // Length not matching the count.
-  TEST_ASSERT_FALSE(decodeNavSat(p.data(), p.size() - 1, d));
-  TEST_ASSERT_FALSE(decodeNavSat(p.data(), 4, d));
+  TEST_ASSERT_FALSE(decodeNavSat(p.data(), p.size() - 1, p.size() - 1, d));
+  TEST_ASSERT_FALSE(decodeNavSat(p.data(), 4, 4, d));
+  // Unknown version.
+  p[4] = 0;
+  TEST_ASSERT_FALSE(decodeNavSat(p.data(), p.size(), p.size(), d));
 }
 
 static void test_nav_sat_too_many() {
   const int n = gnss::kMaxSats + 6;
   std::vector<uint8_t> p(kNavSatHeaderLen + n * kNavSatBlockLen, 0);
+  p[4] = kNavSatVersion;
   p[5] = uint8_t(n);
+  for (int i = 0; i < n; i++) {  // all GPS, all used, all with a signal
+    p[kNavSatHeaderLen + i * kNavSatBlockLen + 2] = 30;
+    p[kNavSatHeaderLen + i * kNavSatBlockLen + 8] = 0x08;
+  }
   gnss::Sky d = {};
-  TEST_ASSERT_TRUE(decodeNavSat(p.data(), p.size(), d));
+  TEST_ASSERT_TRUE(decodeNavSat(p.data(), p.size(), p.size(), d));
   TEST_ASSERT_EQUAL_INT(gnss::kMaxSats, d.numSvs);
+  // The counts include the satellites beyond the kept ones.
+  TEST_ASSERT_EQUAL_INT(n, d.totalSvs);
+  TEST_ASSERT_EQUAL_INT(n, d.totalUsed);
+  TEST_ASSERT_EQUAL_INT(n, d.totalSignal);
+  TEST_ASSERT_EQUAL_UINT8(n, d.viewBy[0]);
+}
+
+// A NAV-SAT longer than the parser's buffer (100 satellites, 1208 bytes) still arrives, truncated to the
+// buffer; other messages that long are refused.
+static void test_nav_sat_longer_than_buffer() {
+  const int n = 100;
+  std::vector<uint8_t> payload(kNavSatHeaderLen + n * kNavSatBlockLen, 0);
+  payload[4] = kNavSatVersion;
+  payload[5] = n;
+  for (int i = 0; i < n; i++) payload[kNavSatHeaderLen + i * kNavSatBlockLen + 2] = 40;
+  std::vector<uint8_t> f(payload.size() + kFrameOverhead);
+  TEST_ASSERT_EQUAL(f.size(), buildFrame(kClsNav, kIdNavSat, payload.data(), payload.size(), f.data(), f.size()));
+  static Parser p;
+  p.reset();
+  TEST_ASSERT_EQUAL_INT(1, feedAll(p, f.data(), f.size()));
+  TEST_ASSERT_EQUAL(kMaxPayloadLen, p.payloadLen());
+  TEST_ASSERT_EQUAL(payload.size(), p.frameLen());
+  gnss::Sky d = {};
+  TEST_ASSERT_TRUE(decodeNavSat(p.payload(), p.payloadLen(), p.frameLen(), d));
+  TEST_ASSERT_EQUAL_INT(gnss::kMaxSats, d.numSvs);
+  TEST_ASSERT_EQUAL_INT(n, d.totalSvs);
+  TEST_ASSERT_EQUAL_INT(int((kMaxPayloadLen - kNavSatHeaderLen) / kNavSatBlockLen), d.totalSignal);
+
+  // The same length as another message: a length error.
+  TEST_ASSERT_EQUAL(f.size(), buildFrame(kClsNav, kIdNavPvt, payload.data(), payload.size(), f.data(), f.size()));
+  const uint32_t errs = p.lengthErrors();
+  TEST_ASSERT_EQUAL_INT(0, feedAll(p, f.data(), f.size()));
+  TEST_ASSERT_EQUAL_UINT32(errs + 1, p.lengthErrors());
 }
 
 static void test_nav_dop_decode() {
@@ -116,6 +165,8 @@ static void test_nav_dop_decode() {
   TEST_ASSERT_EQUAL_UINT16(95, d.vDOP);
   TEST_ASSERT_EQUAL_UINT16(70, d.hDOP);
   TEST_ASSERT_FALSE(decodeNavDop(p.data(), 17, d));
+  p.push_back(0);
+  TEST_ASSERT_FALSE(decodeNavDop(p.data(), 19, d));
 }
 
 void setUp() {}
@@ -300,6 +351,7 @@ int main() {
   RUN_TEST(test_nav_pvt_decode);
   RUN_TEST(test_nav_sat_decode);
   RUN_TEST(test_nav_sat_too_many);
+  RUN_TEST(test_nav_sat_longer_than_buffer);
   RUN_TEST(test_nav_dop_decode);
   RUN_TEST(test_pvt_predicates);
   RUN_TEST(test_split_concatenated_garbage_and_bad_checksum);

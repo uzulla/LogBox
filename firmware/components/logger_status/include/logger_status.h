@@ -35,7 +35,8 @@ struct Status {
   int64_t gnssAtUs;      // same, of the last GNSS message
   int64_t unixUs;        // UTC (microseconds since the Unix epoch), 0 = not valid
   uint8_t fix;           // 0 none, 2 2D, 3 3D
-  bool fixOk;
+  bool fixOk;            // 3D (or GNSS + DR) and gnssFixOK
+  bool posOk;            // 2D / 3D / GNSS + DR and gnssFixOK: the position (not the 2D altitude) is valid
   uint8_t sats;
   int32_t lat, lon;      // deg * 1e7
   int32_t altMm;         // MSL

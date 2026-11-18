@@ -476,7 +476,7 @@ uint16_t cnoColor(uint8_t cno) { return cno >= 35 ? kGreen : cno >= 25 ? kAmber 
 void drawGnssPage(const Status& s, int64_t now, int rate) {
   char b[32];
   const bool fresh = gnssFresh(s, now);
-  const bool pos = fresh && s.fix >= 2;
+  const bool pos = fresh && s.posOk;
   constexpr int lx = 4, vx = 34, dy = 19;
   int y = 28;
   auto row = [&](const char* label, const char* value, uint16_t c) {
@@ -491,8 +491,12 @@ void drawGnssPage(const Status& s, int64_t now, int rate) {
     row("LAT", b, kWhite);
     fmtCoord(b, sizeof(b), s.lon);
     row("LON", b, kWhite);
-    snprintf(b, sizeof(b), "%.1fM", s.altMm / 1000.0);
-    row("ALT", b, kWhite);
+    if (s.fixOk) {  // a 2D fix only holds the last altitude
+      snprintf(b, sizeof(b), "%.1fM", s.altMm / 1000.0);
+      row("ALT", b, kWhite);
+    } else {
+      row("ALT", "2D --", kDim);
+    }
     snprintf(b, sizeof(b), "%.1fKM/H", kmh10(s.speedMms) / 10.0);
     row("SPD", b, kWhite);
     if (s.headingValid) {
@@ -579,21 +583,11 @@ void drawGnssPage(const Status& s, int64_t now, int rate) {
   if (!sats) return;
   static const struct { uint8_t id; const char* name; } kSys[] = {
       {0, "GPS"}, {6, "GLO"}, {2, "GAL"}, {3, "BDS"}, {5, "QZS"}, {1, "SBS"}};
-  int used = 0, sig = 0;
-  for (int i = 0; i < sky.numSvs; i++) {
-    used += sky.sats[i].used;
-    sig += sky.sats[i].cno > 0;
-  }
-  snprintf(b, sizeof(b), "USED %d SIG %d VIEW %d", used, sig, sky.numSvs);
+  snprintf(b, sizeof(b), "USED %d SIG %d VIEW %d", sky.totalUsed, sky.totalSignal, sky.totalSvs);
   textCenter(cx, ty, b, 1, kWhite);
   ty += 12;
   for (int k = 0; k < 6; k++) {
-    int u = 0, n = 0;
-    for (int i = 0; i < sky.numSvs; i++) {
-      if (sky.sats[i].gnssId != kSys[k].id) continue;
-      n++;
-      u += sky.sats[i].used;
-    }
+    const int u = sky.usedBy[kSys[k].id], n = sky.viewBy[kSys[k].id];
     snprintf(b, sizeof(b), "%s %2d/%-2d", kSys[k].name, u, n);
     text(cx - 68 + (k % 2) * 72, ty + (k / 2) * 11, b, 1, n ? kGray : kTrack);
   }

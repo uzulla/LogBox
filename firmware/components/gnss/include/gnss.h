@@ -35,6 +35,8 @@ struct Pvt {  // UBX-NAV-PVT, raw protocol units
 
   bool dateTimeValid() const { return (valid & 0x07) == 0x07; }
   bool fixOk() const { return (fixType == 3 || fixType == 4) && (flags & 0x01); }
+  // Valid horizontal position: also a 2D fix (whose altitude is only the last one held).
+  bool posOk() const { return fixType >= 2 && fixType <= 4 && (flags & 0x01); }
   // headVehValid is only ever set by sensor-fusion (ADR/UDR) receivers; a plain
   // NEO-M9N never sets it, so headMot is also accepted when there is a good fix
   // and the ground speed exceeds kHeadingMinSpeedMmps.
@@ -66,9 +68,12 @@ struct Sky {
   uint32_t iTOW;
   int numSvs;            // entries in sats (the receiver may report more than kMaxSats; the rest are dropped)
   Sat sats[kMaxSats];
+  // Counts over every satellite of the message (not only the kept ones), per gnssId (0..7) and in total.
+  int totalSvs, totalUsed, totalSignal;
+  uint8_t viewBy[8], usedBy[8];
   int64_t satAtUs;       // esp_timer time of the last NAV-SAT, 0 = none yet
   uint16_t gDOP, pDOP, tDOP, vDOP, hDOP;  // * 0.01
-  int64_t dopAtUs;       // same, NAV-DOP
+  int64_t dopAtUs;       // same, NAV-DOP; 0 again whenever a NAV-PVT has no valid fix (DOP of an earlier fix)
 };
 
 using Callback = void (*)(const Pvt&);

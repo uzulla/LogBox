@@ -50,12 +50,17 @@ void handleFrame() {
     if (ubx::decodeNavPvt(g_parser.payload(), g_parser.payloadLen(), pvt)) {
       g_pvt++;
       g_lastPvtUs = esp_timer_get_time();
+      if (!pvt.posOk()) {  // a DOP from before the fix was lost must not be shown with the next fix
+        taskENTER_CRITICAL(&g_skyLock);
+        g_sky.dopAtUs = 0;
+        taskEXIT_CRITICAL(&g_skyLock);
+      }
       if (g_cb) g_cb(pvt);
       return;
     }
   } else if (cls == ubx::kClsNav && id == ubx::kIdNavSat) {
     taskENTER_CRITICAL(&g_skyLock);  // decoded in place: a few microseconds for 64 satellites
-    const bool ok = ubx::decodeNavSat(g_parser.payload(), g_parser.payloadLen(), g_sky);
+    const bool ok = ubx::decodeNavSat(g_parser.payload(), g_parser.payloadLen(), g_parser.frameLen(), g_sky);
     if (ok) g_sky.satAtUs = esp_timer_get_time();
     taskEXIT_CRITICAL(&g_skyLock);
     if (ok) return;
