@@ -6,6 +6,7 @@
 
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -279,6 +280,12 @@ void start(int rxPin, int txPin, int rateHz, Callback cb) {
   cfg.stop_bits = UART_STOP_BITS_1;
   cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
   cfg.source_clk = UART_SCLK_DEFAULT;
+  // The UART driver holds the APB frequency only while sending. On the ESP32 a DFS switch between 240 MHz
+  // and 80 MHz turns the PLL off for a moment, which garbles what is being received (measured: ~7 instead
+  // of 25 NAV-PVT/s, with checksum errors). The receiver talks all the time, so keep APB at 80 MHz for good.
+  // With a 240 MHz maximum this keeps the CPU at 240 MHz.
+  esp_pm_lock_handle_t pm;
+  if (esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "gnss_uart", &pm) == ESP_OK) esp_pm_lock_acquire(pm);
   ESP_ERROR_CHECK(uart_driver_install(kUart, 4096, 0, 0, nullptr, 0));
   ESP_ERROR_CHECK(uart_param_config(kUart, &cfg));
   ESP_ERROR_CHECK(uart_set_pin(kUart, txPin, rxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
