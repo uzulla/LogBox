@@ -9,7 +9,7 @@
 // a short press of B on the G page resets the peak values, on the STATUS page it starts the magnetometer
 // calibration (a page of its own until it ends: B finishes, A / C cancel).
 //
-// Pages: 0 speed + G, 1 G circle, 2 status.
+// Pages: 0 speed + G, 1 G circle, 2 status, 3 GNSS details (satellites in the sky).
 
 #include "logger_status.h"
 
@@ -32,6 +32,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "gnss.h"
 
 namespace logger {
 namespace {
@@ -44,7 +45,7 @@ constexpr gpio_num_t kBtnA = GPIO_NUM_39, kBtnB = GPIO_NUM_38, kBtnC = GPIO_NUM_
 constexpr int W = 320, H = 240;
 constexpr int kBandH = 24;  // 10 bands per frame, 15 KB per band buffer
 constexpr int kFrameMs = 100;
-constexpr int kPages = 3;
+constexpr int kPages = 4;
 
 // The panel takes big-endian RGB565, so the buffers hold byte-swapped values.
 constexpr uint16_t rgb(int r, int g, int b) {
@@ -254,7 +255,7 @@ void drawTopBar(const Status& s, int64_t now) {
 void drawButtonBar(const Status& s) {
   if (bandY + kBandH < H - 14) return;
   fillRect(0, H - 14, W, 14, kBar);
-  static const char* const kNames[kPages] = {"SPEED", "G", "STATUS"};
+  static const char* const kNames[kPages] = {"SPEED", "G", "STATUS", "GNSS"};
   textCenter(68, H - 11, "<", 1, kGray);
   textCenter(252, H - 11, ">", 1, kGray);
   textCenter(160, H - 11, s.rec == 1 ? "HOLD: STOP REC" : "HOLD: START REC", 1, s.rec == 1 ? kRed : kGray);
@@ -465,6 +466,131 @@ void drawStatusPage(const Status& s, int64_t now, int rate) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Page 3: GNSS details, with the satellites on a sky plot (from NAV-SAT / NAV-DOP, about once a second)
+
+gnss::Sky sky;  // display task's copy
+
+uint16_t cnoColor(uint8_t cno) { return cno >= 35 ? kGreen : cno >= 25 ? kAmber : cno > 0 ? kRed : kDim; }
+
+void drawGnssPage(const Status& s, int64_t now) {
+  char b[32];
+  const bool fresh = gnssFresh(s, now);
+  const bool pos = fresh && s.fix >= 2;
+  constexpr int lx = 4, vx = 34, dy = 19;
+  int y = 28;
+  auto row = [&](const char* label, const char* value, uint16_t c) {
+    text(lx, y + 4, label, 1, kDim);
+    text(vx, y, value, 2, c);
+    y += dy;
+  };
+  auto dash = [&](const char* label) { row(label, "--", kDim); };
+
+  if (pos) {
+    fmtCoord(b, sizeof(b), s.lat);
+    row("LAT", b, kWhite);
+    fmtCoord(b, sizeof(b), s.lon);
+    row("LON", b, kWhite);
+    snprintf(b, sizeof(b), "%.1fM", s.altMm / 1000.0);
+    row("ALT", b, kWhite);
+    snprintf(b, sizeof(b), "%.1fKM/H", kmh10(s.speedMms) / 10.0);
+    row("SPD", b, kWhite);
+    if (s.headingValid) {
+      snprintf(b, sizeof(b), "%.1f", (s.headingE5 % 36000000 + 36000000) % 36000000 / 1e5);
+      row("CRS", b, kWhite);
+    } else {
+      dash("CRS");
+    }
+  } else {
+    dash("LAT");
+    dash("LON");
+    dash("ALT");
+    dash("SPD");
+    dash("CRS");
+  }
+  if (s.unixUs) {
+    const time_t t = static_cast<time_t>((s.unixUs + (now - s.gnssAtUs)) / 1000000) + 9 * 3600;
+    tm jst;
+    gmtime_r(&t, &jst);
+    snprintf(b, sizeof(b), "%04d-%02d-%02d", jst.tm_year + 1900, jst.tm_mon + 1, jst.tm_mday);
+    row("DATE", b, fresh ? kWhite : kDim);
+    snprintf(b, sizeof(b), "%02d:%02d:%02d", jst.tm_hour, jst.tm_min, jst.tm_sec);
+    row("JST", b, fresh ? kWhite : kDim);
+  } else {
+    dash("DATE");
+    dash("JST");
+  }
+  const bool dop = sky.dopAtUs && now - sky.dopAtUs < 3000000;
+  if (dop && pos) {
+    snprintf(b, sizeof(b), "%d.%d P%d.%d", sky.hDOP / 100, sky.hDOP % 100 / 10, sky.pDOP / 100, sky.pDOP % 100 / 10);
+    row("HDOP", b, sky.hDOP <= 200 ? kGreen : sky.hDOP <= 500 ? kAmber : kRed);
+  } else {
+    dash("HDOP");
+  }
+  if (pos) {
+    const uint32_t acc = std::min<uint32_t>(s.hAccMm, 999900);
+    snprintf(b, sizeof(b), "%d.%dM", static_cast<int>(acc / 1000), static_cast<int>(acc % 1000 / 100));
+    row("ACC", b, acc <= 5000 ? kGreen : acc <= 20000 ? kAmber : kRed);
+  } else {
+    dash("ACC");
+  }
+
+  // Sky plot: zenith in the centre, horizon on the outer ring, north up. Filled = used in the fix, ring =
+  // tracked but not used; the colour is the signal strength.
+  constexpr int cx = 250, cy = 98, R = 66;
+  const bool sats = sky.satAtUs && now - sky.satAtUs < 3000000;
+  if (bandY <= cy + R + 8 && bandY + kBandH >= cy - R - 8) {
+    for (int k = 1; k <= 3; k++) circle(cx, cy, R * k / 3, k == 3 ? kDim : kGrid);
+    fillRect(cx - R, cy, 2 * R + 1, 1, kGrid);
+    fillRect(cx, cy - R, 1, 2 * R + 1, kGrid);
+    textCenter(cx, cy - R + 3, "N", 1, kGray);
+    textCenter(cx, cy + R - 9, "S", 1, kGray);
+    text(cx + R - 8, cy - 9, "E", 1, kGray);
+    text(cx - R + 3, cy - 9, "W", 1, kGray);
+    if (sats) {
+      for (int pass = 0; pass < 2; pass++) {  // unused first, so the used ones are drawn on top
+        for (int i = 0; i < sky.numSvs; i++) {
+          const gnss::Sat& v = sky.sats[i];
+          if (v.used != (pass == 1) || v.elev < 0 || v.elev > 90 || v.azim < 0 || v.azim > 360) continue;
+          const float r = R * (90 - v.elev) / 90.0f, a = v.azim * static_cast<float>(M_PI) / 180;
+          const int x = cx + static_cast<int>(lroundf(r * sinf(a))), yy = cy - static_cast<int>(lroundf(r * cosf(a)));
+          if (v.used) {
+            disc(x, yy, 4, cnoColor(v.cno));
+          } else {
+            circle(x, yy, 4, cnoColor(v.cno));
+          }
+        }
+      }
+    } else {
+      textCenter(cx, cy + 12, "NO SAT DATA", 1, kDim);
+    }
+  }
+
+  // Counts per constellation: used / tracked (with a signal) / in view.
+  int ty = cy + R + 8;
+  if (!sats) return;
+  static const struct { uint8_t id; const char* name; } kSys[] = {
+      {0, "GPS"}, {6, "GLO"}, {2, "GAL"}, {3, "BDS"}, {5, "QZS"}, {1, "SBS"}};
+  int used = 0, sig = 0;
+  for (int i = 0; i < sky.numSvs; i++) {
+    used += sky.sats[i].used;
+    sig += sky.sats[i].cno > 0;
+  }
+  snprintf(b, sizeof(b), "USED %d SIG %d VIEW %d", used, sig, sky.numSvs);
+  textCenter(cx, ty, b, 1, kWhite);
+  ty += 12;
+  for (int k = 0; k < 6; k++) {
+    int u = 0, n = 0;
+    for (int i = 0; i < sky.numSvs; i++) {
+      if (sky.sats[i].gnssId != kSys[k].id) continue;
+      n++;
+      u += sky.sats[i].used;
+    }
+    snprintf(b, sizeof(b), "%s %2d/%-2d", kSys[k].name, u, n);
+    text(cx - 68 + (k % 2) * 72, ty + (k / 2) * 11, b, 1, n ? kGray : kTrack);
+  }
+}
+
 // Magnetometer calibration (replaces the page while collecting)
 
 void drawMagCal(const Status& s) {
@@ -620,6 +746,7 @@ void displayTask(void*) {
     }
     gv = gs;
     portEXIT_CRITICAL(&stLock);
+    if (page == 3) gnss::sky(sky);
     // Calibration: finish by itself once there is plenty of rotation, give up after a while.
     // Session numbers only grow: a Status with a smaller number than ours is older than our own start (the logger
     // can go up to ~1 s between updates while the GNSS is silent) and is ignored, however long it lingers.
@@ -663,6 +790,8 @@ void displayTask(void*) {
         drawSpeedPage(s, now);
       } else if (page == 1) {
         drawGPage(s, now);
+      } else if (page == 3) {
+        drawGnssPage(s, now);
       } else {
         drawStatusPage(s, now, rate);
       }

@@ -57,6 +57,67 @@ static std::vector<uint8_t> navPvtPayload() {
   return p;
 }
 
+// NAV-SAT with three satellites: GPS 5 used, GLONASS 12 tracked, Galileo 3 without a signal.
+static void test_nav_sat_decode() {
+  std::vector<uint8_t> p(kNavSatHeaderLen + 3 * kNavSatBlockLen, 0);
+  put32(&p[0], 1000);
+  p[4] = 1;  // version
+  p[5] = 3;  // numSvs
+  const struct { uint8_t gnss, sv, cno; int8_t elev; int16_t azim; uint32_t flags; } sv[3] = {
+      {0, 5, 42, 67, 123, 0x0F}, {6, 12, 28, 10, 350, 0x04}, {2, 3, 0, -91, 0, 0}};
+  for (int i = 0; i < 3; i++) {
+    uint8_t* b = &p[kNavSatHeaderLen + i * kNavSatBlockLen];
+    b[0] = sv[i].gnss;
+    b[1] = sv[i].sv;
+    b[2] = sv[i].cno;
+    b[3] = uint8_t(sv[i].elev);
+    put16(b + 4, uint16_t(sv[i].azim));
+    put32(b + 8, sv[i].flags);
+  }
+  gnss::Sky d = {};
+  TEST_ASSERT_TRUE(decodeNavSat(p.data(), p.size(), d));
+  TEST_ASSERT_EQUAL_UINT32(1000, d.iTOW);
+  TEST_ASSERT_EQUAL_INT(3, d.numSvs);
+  TEST_ASSERT_EQUAL_UINT8(0, d.sats[0].gnssId);
+  TEST_ASSERT_EQUAL_UINT8(5, d.sats[0].svId);
+  TEST_ASSERT_EQUAL_UINT8(42, d.sats[0].cno);
+  TEST_ASSERT_EQUAL_INT8(67, d.sats[0].elev);
+  TEST_ASSERT_EQUAL_INT16(123, d.sats[0].azim);
+  TEST_ASSERT_TRUE(d.sats[0].used);
+  TEST_ASSERT_FALSE(d.sats[1].used);
+  TEST_ASSERT_EQUAL_INT16(350, d.sats[1].azim);
+  TEST_ASSERT_EQUAL_INT8(-91, d.sats[2].elev);
+  // Length not matching the count.
+  TEST_ASSERT_FALSE(decodeNavSat(p.data(), p.size() - 1, d));
+  TEST_ASSERT_FALSE(decodeNavSat(p.data(), 4, d));
+}
+
+static void test_nav_sat_too_many() {
+  const int n = gnss::kMaxSats + 6;
+  std::vector<uint8_t> p(kNavSatHeaderLen + n * kNavSatBlockLen, 0);
+  p[5] = uint8_t(n);
+  gnss::Sky d = {};
+  TEST_ASSERT_TRUE(decodeNavSat(p.data(), p.size(), d));
+  TEST_ASSERT_EQUAL_INT(gnss::kMaxSats, d.numSvs);
+}
+
+static void test_nav_dop_decode() {
+  std::vector<uint8_t> p(kNavDopLen, 0);
+  put16(&p[4], 150);
+  put16(&p[6], 120);
+  put16(&p[8], 80);
+  put16(&p[10], 95);
+  put16(&p[12], 70);
+  gnss::Sky d = {};
+  TEST_ASSERT_TRUE(decodeNavDop(p.data(), p.size(), d));
+  TEST_ASSERT_EQUAL_UINT16(150, d.gDOP);
+  TEST_ASSERT_EQUAL_UINT16(120, d.pDOP);
+  TEST_ASSERT_EQUAL_UINT16(80, d.tDOP);
+  TEST_ASSERT_EQUAL_UINT16(95, d.vDOP);
+  TEST_ASSERT_EQUAL_UINT16(70, d.hDOP);
+  TEST_ASSERT_FALSE(decodeNavDop(p.data(), 17, d));
+}
+
 void setUp() {}
 void tearDown() {}
 
@@ -237,6 +298,9 @@ int main() {
   RUN_TEST(test_valset_mixed_sizes);
   RUN_TEST(test_valset_errors);
   RUN_TEST(test_nav_pvt_decode);
+  RUN_TEST(test_nav_sat_decode);
+  RUN_TEST(test_nav_sat_too_many);
+  RUN_TEST(test_nav_dop_decode);
   RUN_TEST(test_pvt_predicates);
   RUN_TEST(test_split_concatenated_garbage_and_bad_checksum);
   RUN_TEST(test_length_error);

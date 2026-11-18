@@ -50,6 +50,27 @@ struct Stats {
   uint16_t rateHz;   // measurement rate in effect (after any fallback), 0 if not configured
 };
 
+// Satellites in view (UBX-NAV-SAT) and the dilutions of precision (UBX-NAV-DOP), both requested about
+// once a second, for the display.
+struct Sat {
+  uint8_t gnssId;   // 0 GPS, 1 SBAS, 2 Galileo, 3 BeiDou, 5 QZSS, 6 GLONASS
+  uint8_t svId;
+  uint8_t cno;      // dBHz, 0 = no signal
+  int8_t elev;      // deg, -90..90 (out of range: unknown)
+  int16_t azim;     // deg, 0..360 (unknown when the elevation is)
+  bool used;        // used in the navigation solution
+};
+constexpr int kMaxSats = 64;
+
+struct Sky {
+  uint32_t iTOW;
+  int numSvs;            // entries in sats (the receiver may report more than kMaxSats; the rest are dropped)
+  Sat sats[kMaxSats];
+  int64_t satAtUs;       // esp_timer time of the last NAV-SAT, 0 = none yet
+  uint16_t gDOP, pDOP, tDOP, vDOP, hDOP;  // * 0.01
+  int64_t dopAtUs;       // same, NAV-DOP
+};
+
 using Callback = void (*)(const Pvt&);
 
 // Installs the UART driver (UART_NUM_2) and starts the GNSS task (priority 10).
@@ -57,5 +78,7 @@ using Callback = void (*)(const Pvt&);
 // NAV-PVT; keep it fast. Call once.
 void start(int rxPin, int txPin, int rateHz, Callback cb);
 Stats stats();
+// Copies the latest satellites / DOP into out (about 1 KB: keep it static).
+void sky(Sky& out);
 
 }  // namespace gnss

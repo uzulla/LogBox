@@ -17,6 +17,8 @@ constexpr size_t kFrameOverhead = 8;  // sync(2) class id len(2) ... ck(2)
 
 constexpr uint8_t kClsNav = 0x01, kIdNavPvt = 0x07;
 constexpr size_t kNavPvtLen = 92;
+constexpr uint8_t kIdNavSat = 0x35, kIdNavDop = 0x04;
+constexpr size_t kNavSatHeaderLen = 8, kNavSatBlockLen = 12, kNavDopLen = 18;
 constexpr uint8_t kClsAck = 0x05, kIdAckNak = 0x00, kIdAckAck = 0x01;
 constexpr uint8_t kClsCfg = 0x06, kIdCfgValset = 0x8A, kIdCfgValget = 0x8B;
 constexpr uint8_t kClsMon = 0x0A, kIdMonVer = 0x04;
@@ -31,6 +33,8 @@ constexpr uint32_t kCfgUart1InprotNmea = 0x10730002;   // L
 constexpr uint32_t kCfgUart1OutprotUbx = 0x10740001;   // L
 constexpr uint32_t kCfgUart1OutprotNmea = 0x10740002;  // L
 constexpr uint32_t kCfgMsgoutNavPvtUart1 = 0x20910007; // U1
+constexpr uint32_t kCfgMsgoutNavSatUart1 = 0x20910016; // U1, every n-th epoch
+constexpr uint32_t kCfgMsgoutNavDopUart1 = 0x20910039; // U1
 constexpr uint32_t kCfgRateMeas = 0x30210001;          // U2, ms
 constexpr uint32_t kCfgRateNav = 0x30210002;           // U2, cycles
 constexpr uint32_t kCfgNavspgDynmodel = 0x20110021;    // E1
@@ -89,6 +93,11 @@ class NmeaDetector {
 };
 
 bool decodeNavPvt(const uint8_t* payload, size_t len, gnss::Pvt& out);
+// Decodes UBX-NAV-SAT into out.iTOW / numSvs / sats (other fields untouched). At most gnss::kMaxSats
+// satellites are kept. False if the length does not match the header's count.
+bool decodeNavSat(const uint8_t* payload, size_t len, gnss::Sky& out);
+// Decodes UBX-NAV-DOP into out's gDOP..hDOP (other fields untouched).
+bool decodeNavDop(const uint8_t* payload, size_t len, gnss::Sky& out);
 
 // Builds a complete frame (sync, header, payload, checksum) into out. Returns
 // the frame length, or 0 if out is too small.

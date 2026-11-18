@@ -159,6 +159,35 @@ bool decodeNavPvt(const uint8_t* p, size_t len, gnss::Pvt& d) {
   return true;
 }
 
+bool decodeNavSat(const uint8_t* p, size_t len, gnss::Sky& d) {
+  if (len < kNavSatHeaderLen) return false;
+  const int n = p[5];
+  if (len != kNavSatHeaderLen + n * kNavSatBlockLen) return false;
+  d.iTOW = u32(p);
+  d.numSvs = n < gnss::kMaxSats ? n : gnss::kMaxSats;
+  for (int i = 0; i < d.numSvs; i++) {
+    const uint8_t* b = p + kNavSatHeaderLen + i * kNavSatBlockLen;
+    gnss::Sat& s = d.sats[i];
+    s.gnssId = b[0];
+    s.svId = b[1];
+    s.cno = b[2];
+    s.elev = static_cast<int8_t>(b[3]);
+    s.azim = static_cast<int16_t>(u16(b + 4));
+    s.used = (u32(b + 8) & 0x08) != 0;  // flags bit 3: svUsed
+  }
+  return true;
+}
+
+bool decodeNavDop(const uint8_t* p, size_t len, gnss::Sky& d) {
+  if (len < kNavDopLen) return false;
+  d.gDOP = u16(p + 4);
+  d.pDOP = u16(p + 6);
+  d.tDOP = u16(p + 8);
+  d.vDOP = u16(p + 10);
+  d.hDOP = u16(p + 12);
+  return true;
+}
+
 size_t buildFrame(uint8_t cls, uint8_t id, const uint8_t* payload, size_t len, uint8_t* out,
                   size_t outSize) {
   if (len > 0xFFFF || outSize < len + kFrameOverhead) return 0;
