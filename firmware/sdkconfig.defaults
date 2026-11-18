@@ -15,8 +15,12 @@ CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
 # log_0001_01.csv is not an 8.3 name
 CONFIG_FATFS_LFN_HEAP=y
 
-# Power management: dynamic frequency scaling between LOGBO_CPU_MIN_MHZ and this
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+# Power management: dynamic frequency scaling between LOGBO_CPU_MIN_MHZ and this. Not 240: on the ESP32 a
+# switch between 240 and 80 / 160 MHz turns the PLL off for a moment, so the GNSS UART (which holds the APB
+# frequency, see components/gnss) would keep the CPU at 240 MHz all the time. 160 <-> 80 keeps the PLL.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+# GNSS UART: keep receiving while the cache is off for a flash write (see components/gnss)
+CONFIG_UART_ISR_IN_IRAM=y
 CONFIG_PM_ENABLE=y
 # 1 kHz tick: the IMU and GNSS tasks run at 200 / 25 Hz
 CONFIG_FREERTOS_HZ=1000

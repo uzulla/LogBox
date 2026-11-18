@@ -124,6 +124,17 @@
 </section>
 
 <section>
+  <h2 id="bl_title">画面の明るさ</h2>
+  <p class="hint">暗くすると電池が長持ちします。本体でも A（左）/ C（右）ボタンの長押しで暗く / 明るくできます。設定は保存されます。</p>
+  <div class="row">
+    <span aria-hidden="true">暗い</span>
+    <input type="range" id="bl_level" min="1" max="5" step="1" value="5" disabled style="width:200px" aria-labelledby="bl_title">
+    <span aria-hidden="true">明るい</span>
+    <span id="bl_msg" class="muted"></span>
+  </div>
+</section>
+
+<section>
   <h2>本体</h2>
   <div class="row">
     <button id="reboot" disabled>再起動</button>
@@ -159,6 +170,9 @@ const write = (c, text) => gatt(() => c.writeValueWithResponse(enc.encode(text))
 const CONTROLS = ['disconnect', 'refresh', 'rec_start', 'rec_stop', 'setwifi', 'clearwifi', 'radio_save', 'mag_start', 'mag_done', 'mag_cancel', 'mag_clear', 'reboot'];
 function setConnected(on) {
   for (const id of CONTROLS) $(id).disabled = !on;
+  // 明るさは、この接続で現在値を読めてから有効にする(refreshBacklight)
+  $('bl_level').disabled = true;
+  $('bl_msg').textContent = on ? '読み込み中…' : '';
   $('connect').disabled = on || !navigator.bluetooth;
   $('connstate').textContent = on ? `接続中: ${device.name || ''}` : '未接続';
   $('connstate').className = on ? 'ok' : 'muted';
@@ -186,6 +200,8 @@ $('connect').onclick = async () => {
     await tick();
     await refreshWifi().catch(e => log(`接続先の一覧を読めません(古いファームウェア?): ${e.message}`));
     if (ch.ctrl) await refreshRadio().catch(e => log(`無線設定を読めません: ${e.message}`));
+    if (ch.ctrl) await refreshBacklight().catch(e => log(`画面の明るさを読めません: ${e.message}`));
+    else $('bl_msg').textContent = 'このファームウェアは明るさの設定に対応していません';
   } catch (e) {
     log(`接続失敗: ${e.message}`);
   }
@@ -238,11 +254,12 @@ async function tick() {
   }
   if ($('auto').checked && device?.gatt?.connected) timer = setTimeout(tick, lastMag?.collecting ? 500 : 2000);
 }
-// 「更新」は状態に加えて、接続先の一覧と無線の設定も読み直す
+// 「更新」は状態に加えて、接続先の一覧と無線・画面の明るさの設定も読み直す(明るさは本体のボタンでも変わる)
 $('refresh').onclick = async () => {
   await tick();
   try { await refreshWifi(); wifiListStale = false; } catch (e) { log(`接続先の一覧を読めません: ${e.message}`); }
   if (ch.ctrl) await refreshRadio().catch(e => log(`無線設定を読めません: ${e.message}`));
+  if (ch.ctrl) await refreshBacklight().catch(e => log(`画面の明るさを読めません: ${e.message}`));
 };
 let wifiListStale = false; // 保存後に一覧を読み直せなかった(「更新」で読み直すまで警告を残す)
 $('auto').onchange = () => { if ($('auto').checked) tick(); };
@@ -413,6 +430,48 @@ $('radio_save').onclick = async () => {
     $('radio_msg').textContent = reread
       ? `失敗: ${e.message}(一部だけ保存された可能性があります。上のチェックは本体に保存されている値です)`
       : `失敗: ${e.message}(本体に保存された値を確認できませんでした。上のチェックは本体の値と違う可能性があります。「更新」で読み直してください)`;
+  }
+};
+
+// ---- 画面の明るさ ----
+// blSeq はスライダーを動かすたびに増える。読み出しや書き込みの結果は、その間に新しい操作がなかったときだけ表示する
+let blSeq = 0;
+function showBacklight(level, levels, note = '') {
+  $('bl_level').max = levels;
+  $('bl_level').value = level;
+  $('bl_level').setAttribute('aria-valuetext', `${level} / ${levels}`);
+  $('bl_msg').textContent = `${level} / ${levels}${note}`;
+}
+// 本体の現在値を読んで表示する。読めたら true(スライダーを有効にする)。対応していない / 読めないときは無効のまま
+async function refreshBacklight(note = '') {
+  const seq = blSeq;
+  let b;
+  try {
+    b = (await readJson(ch.ctrl)).backlight;
+  } catch (e) {
+    if (seq === blSeq) { $('bl_level').disabled = true; $('bl_msg').textContent = `現在の明るさを読めません(${e.message})。「更新」で読み直してください`; }
+    throw e;
+  }
+  if (seq !== blSeq) return false; // 読んでいる間に動かされた: その操作の結果を優先する
+  if (!b) { $('bl_level').disabled = true; $('bl_msg').textContent = 'このファームウェアは明るさの設定に対応していません'; return false; }
+  showBacklight(b.level, b.levels, note);
+  $('bl_level').disabled = !device?.gatt?.connected;
+  return true;
+}
+$('bl_level').onchange = async () => {
+  const seq = ++blSeq, v = Number($('bl_level').value), levels = $('bl_level').max;
+  $('bl_msg').textContent = `${v} / ${levels}(設定中…)`;
+  try {
+    await write(ch.ctrl, `bl=${v}`);
+    log(`画面の明るさを ${v} にしました`);
+    if (seq === blSeq) showBacklight(v, levels);
+  } catch (e) {
+    log(`bl=${v}: 失敗: ${e.message}`);
+    if (seq !== blSeq) return;
+    // 本体は保存に失敗しても明るさは変えている。いまの値を読み直して、保存を確認できなかったことと一緒に出す
+    await refreshBacklight(`(保存を確認できません: ${e.message})`).catch(() => {
+      if (seq === blSeq) { $('bl_level').disabled = true; $('bl_msg').textContent = `設定に失敗し、現在の明るさも確認できません(${e.message})。「更新」で読み直してください`; }
+    });
   }
 };
 

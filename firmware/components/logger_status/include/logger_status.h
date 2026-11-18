@@ -69,6 +69,12 @@ void displayStart();
 // Called whenever the state changes (cheap; may be called 25+ times/s).
 void displayUpdate(const Status& s);
 
+// Backlight brightness, 1 (dimmest) .. kBacklightLevels (full). Also changed by holding A (darker) / C
+// (brighter). Saved in NVS; set returns false for a level out of range (or when saving failed: still applied).
+constexpr int kBacklightLevels = 5;
+int displayBacklight();
+bool displaySetBacklight(int level);
+
 // Implemented by the logger, called by the display on a long press: stops the SD recording and makes the
 // card safe to remove; otherwise tries to start recording (after SAFE, SD ERR, or a card inserted late).
 void onLongPress();

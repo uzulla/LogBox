@@ -11,7 +11,8 @@
     uv run tools/ble-config.py wifi-del HomeAP
     uv run tools/ble-config.py mag         # magnetometer calibration state and the AP / STA switches
     uv run tools/ble-config.py ctrl rec=0  # a command: rec=1|0, mag=start|done|cancel|clear, wifi=clear,
-                                           #   ap=0|1, sta=0|1 (from the next boot), reboot=1
+                                           #   ap=0|1, sta=0|1 (from the next boot),
+                                           #   bl=1..5 (backlight), reboot=1
 
 The same service is used by the Web Bluetooth page docs/index.html.
 
