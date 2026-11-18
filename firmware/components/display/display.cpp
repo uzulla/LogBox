@@ -473,7 +473,7 @@ gnss::Sky sky;  // display task's copy
 
 uint16_t cnoColor(uint8_t cno) { return cno >= 35 ? kGreen : cno >= 25 ? kAmber : cno > 0 ? kRed : kDim; }
 
-void drawGnssPage(const Status& s, int64_t now) {
+void drawGnssPage(const Status& s, int64_t now, int rate) {
   char b[32];
   const bool fresh = gnssFresh(s, now);
   const bool pos = fresh && s.fix >= 2;
@@ -547,6 +547,14 @@ void drawGnssPage(const Status& s, int64_t now) {
     textCenter(cx, cy + R - 9, "S", 1, kGray);
     text(cx + R - 8, cy - 9, "E", 1, kGray);
     text(cx - R + 3, cy - 9, "W", 1, kGray);
+    // Update rate in the plot's top corners: measured NAV-PVT per second (right), configured (left).
+    const int set = gnss::stats().rateHz;
+    snprintf(b, sizeof(b), "%d", fresh ? rate : 0);
+    textRight(W - 4, 26, b, 2, !fresh || !set ? kDim : rate * 10 >= set * 9 ? kGreen : rate * 2 >= set ? kAmber : kRed);
+    textRight(W - 4, 42, "HZ", 1, kDim);
+    text(cx - R - 2, 26, "SET", 1, kDim);
+    snprintf(b, sizeof(b), set ? "%dHZ" : "--", set);
+    text(cx - R - 2, 36, b, 1, kGray);
     if (sats) {
       for (int pass = 0; pass < 2; pass++) {  // unused first, so the used ones are drawn on top
         for (int i = 0; i < sky.numSvs; i++) {
@@ -791,7 +799,7 @@ void displayTask(void*) {
       } else if (page == 1) {
         drawGPage(s, now);
       } else if (page == 3) {
-        drawGnssPage(s, now);
+        drawGnssPage(s, now, rate);
       } else {
         drawStatusPage(s, now, rate);
       }
