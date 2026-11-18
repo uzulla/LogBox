@@ -44,8 +44,12 @@ constexpr gpio_num_t kCs = GPIO_NUM_14, kDc = GPIO_NUM_27, kRst = GPIO_NUM_33, k
 constexpr gpio_num_t kBtnA = GPIO_NUM_39, kBtnB = GPIO_NUM_38, kBtnC = GPIO_NUM_37;  // low = pressed
 constexpr int W = 320, H = 240;
 constexpr int kBandH = 24;  // 10 bands per frame, 15 KB per band buffer
-constexpr int kFrameMs = 100;
+constexpr int kFrameMs = 100;  // buttons and state; the screen is redrawn every kRedrawFrames[page] of these
 constexpr int kPages = 4;
+// Redraw every n-th frame per page: G 10 fps, SPEED 5 fps, STATUS / GNSS 2 fps. Drawing is most of the CPU
+// time, and with less of it the CPU spends more time at the lower DFS frequency.
+constexpr int kRedrawFrames[] = {2, 1, 5, 5};
+static_assert(sizeof(kRedrawFrames) / sizeof(kRedrawFrames[0]) == kPages);
 
 // The panel takes big-endian RGB565, so the buffers hold byte-swapped values.
 constexpr uint16_t rgb(int r, int g, int b) {
@@ -779,7 +783,15 @@ void displayTask(void*) {
       rateAt = now;
     }
 
-    for (bandY = 0; bandY < H; bandY += kBandH) {
+    // At once on a page change or when the calibration starts / ends, otherwise at the page's rate.
+    static int drawnPage = -1, sinceDraw = 0;
+    const int drawPage = s.magCollecting ? -2 : page;  // the calibration page: every frame
+    const bool redraw = drawPage != drawnPage || ++sinceDraw >= (s.magCollecting ? 1 : kRedrawFrames[page]);
+    if (redraw) {
+      drawnPage = drawPage;
+      sinceDraw = 0;
+    }
+    for (bandY = 0; redraw && bandY < H; bandY += kBandH) {
       xSemaphoreTake(bufFree, portMAX_DELAY);
       static int which = 0;
       cv = bufs[which];

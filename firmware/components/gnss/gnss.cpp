@@ -283,7 +283,8 @@ void start(int rxPin, int txPin, int rateHz, Callback cb) {
   // The UART driver holds the APB frequency only while sending. On the ESP32 a DFS switch between 240 MHz
   // and 80 MHz turns the PLL off for a moment, which garbles what is being received (measured: ~7 instead
   // of 25 NAV-PVT/s, with checksum errors). The receiver talks all the time, so keep APB at 80 MHz for good.
-  // With a 240 MHz maximum this keeps the CPU at 240 MHz.
+  // With a 240 MHz maximum this keeps the CPU at 240 MHz; with 160 MHz (the default) DFS still goes down to
+  // 80 MHz, as both use the same PLL.
   esp_pm_lock_handle_t pm;
   if (esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "gnss_uart", &pm) == ESP_OK) esp_pm_lock_acquire(pm);
   ESP_ERROR_CHECK(uart_driver_install(kUart, 4096, 0, 0, nullptr, 0));

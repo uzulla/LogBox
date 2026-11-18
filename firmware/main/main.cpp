@@ -1237,6 +1237,7 @@ extern "C" void app_main() {
   }
   ESP_ERROR_CHECK(err);
 
+  // The GNSS UART pins the APB frequency: with a 240 MHz maximum that pins the CPU at 240 MHz (see gnss.cpp).
   esp_pm_config_t pm = {};
   pm.max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
   pm.min_freq_mhz = CONFIG_LOGBO_CPU_MIN_MHZ;
