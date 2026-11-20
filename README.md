@@ -28,7 +28,7 @@ The battery gauge (IP5306) of this unit does not answer on I2C, so `batt` / `cha
 | `gnss` | finds the receiver's baud, configures it with UBX-CFG-VALSET (115200, UBX only, NAV-PVT every epoch, `LOGBO_GNSS_RATE_HZ` = 25 Hz, automotive model), recovers by itself after a receiver reset; falls back to 10 Hz if 25 Hz is rejected or not sustained |
 | `imu` | BMI270 FIFO at 200 Hz (±8 g, ±2000 dps), BMM150 at 25 Hz through the BMI270 aux interface (Bosch compensation, then hard / soft iron calibration from NVS), BMP280 at ~26 Hz |
 | `record` | one record = NAV-PVT + IMU mean over the epoch; CSV row and UDP JSON formatting (host-tested) |
-| `sdlog` | writes the records to `log_<session>_<seq>.csv` on the card |
+| `sdlog` | writes the records to `log_<session>_<seq>_<part>.csv` on the card (a new part every 5 minutes) |
 | `display` | LCD UI and buttons |
 | `main` | wiring, Wi-Fi (STA + soft AP), UDP, BLE config service, serial console |
 
@@ -78,7 +78,10 @@ changing the stack (another base, battery, module). Serial console: `mag-cal`, `
 ### SD log
 
 A FAT32 microSD card present at boot is recorded to at once. The session number counts up per boot (NVS) and skips
-numbers already on the card; flushed every second. No card, an unreadable card, a full card or a write error: no
+numbers already on the card; flushed every second. Files are `log_<session>_<seq>_<part>.csv` (`log_0123_01_001.csv`):
+seq counts the recordings of one boot (stop / start with B), part a new file every 5 minutes, so a power cut or a
+card error can only damage the file being written. `t_ms` counts from the start of the recording and continues across
+the parts, so the parts of one recording can simply be joined in name order. No card, an unreadable card, a full card or a write error: no
 recording, and nothing is retried by itself (hold B).
 
 ```
@@ -148,7 +151,7 @@ uv run tools/ble-config.py ctrl rec=0  # a command (see the ctrl characteristic 
 | Characteristic | UUID | |
 |---|---|---|
 | service | `9b3c0001-4e5f-4a2b-8c6d-2f1e0a7b5c3d` | |
-| status | `9b3c0002-…` | read: `{"device":"logbo-CD0E","uptime_s":120,"free_heap":45000,"gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01.csv","records":3000,"imu":true,"mag":true,"baro":true,"wifi_ssid":"…","wifi_connected":true,"wifi_networks":2,"ip":"192.168.11.38","rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0}` (`rec`: off / rec / saving / safe / failed; `fix` 0 when no fix or no GNSS for 2 s; `wifi_ssid`: the network being tried or joined, `wifi_networks`: how many are saved) |
+| status | `9b3c0002-…` | read: `{"device":"logbo-CD0E","uptime_s":120,"free_heap":45000,"gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01_001.csv","records":3000,"imu":true,"mag":true,"baro":true,"wifi_ssid":"…","wifi_connected":true,"wifi_networks":2,"ip":"192.168.11.38","rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0}` (`rec`: off / rec / saving / safe / failed; `fix` 0 when no fix or no GNSS for 2 s; `wifi_ssid`: the network being tried or joined, `wifi_networks`: how many are saved) |
 | wifi | `9b3c0003-…` | read: `{"networks":[{"ssid":"HomeAP","prio":10,"secured":true},...],"total":3,"next":null,"gen":7}` (no passwords), in pages that fit the 512-byte attribute limit: when `next` is a number, write `list=<next>&gen=<gen>` and read again. Each client has its own position. `gen` changes with every change of the list: a request with an old `gen` is refused (ATT error 0x83) and a later page with a different `gen` means start over from `list=0`. write with response: `ssid=HomeAP&pass=secret&prio=10` (URL-encoded; adds, or updates the same SSID; `pass` may be left out for an open network) or `ssid=HomeAP&del=1`; the older `<ssid>\t<password>` adds with priority 0. Refused with ATT error 0x80 (invalid: SSID 1–32 bytes, password ≤ 64), 0x81 (8 networks already), 0x82 (no such network) |
 | ctrl | `9b3c0004-…` | read: `{"magcal":{…},"radio":{"ap":true,"sta":true,"active":{"ap":true,"sta":true}}}` (radio: saved switches, and those of this boot), magcal = `{"calibrated":true,"field":34.4,"collecting":false,"session":3,"samples":0,"coverage":[0.00,0.00,0.00],"complete":false,"result":1}` (`result` 0 none yet, 1 ok, 2 too short, 3 not rotated, 4 bad fit, 5 not running, 6 not saved). write with response, one command: `rec=1` / `rec=0` (as holding B), `mag=start` / `mag=done` / `mag=cancel` / `mag=clear`, `wifi=clear` (all networks), `ap=0` / `ap=1` / `sta=0` / `sta=1` (next boot), `reboot=1`; an unknown command or a failed `mag=done` gets ATT error 0x13 |
 

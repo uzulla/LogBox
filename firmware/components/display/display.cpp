@@ -448,7 +448,11 @@ void drawStatusPage(const Status& s, int64_t now, int rate) {
 
   // SD
   static const char* const kRec[] = {"NO CARD", "REC", "SAVING", "SAFE", "ERROR"};
-  snprintf(b, sizeof(b), "%s %s", kRec[s.rec < 5 ? s.rec : 0], s.rec ? s.logName : "");
+  // "log_0123_01_001.csv" is too wide for the row: show "0123_01_001".
+  const char* name = s.rec ? s.logName : "";
+  if (!strncmp(name, "log_", 4)) name += 4;
+  const char* dot = strrchr(name, '.');
+  snprintf(b, sizeof(b), "%s %.*s", kRec[s.rec < 5 ? s.rec : 0], dot ? static_cast<int>(dot - name) : 15, name);
   row("SD", b, s.rec == 1 ? kGreen : s.rec == 4 ? kRed : s.rec == 3 ? kCyan : kAmber);
 
   // Wi-Fi

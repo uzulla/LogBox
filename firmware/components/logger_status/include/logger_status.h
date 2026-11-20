@@ -21,7 +21,7 @@ struct Status {
   int apClients;         // stations joined to our soft AP
   uint32_t udpErrors;
   uint8_t rec;           // SD log: 0 none, 1 recording, 2 saving (do not remove), 3 safe to remove, 4 failed
-  char logName[16];      // current / last log file, e.g. "log_0012_01.csv"
+  char logName[24];      // current / last log file, e.g. "log_0012_01_001.csv"
 
   // Sensors
   bool imuOk, magOk, baroOk;

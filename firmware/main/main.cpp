@@ -496,7 +496,7 @@ static void batteryJson(char* buf, size_t size) {
 }
 
 // {"device":"logbo-CD0E","uptime_s":120,"free_heap":45000,
-//  "gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01.csv",
+//  "gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01_001.csv",
 //  "records":3000,"imu":true,"mag":true,"baro":true,"wifi_ssid":"...","wifi_connected":true,"ip":"192.168.11.38",
 //  "rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0,"battery":{"level":75,"charging":false,"full":false}}
 // "battery" is null without the I2C power IC (level: 0/25/50/75/100, the IC's 4 steps).

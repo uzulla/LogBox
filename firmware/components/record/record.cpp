@@ -63,19 +63,19 @@ int64_t unixMicros(const gnss::Pvt& p) {
   return secs * 1000000 + p.nano / 1000;
 }
 
-size_t csvHeader(char* buf, size_t size, unsigned session, unsigned seq) {
+size_t csvHeader(char* buf, size_t size, unsigned session, unsigned seq, unsigned part) {
   const int n = snprintf(
       buf, size,
-      "# session %u seq %u\n"
+      "# session %u seq %u part %u\n"
       "# logbo (M5Stack + GNSS module: NEO-M9N / BMI270 / BMM150 / BMP280). One row per GNSS epoch, "
-      "t_ms = ms since this file was opened\n"
+      "t_ms = ms since the recording started (continues across the 5-minute files of one recording)\n"
       "# lat/lon: deg, alt: m (MSL), speed: km/h, heading: deg (of motion), hacc: m, "
       "acc: G and gyro: deg/s (BMI270 axes, mean over the epoch), batt/charging: not available (empty), "
       "mag: uT (BMM150 axes; mag_cal 1 = hard / soft iron calibrated, 0 = raw), press: hPa, temp: C (BMP280), "
       "head_acc: deg and speed_acc: km/h (receiver's 1-sigma estimates)\n"
       "t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,"
       "batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c,mag_cal,head_acc_deg,speed_acc_kmh\n",
-      session, seq);
+      session, seq, part);
   return n > 0 && static_cast<size_t>(n) < size ? static_cast<size_t>(n) : 0;
 }
 

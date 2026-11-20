@@ -44,8 +44,8 @@ std::vector<std::string> split(const std::string& s) {
 }
 
 std::string headerRow() {
-  char buf[1024];
-  const size_t n = record::csvHeader(buf, sizeof(buf), 12, 1);
+  char buf[record::kMaxCsvHeader];
+  const size_t n = record::csvHeader(buf, sizeof(buf), 12, 1, 3);
   TEST_ASSERT_GREATER_THAN(0, n);
   std::string h(buf, n);
   const size_t at = h.find("t_ms,");
@@ -59,6 +59,12 @@ void test_csv_header_keeps_racebox_columns() {
   const std::string h = headerRow();
   TEST_ASSERT_EQUAL(0, h.rfind("t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,"
                                "gyro_x,gyro_y,gyro_z,batt,charging,", 0));
+}
+
+void test_csv_header_fits() {
+  // sdlog writes the header from a kMaxCsvHeader buffer: a longer header means no log file at all.
+  char buf[record::kMaxCsvHeader];
+  TEST_ASSERT_GREATER_THAN(0, record::csvHeader(buf, sizeof(buf), 9999, 99, 999));
 }
 
 void test_csv_row() {
@@ -156,6 +162,7 @@ void test_json_fits_and_fields() {
 
 void runRecordTests() {
   RUN_TEST(test_csv_header_keeps_racebox_columns);
+  RUN_TEST(test_csv_header_fits);
   RUN_TEST(test_csv_row);
   RUN_TEST(test_csv_row_without_gnss_and_sensors);
   RUN_TEST(test_json_fits_and_fields);

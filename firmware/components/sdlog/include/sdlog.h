@@ -29,10 +29,10 @@ void write(const record::Record& r);
 // Stops recording and unmounts the card (returns at once; state() goes Saving, then Safe).
 void requestStop();
 // From Safe, Failed or Off (no card at boot): mounts the card and records to the next file
-// (log_<session>_02.csv, ...). This is how a card inserted later, or after SD ERR, is used.
+// (log_<session>_02_001.csv, ...). This is how a card inserted later, or after SD ERR, is used.
 void requestStart();
 State state();
-// Name of the current / last log file ("log_0012_01.csv"), "" if none yet.
+// Name of the current / last log file ("log_0012_01_001.csv"), "" if none yet.
 const char* fileName();
 
 // Appends one CSV line (without the newline) to boot_log.csv on the card: the history of boots, resets and
