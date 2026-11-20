@@ -25,7 +25,8 @@ constexpr int kFallbackRateHz = 10;
 // fails again soon after (up to kRetryMaxUs), back to kRetryMinUs once it has held for kRetryHoldUs.
 constexpr int64_t kRetryMinUs = 60000000;
 constexpr int64_t kRetryMaxUs = 600000000;
-constexpr int64_t kRetryHoldUs = 300000000;
+constexpr int64_t kRetryHoldUs = 300000000;  // with a fix
+constexpr int64_t kSettleUs = 10000000;  // the rate is judged only after a fix for this long (reacquisition)
 constexpr int64_t kPvtTimeoutUs = 2000000;  // no NAV-PVT this long -> redetect + reconfigure
 constexpr uint8_t kLayers = ubx::kLayerRam | ubx::kLayerBbr;
 
@@ -244,8 +245,9 @@ void task(void*) {
     constexpr int64_t kWindowUs = 5000000;
     int64_t windowStartUs = esp_timer_get_time();
     uint32_t windowPvt0 = g_pvt, windowNoFix0 = g_pvtNoFix;
-    int64_t retryDelayUs = kRetryMinUs, changedAtUs = windowStartUs, fixSinceUs = 0;
+    int64_t retryDelayUs = kRetryMinUs, changedAtUs = windowStartUs, fixSinceUs = 0, heldUs = 0;
     bool retried = false;  // the current rate is a retry of the requested one after a fallback
+    auto backOff = [&] { retryDelayUs = retryDelayUs * 2 > kRetryMaxUs ? kRetryMaxUs : retryDelayUs * 2; };
     for (;;) {
       pump(100);
       const int64_t now = esp_timer_get_time();
@@ -262,12 +264,12 @@ void task(void*) {
       } else if (!fixSinceUs) {
         fixSinceUs = windowStartUs;
       }
-      if (fixed && g_rate > kFallbackRateHz && got * 10 < want * 7) {
+      const bool settled = fixed && now - fixSinceUs >= kSettleUs;
+      if (settled && g_rate > kFallbackRateHz && got * 10 < want * 7) {
         ESP_LOGW(TAG, "rate not sustained (%lu of %lu NAV-PVT), falling back to %d Hz", (unsigned long)got,
                  (unsigned long)want, kFallbackRateHz);
         if (setRate(kFallbackRateHz)) {
-          // failed again soon after a retry: wait longer before the next one
-          if (retried) retryDelayUs = retryDelayUs * 2 > kRetryMaxUs ? kRetryMaxUs : retryDelayUs * 2;
+          if (retried) backOff();  // failed again soon after a retry: wait longer before the next one
           retried = false;
           changedAtUs = now;
         }
@@ -276,10 +278,13 @@ void task(void*) {
         ESP_LOGI(TAG, "trying %d Hz again", g_requestedRate);
         if (setRate(g_requestedRate)) {
           retried = true;
+          heldUs = 0;
+        } else {
+          backOff();  // rejected or no answer (also when configure() could only set a lower rate)
         }
         changedAtUs = now;
-      } else if (retried && now - changedAtUs >= kRetryHoldUs) {
-        retried = false;  // the retry held: a later fallback starts from the short delay again
+      } else if (retried && fixed && (heldUs += now - windowStartUs) >= kRetryHoldUs) {
+        retried = false;  // the retry held with a fix: a later fallback starts from the short delay again
         retryDelayUs = kRetryMinUs;
       }
       windowStartUs = esp_timer_get_time();
