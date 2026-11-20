@@ -645,6 +645,7 @@ BatSource gBatSource;
 i2c_master_dev_handle_t gBatDev;
 Battery gBattery;
 TickType_t gBatAt;
+bool gBatRead;  // read at least once
 
 uint8_t levelPercent(uint8_t reg) {
   switch (reg & 0xF0) {
@@ -702,14 +703,19 @@ void findBattery() {
   esp_err_t err = probeBat(ina226::kAddr, ina226::kSclHz, &gBatDev);
   if (err == ESP_OK) {
     uint16_t mfg = 0;
-    if (readReg16(gBatDev, ina226::kRegMfg, &mfg) && mfg == ina226::kMfgTi) {
+    const bool read = readReg16(gBatDev, ina226::kRegMfg, &mfg);
+    if (read && mfg == ina226::kMfgTi) {
       gBatSource = BatSource::Ina226;
       ESP_LOGI(TAG, "battery: Dual 16340 base (INA226 at 0x%02x)", ina226::kAddr);
       return;
     }
-    ESP_LOGW(TAG, "battery: device at 0x%02x is not an INA226 (id 0x%04x)", ina226::kAddr, mfg);
     i2c_master_bus_rm_device(gBatDev);
     gBatDev = nullptr;
+    if (!read) {  // it answered the probe: a failed read is tried again, not taken as "some other device"
+      ESP_LOGW(TAG, "battery: INA226 id read failed, trying again");
+      return;
+    }
+    ESP_LOGW(TAG, "battery: device at 0x%02x is not an INA226 (id 0x%04x)", ina226::kAddr, mfg);
   } else if (err != ESP_ERR_NOT_FOUND) {
     ESP_LOGW(TAG, "battery: INA226 probe failed (%s), trying again", esp_err_to_name(err));
     return;
@@ -931,9 +937,12 @@ Battery battery() {
   if (!gBus || !gBatMutex) return {};
   xSemaphoreTake(gBatMutex, portMAX_DELAY);
   const TickType_t now = xTaskGetTickCount();
-  if (gBatSource == BatSource::Unknown || now - gBatAt >= kBatPeriod) {
+  // Every kBatPeriod, also while the source is still unknown: a stuck bus must not cost an I2C probe for every
+  // record (emitRecord calls this at the GNSS rate).
+  if (!gBatRead || now - gBatAt >= kBatPeriod) {
     readBattery();
     gBatAt = now;
+    gBatRead = true;
   }
   const Battery b = gBattery;
   xSemaphoreGive(gBatMutex);

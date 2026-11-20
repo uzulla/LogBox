@@ -484,16 +484,16 @@ static constexpr ble_uuid128_t kConfigCtrl = uuid128(
 static uint8_t ownAddrType;
 static std::atomic<bool> configWindowOpen{true};
 
-// {"level":75,"charging":false,"full":false,"mv":3912,"ma":-180} (mv / ma only with the battery base), or null
-// without a battery source.
-static void batteryJson(char* buf, size_t size) {
+// {"level":75,"charging":false,"full":false,"mv":3912,"ma":-180} (mv / ma only with the battery base and when
+// asked for), or null without a battery source.
+static void batteryJson(char* buf, size_t size, bool withVi) {
   const imu::Battery b = imu::battery();
   if (!b.valid) {
     snprintf(buf, size, "null");
     return;
   }
   char vi[40] = "";
-  if (b.hasVoltage) snprintf(vi, sizeof(vi), ",\"mv\":%u,\"ma\":%d", b.voltageMv, b.currentMa);
+  if (withVi && b.hasVoltage) snprintf(vi, sizeof(vi), ",\"mv\":%u,\"ma\":%d", b.voltageMv, b.currentMa);
   snprintf(buf, size, "{\"level\":%u,\"charging\":%s,\"full\":%s%s}", b.level, b.charging ? "true" : "false",
            b.full ? "true" : "false", vi);
 }
@@ -503,8 +503,9 @@ static void batteryJson(char* buf, size_t size) {
 //  "records":3000,"imu":true,"mag":true,"baro":true,"wifi_ssid":"...","wifi_connected":true,"ip":"192.168.11.38",
 //  "rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0,"battery":{"level":75,"charging":false,"full":false}}
 // "battery" is null without a battery source (level 0..100; the IP5306 only reports 0/25/50/75/100).
-// The earlier members keep their names and meaning (tools/ble-config.py). At most ~490 bytes even with an
-// SSID of 32 characters that all need escaping, below the 512 bytes an attribute may have.
+// The earlier members keep their names and meaning (tools/ble-config.py). At most ~505 bytes even with an
+// SSID of 32 characters that all need escaping, below the 512 bytes an attribute may have: so no "mv" / "ma"
+// here (the UDP status has them).
 static size_t statusJson(char* buf, size_t size) {
   static const char* const kRec[] = {"off", "rec", "saving", "safe", "failed"};
   char target[33];
@@ -524,7 +525,7 @@ static size_t statusJson(char* buf, size_t size) {
   const char* t = "true";
   const char* f = "false";
   char bat[96];
-  batteryJson(bat, sizeof(bat));
+  batteryJson(bat, sizeof(bat), false);
   const imu::Status imuStatus = imu::status();
   const int n = snprintf(
       buf, size,
@@ -1056,7 +1057,7 @@ static void sendStatus() {
   staIpInfo(&ip);
 
   char bat[96];
-  batteryJson(bat, sizeof(bat));
+  batteryJson(bat, sizeof(bat), true);
   char json[record::kMaxUdpPayload + 1];
   const int n = snprintf(
       json, sizeof(json),

@@ -157,10 +157,13 @@ bool openPart(unsigned part) {
   char* path = gPaths[gPathIdx.load() ^ 1];
   snprintf(path, sizeof(gPaths[0]), "%s/log_%04u_%02u_%03u.csv", kMount, static_cast<unsigned>(gSession),
            static_cast<unsigned>(gSeq), part);
-  gPathIdx.store(gPathIdx.load() ^ 1);
   gPart = part;
   gFile = fopen(path, "w");
-  if (!gFile) return false;
+  if (!gFile) {
+    ESP_LOGE(TAG, "cannot create %s (errno %d)", path, errno);
+    return false;  // fileName() keeps the last file that was really written
+  }
+  gPathIdx.store(gPathIdx.load() ^ 1);
   static char buf[4096];
   setvbuf(gFile, buf, _IOFBF, sizeof(buf));
   static char head[record::kMaxCsvHeader];  // the log task / the start task, never both at once
@@ -176,11 +179,16 @@ bool openLog() {
   // Like gmeter: the file name is log_<session>_<seq>; seq counts up each time recording is restarted.
   char path[40];
   struct stat st;
+  // seq is two digits: past 99 nothing is overwritten, recording stops (the next boot has a new session).
   do {
+    if (gSeq >= 99) {
+      ESP_LOGE(TAG, "no free seq left in session %u", static_cast<unsigned>(gSession));
+      return false;
+    }
     gSeq++;
     snprintf(path, sizeof(path), "%s/log_%04u_%02u_001.csv", kMount, static_cast<unsigned>(gSession),
              static_cast<unsigned>(gSeq));
-  } while (stat(path, &st) == 0 && gSeq < 99);
+  } while (stat(path, &st) == 0);
   return openPart(1);
 }
 
@@ -238,7 +246,7 @@ void logTask(void*) {
       if (now - partAt >= kPartUs) {
         partAt = now;
         if (!nextPart()) {
-          ESP_LOGE(TAG, "cannot start %s (errno %d), recording stopped", curPath(), errno);
+          ESP_LOGE(TAG, "cannot start the next part after %s, recording stopped", curPath());
           failed = true;
           break;
         }
@@ -264,7 +272,7 @@ void logTask(void*) {
 // Creates the next log file on the mounted card and starts the writer task.
 bool startLogging() {
   if (!openLog()) {
-    ESP_LOGE(TAG, "cannot create %s (errno %d)", curPath(), errno);
+    ESP_LOGE(TAG, "cannot start recording");
     closeAndUnmount();
     gState = State::Failed;
     return false;
