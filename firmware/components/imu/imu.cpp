@@ -697,9 +697,11 @@ esp_err_t probeBat(uint8_t addr, uint32_t hz, i2c_master_dev_handle_t* dev) {
   return i2c_master_bus_add_device(gBus, &cfg, dev);
 }
 
-// Finds the battery source once. Only "no ACK" (ESP_ERR_NOT_FOUND) counts as absent; a timeout or a failed
-// registration is tried again at the next period.
+// Finds the battery source. Only "no ACK" (ESP_ERR_NOT_FOUND) counts as absent; a timeout or a failed
+// registration is tried again at the next period. With none found (None) it is called again every period too, so
+// a battery base switched on after boot (logger on USB) is picked up without a reboot; it logs only the first time.
 void findBattery() {
+  const bool quiet = gBatSource == BatSource::None;
   esp_err_t err = probeBat(ina226::kAddr, ina226::kSclHz, &gBatDev);
   if (err == ESP_OK) {
     uint16_t mfg = 0;
@@ -715,7 +717,7 @@ void findBattery() {
       ESP_LOGW(TAG, "battery: INA226 id read failed, trying again");
       return;
     }
-    ESP_LOGW(TAG, "battery: device at 0x%02x is not an INA226 (id 0x%04x)", ina226::kAddr, mfg);
+    if (!quiet) ESP_LOGW(TAG, "battery: device at 0x%02x is not an INA226 (id 0x%04x)", ina226::kAddr, mfg);
   } else if (err != ESP_ERR_NOT_FOUND) {
     ESP_LOGW(TAG, "battery: INA226 probe failed (%s), trying again", esp_err_to_name(err));
     return;
@@ -725,8 +727,8 @@ void findBattery() {
     gBatSource = BatSource::Ip5306;
     ESP_LOGI(TAG, "battery: power IC (IP5306, I2C)");
   } else if (err == ESP_ERR_NOT_FOUND) {
+    if (!quiet) ESP_LOGI(TAG, "battery: no battery base, no I2C power IC: no battery level");
     gBatSource = BatSource::None;
-    ESP_LOGI(TAG, "battery: no battery base, no I2C power IC: no battery level");
   } else {
     ESP_LOGW(TAG, "battery: IP5306 probe failed (%s), trying again", esp_err_to_name(err));
   }
@@ -772,7 +774,7 @@ bool readIp5306(Battery* b) {
 }
 
 void readBattery() {
-  if (gBatSource == BatSource::Unknown) findBattery();
+  if (gBatSource == BatSource::Unknown || gBatSource == BatSource::None) findBattery();
   Battery b = {};
   if (gBatSource == BatSource::Ina226) b.valid = readIna226(&b);
   else if (gBatSource == BatSource::Ip5306) b.valid = readIp5306(&b);

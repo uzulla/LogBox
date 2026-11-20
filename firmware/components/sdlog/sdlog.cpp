@@ -1,6 +1,7 @@
 #include "sdlog.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -158,9 +159,15 @@ bool openPart(unsigned part) {
   snprintf(path, sizeof(gPaths[0]), "%s/log_%04u_%02u_%03u.csv", kMount, static_cast<unsigned>(gSession),
            static_cast<unsigned>(gSeq), part);
   gPart = part;
-  gFile = fopen(path, "w");
+  // Never over an existing file (O_EXCL): e.g. after NVS was erased, a session and seq whose _001 is gone may
+  // still have later parts on the card. errno EEXIST then.
+  const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+  gFile = fd >= 0 ? fdopen(fd, "w") : nullptr;
   if (!gFile) {
-    ESP_LOGE(TAG, "cannot create %s (errno %d)", path, errno);
+    const int e = errno;
+    if (fd >= 0) close(fd);
+    ESP_LOGE(TAG, "cannot create %s (errno %d)", path, e);
+    errno = e;
     return false;  // fileName() keeps the last file that was really written
   }
   gPathIdx.store(gPathIdx.load() ^ 1);
@@ -170,6 +177,7 @@ bool openPart(unsigned part) {
   const size_t n = record::csvHeader(head, sizeof(head), gSession, gSeq, part);
   if (!n) {
     ESP_LOGE(TAG, "CSV header does not fit");
+    errno = EINVAL;
     return false;
   }
   return fwrite(head, 1, n, gFile) == n;
@@ -180,7 +188,7 @@ bool openLog() {
   char path[40];
   struct stat st;
   // seq is two digits: past 99 nothing is overwritten, recording stops (the next boot has a new session).
-  do {
+  for (;;) {
     if (gSeq >= 99) {
       ESP_LOGE(TAG, "no free seq left in session %u", static_cast<unsigned>(gSession));
       return false;
@@ -188,8 +196,10 @@ bool openLog() {
     gSeq++;
     snprintf(path, sizeof(path), "%s/log_%04u_%02u_001.csv", kMount, static_cast<unsigned>(gSession),
              static_cast<unsigned>(gSeq));
-  } while (stat(path, &st) == 0);
-  return openPart(1);
+    if (stat(path, &st) == 0) continue;
+    if (openPart(1)) return true;
+    if (errno != EEXIST) return false;
+  }
 }
 
 // Closes the current part and continues in the next one. t_ms keeps counting from the start of the recording.
@@ -201,7 +211,9 @@ bool nextPart() {
     // Out of part numbers: continue in a new recording (seq) rather than stop.
     return openLog();
   }
-  return openPart(gPart + 1);
+  if (openPart(gPart + 1)) return true;
+  // That part already exists (left from an earlier recording with the same name): continue in a new seq.
+  return errno == EEXIST && openLog();
 }
 
 // Returns false on a write error (disk full, card removed, ...).
