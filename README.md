@@ -18,8 +18,14 @@ IMU   BMI270 (+ BMM150 on its aux bus), BMP280  --I2C-->  (mean over the epoch) 
 | I2C (G21/G22) | BMI270 0x69, BMP280 0x76, BMM150 behind the BMI270 (aux I2C) |
 | LCD ILI9342C 320x240 + TF slot | share VSPI (SCLK 18, MOSI 23, MISO 19); CS LCD 14, TF 4; LCD DC 27, RST 33, BL 32 |
 | Buttons | A G39, B G38, C G37 |
+| Base Dual 16340 (optional, under the Gray) | 2 × 16340 cells in parallel; INA226 (I2C 0x45, 20 mΩ shunt) reports the pack voltage and current |
 
-The battery gauge (IP5306) of this unit does not answer on I2C, so `batt` / `charging` stay empty.
+Battery: with the Dual 16340 base stacked, the level is estimated from its pack voltage, referred to a 200 mA load
+(0.45 Ω internal resistance) and smoothed, on a curve measured on this unit: a full pack ran the logger for 7 h 08 min
+at ~208 mA (~1480 mAh) and it stopped at ~3.0 V. 0 % is 3.30 V, about 20 minutes before it stops (a reserve); 100 % lasts for the first half hour or so. Charging /
+full come from the current (on USB the icon shows a bolt instead of the level). Without it the Gray's own
+IP5306 is used if it answers on I2C (this unit's does not); with neither, `batt` / `charging` / `batt_v` stay empty and
+no battery icon is shown.
 
 ## Firmware (`firmware/`, ESP-IDF v6.1, target esp32)
 
@@ -85,14 +91,15 @@ the parts, so the parts of one recording can simply be joined in name order. No 
 recording, and nothing is retried by itself (hold B).
 
 ```
-t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c,mag_cal,head_acc_deg,speed_acc_kmh
+t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c,mag_cal,head_acc_deg,speed_acc_kmh,batt_v
 ```
 
 The columns up to `charging` are those of the RaceBox logs, so [`log-viewer/`](log-viewer/README.md) reads both. acc is
 in G and gyro in deg/s, BMI270 axes (mean over the epoch); mag in uT (BMM150 axes; calibrated when `mag_cal` is 1, raw
 with the base magnets' offset when 0, see above); press in hPa, temp in °C (BMP280, warmed by the stack);
 head_acc / speed_acc: the receiver's accuracy estimates of heading (deg) and speed (km/h), used by log-viewer to pick the
-stretches it trusts for the body heading / slip angle.
+stretches it trusts for the body heading / slip angle. batt in % (integer, like the RaceBox Mini), charging 1 / 0,
+batt_v the pack voltage in V (battery base only), handy for battery-life tests.
 
 ### Soft AP
 
@@ -183,7 +190,7 @@ logbo's extras follow `gyro_dps`.
  "fix":3,"fix_ok":true,"sats":14,"lat":35.6812360,"lon":139.7671250,"latlon_valid":true,
  "alt_wgs_m":79.761,"alt_msl_m":40.500,"h_acc_m":1.200,"v_acc_m":1.836,
  "speed_mps":27.778,"speed_acc_mps":0.208,"heading_deg":90.00000,"heading_acc_deg":0.50000,"heading_valid":true,
- "pdop":1.20,"battery":null,
+ "pdop":1.20,"battery":{"percent":89,"charging":false},
  "g":{"x":-0.300,"y":0.250,"z":0.980},"gyro_dps":{"x":1.00,"y":2.00,"z":-15.50},
  "gnss":true,"vel_ned_mps":{"n":0.000,"e":27.778,"d":0.000},
  "g_sensor":{"x":0.100,"y":-0.250,"z":0.980},"gyro_sensor":{"x":1.50,"y":-2.00,"z":30.25},
@@ -199,7 +206,7 @@ logbo's extras follow `gyro_dps`.
 - `g_sensor` / `gyro_sensor`: the raw BMI270 axes (what the CSV logs).
 - `gnss` is false for IMU-only records (receiver silent); `time` is `null` unless date, time and "fully resolved" are
   valid (nanoseconds, as the bridge); `time_confirmed`: the receiver also confirmed date and time.
-- `heading_valid`: fix OK and moving faster than 0.5 m/s. `battery` is always `null` (not measured).
+- `heading_valid`: fix OK and moving faster than 0.5 m/s. `battery` is `{"percent":89,"charging":false}` (as the bridge for a RaceBox Mini), `null` without a battery source.
   `g_sensor` / `mag_ut` / `press_hpa` are `null` when the sensor is missing.
 - `seq` increments per datagram and restarts from 0 on reboot; gaps mean lost datagrams.
 

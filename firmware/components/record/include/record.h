@@ -23,6 +23,7 @@ struct Record {
   // Only once the gravity reference is known (standing still for ~1 s); until then the JSON has null.
   bool carValid;
   float carG[3], carGyro[3];
+  imu::Battery battery;  // as imu::battery() when the record was made (valid false: no battery source)
 };
 
 // UTC of the PVT as microseconds since the Unix epoch (nano field applied), 0 if not valid.
