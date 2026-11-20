@@ -87,7 +87,7 @@ A FAT32 microSD card present at boot is recorded to at once. The session number 
 numbers already on the card; flushed every second. Files are `log_<session>_<seq>_<part>.csv` (`log_0123_01_001.csv`):
 seq counts the recordings of one boot (stop / start with B), part a new file every 5 minutes, so a power cut or a
 card error can only damage the file being written. `t_ms` counts from the start of the recording and continues across
-the parts, so the parts of one recording can simply be joined in name order. No card, an unreadable card, a full card or a write error: no
+the parts, so the parts of one recording can simply be joined in name order. `python3 tools/join-logs.py "/Volumes/NO NAME"` does that: one `log_<session>_<seq>.csv` per recording, next to the parts. No card, an unreadable card, a full card or a write error: no
 recording, and nothing is retried by itself (hold B).
 
 ```
