@@ -21,6 +21,12 @@ constexpr uint32_t kTargetBaud = 115200;
 constexpr uint32_t kCandidateBauds[] = {38400, 115200, 9600, 230400, 57600, 460800, 921600};
 constexpr int kMaxRateHz = 25;  // NEO-M9N maximum navigation update rate
 constexpr int kFallbackRateHz = 10;
+// After a fallback to 10 Hz the requested rate is tried again after this long with a fix, doubled each time it
+// fails again soon after (up to kRetryMaxUs), back to kRetryMinUs once it has held for kRetryHoldUs.
+constexpr int64_t kRetryMinUs = 60000000;
+constexpr int64_t kRetryMaxUs = 600000000;
+constexpr int64_t kRetryHoldUs = 300000000;  // with a fix
+constexpr int64_t kSettleUs = 10000000;  // the rate is judged only after a fix for this long (reacquisition)
 constexpr int64_t kPvtTimeoutUs = 2000000;  // no NAV-PVT this long -> redetect + reconfigure
 constexpr uint8_t kLayers = ubx::kLayerRam | ubx::kLayerBbr;
 
@@ -35,6 +41,7 @@ uint32_t g_ubxFrames = 0;  // valid UBX frames of any kind (for detection)
 Ack g_ack = Ack::None;
 uint8_t g_ackCls = 0, g_ackId = 0;
 int64_t g_lastPvtUs = 0;
+uint32_t g_pvtNoFix = 0;  // NAV-PVT without a valid fix (the GNSS task only)
 
 std::atomic<uint32_t> g_pvt{0}, g_other{0}, g_bytes{0}, g_ckErr{0}, g_baud{0};
 std::atomic<uint16_t> g_rate{0};
@@ -51,6 +58,7 @@ void handleFrame() {
     if (ubx::decodeNavPvt(g_parser.payload(), g_parser.payloadLen(), pvt)) {
       g_pvt++;
       g_lastPvtUs = esp_timer_get_time();
+      if (!pvt.fixOk()) g_pvtNoFix++;
       if (!pvt.posOk()) {  // a DOP from before the fix was lost must not be shown with the next fix
         taskENTER_CRITICAL(&g_skyLock);
         g_sky.dopAtUs = 0;
@@ -230,12 +238,16 @@ void task(void*) {
     g_configured = true;
     ESP_LOGI(TAG, "configured: %lu baud, %u Hz", (unsigned long)g_baud.load(), g_rate.load());
 
-    // Run: watch for the receiver going silent, and check the achieved rate in
-    // consecutive 5 s windows (a receiver that ACKs 25 Hz but cannot sustain it
-    // once it tracks many satellites is dropped to 10 Hz).
+    // Run: watch for the receiver going silent, and check the achieved rate in consecutive 5 s windows: a
+    // receiver that ACKs 25 Hz but cannot sustain it is dropped to 10 Hz. Only windows with a fix all the way
+    // count: without one (a tunnel, an underpass) the receiver itself sends fewer epochs while it searches,
+    // which says nothing about the rate it can keep. After a fallback the requested rate is tried again later.
     constexpr int64_t kWindowUs = 5000000;
     int64_t windowStartUs = esp_timer_get_time();
-    uint32_t windowPvt0 = g_pvt;
+    uint32_t windowPvt0 = g_pvt, windowNoFix0 = g_pvtNoFix;
+    int64_t retryDelayUs = kRetryMinUs, changedAtUs = windowStartUs, fixSinceUs = 0, heldUs = 0;
+    bool retried = false;  // the current rate is a retry of the requested one after a fallback
+    auto backOff = [&] { retryDelayUs = retryDelayUs * 2 > kRetryMaxUs ? kRetryMaxUs : retryDelayUs * 2; };
     for (;;) {
       pump(100);
       const int64_t now = esp_timer_get_time();
@@ -243,17 +255,41 @@ void task(void*) {
         ESP_LOGW(TAG, "no NAV-PVT for %lld ms, reconfiguring", (now - g_lastPvtUs) / 1000);
         break;
       }
-      if (now - windowStartUs >= kWindowUs) {
-        const uint32_t got = g_pvt - windowPvt0;
-        const uint32_t want = uint32_t((now - windowStartUs) * g_rate / 1000000);
-        if (g_rate > kFallbackRateHz && got * 10 < want * 7) {
-          ESP_LOGW(TAG, "rate not sustained (%lu of %lu NAV-PVT), falling back to %d Hz",
-                   (unsigned long)got, (unsigned long)want, kFallbackRateHz);
-          setRate(kFallbackRateHz);
-        }
-        windowStartUs = now;
-        windowPvt0 = g_pvt;
+      if (now - windowStartUs < kWindowUs) continue;
+      const uint32_t got = g_pvt - windowPvt0;
+      const bool fixed = got > 0 && g_pvtNoFix == windowNoFix0;  // a fix in every epoch of the window
+      const uint32_t want = uint32_t((now - windowStartUs) * g_rate / 1000000);
+      if (!fixed) {
+        fixSinceUs = 0;
+      } else if (!fixSinceUs) {
+        fixSinceUs = windowStartUs;
       }
+      const bool settled = fixed && now - fixSinceUs >= kSettleUs;
+      if (settled && g_rate > kFallbackRateHz && got * 10 < want * 7) {
+        ESP_LOGW(TAG, "rate not sustained (%lu of %lu NAV-PVT), falling back to %d Hz", (unsigned long)got,
+                 (unsigned long)want, kFallbackRateHz);
+        if (setRate(kFallbackRateHz)) {
+          if (retried) backOff();  // failed again soon after a retry: wait longer before the next one
+          retried = false;
+          changedAtUs = now;
+        }
+      } else if (g_rate < g_requestedRate && fixed && now - changedAtUs >= retryDelayUs &&
+                 now - fixSinceUs >= kRetryMinUs) {
+        ESP_LOGI(TAG, "trying %d Hz again", g_requestedRate);
+        if (setRate(g_requestedRate)) {
+          retried = true;
+          heldUs = 0;
+        } else {
+          backOff();  // rejected or no answer (also when configure() could only set a lower rate)
+        }
+        changedAtUs = now;
+      } else if (retried && fixed && (heldUs += now - windowStartUs) >= kRetryHoldUs) {
+        retried = false;  // the retry held with a fix: a later fallback starts from the short delay again
+        retryDelayUs = kRetryMinUs;
+      }
+      windowStartUs = esp_timer_get_time();
+      windowPvt0 = g_pvt;
+      windowNoFix0 = g_pvtNoFix;
     }
   }
 }

@@ -31,7 +31,7 @@ no battery icon is shown.
 
 | component | |
 |---|---|
-| `gnss` | finds the receiver's baud, configures it with UBX-CFG-VALSET (115200, UBX only, NAV-PVT every epoch, `LOGBO_GNSS_RATE_HZ` = 25 Hz, automotive model), recovers by itself after a receiver reset; falls back to 10 Hz if 25 Hz is rejected or not sustained |
+| `gnss` | finds the receiver's baud, configures it with UBX-CFG-VALSET (115200, UBX only, NAV-PVT every epoch, `LOGBO_GNSS_RATE_HZ` = 25 Hz, automotive model), recovers by itself after a receiver reset; falls back to 10 Hz if 25 Hz is rejected or not sustained while it has a fix (fewer epochs without a fix, e.g. in a tunnel, do not count), and tries 25 Hz again after a minute with a fix (then after longer if it fails again) |
 | `imu` | BMI270 FIFO at 200 Hz (±8 g, ±2000 dps), BMM150 at 25 Hz through the BMI270 aux interface (Bosch compensation, then hard / soft iron calibration from NVS), BMP280 at ~26 Hz |
 | `record` | one record = NAV-PVT + IMU mean over the epoch; CSV row and UDP JSON formatting (host-tested) |
 | `sdlog` | writes the records to `log_<session>_<seq>_<part>.csv` on the card (a new part every 5 minutes) |
@@ -87,7 +87,7 @@ A FAT32 microSD card present at boot is recorded to at once. The session number 
 numbers already on the card; flushed every second. Files are `log_<session>_<seq>_<part>.csv` (`log_0123_01_001.csv`):
 seq counts the recordings of one boot (stop / start with B), part a new file every 5 minutes, so a power cut or a
 card error can only damage the file being written. `t_ms` counts from the start of the recording and continues across
-the parts, so the parts of one recording can simply be joined in name order. No card, an unreadable card, a full card or a write error: no
+the parts, so the parts of one recording can simply be joined in name order. `python3 tools/join-logs.py "/Volumes/NO NAME"` does that: one `log_<session>_<seq>.csv` per recording, next to the parts. No card, an unreadable card, a full card or a write error: no
 recording, and nothing is retried by itself (hold B).
 
 ```
