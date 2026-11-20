@@ -218,14 +218,23 @@ void drawRec(int x, int y, int rec, int scale, int64_t now) {
 
 bool gnssFresh(const Status& s, int64_t now) { return s.gnssAtUs && now - s.gnssAtUs < 2000000; }
 
-// Battery: 4 segments (the IC reports 25 % steps). Cyan while charging, green when full on USB.
+// Battery: 4 segments (rounded to the nearest 25 %), white / amber / red. On USB (charging, or full) the body is
+// filled, cyan / green, with a lightning bolt: the voltage-based level means little while charging.
 void drawBattery(int x, int y, const Status& s) {
+  const bool usb = s.batteryCharging || s.batteryFull;
   const uint16_t c = s.batteryFull ? kGreen : s.batteryCharging ? kCyan
                      : s.batteryLevel <= 25 ? kRed : s.batteryLevel <= 50 ? kAmber : kWhite;
   fillRect(x, y, 22, 12, c);          // outline
   fillRect(x + 1, y + 1, 20, 10, kBar);
   fillRect(x + 22, y + 3, 2, 6, c);   // terminal
-  const int seg = s.batteryLevel / 25;
+  if (usb) {
+    fillRect(x + 2, y + 2, 18, 8, c);
+    // Bolt, 8 rows (one run of pixels per row: start column, length), drawn in the bar colour.
+    static const uint8_t kBolt[8][2] = {{6, 3}, {5, 3}, {4, 3}, {3, 7}, {5, 6}, {5, 3}, {4, 3}, {3, 2}};
+    for (int r = 0; r < 8; r++) fillRect(x + 4 + kBolt[r][0], y + 2 + r, kBolt[r][1], 1, kBar);
+    return;
+  }
+  const int seg = (s.batteryLevel + 12) / 25;
   for (int i = 0; i < 4; i++) fillRect(x + 2 + i * 5, y + 2, 4, 8, i < seg ? c : kTrack);
 }
 
@@ -448,7 +457,11 @@ void drawStatusPage(const Status& s, int64_t now, int rate) {
 
   // SD
   static const char* const kRec[] = {"NO CARD", "REC", "SAVING", "SAFE", "ERROR"};
-  snprintf(b, sizeof(b), "%s %s", kRec[s.rec < 5 ? s.rec : 0], s.rec ? s.logName : "");
+  // "log_0123_01_001.csv" is too wide for the row: show "0123_01_001".
+  const char* name = s.rec ? s.logName : "";
+  if (!strncmp(name, "log_", 4)) name += 4;
+  const char* dot = strrchr(name, '.');
+  snprintf(b, sizeof(b), "%s %.*s", kRec[s.rec < 5 ? s.rec : 0], dot ? static_cast<int>(dot - name) : 15, name);
   row("SD", b, s.rec == 1 ? kGreen : s.rec == 4 ? kRed : s.rec == 3 ? kCyan : kAmber);
 
   // Wi-Fi
@@ -467,8 +480,15 @@ void drawStatusPage(const Status& s, int64_t now, int rate) {
     row("WIFI", b, kWhite);
   }
 
-  // Battery (only with the I2C power IC)
-  if (s.batteryValid) {
+  // Battery (only with the battery base or the I2C power IC)
+  if (s.batteryValid && s.batteryMv) {
+    // On USB the word replaces the level (voltage-based, meaningless while charging): "CHG 4.21V +108mA".
+    char lv[8];
+    snprintf(lv, sizeof(lv), "%d%%", s.batteryLevel);
+    snprintf(b, sizeof(b), "%s %.2fV %+dmA", s.batteryFull ? "FULL" : s.batteryCharging ? "CHG" : lv,
+             s.batteryMv / 1000.0, s.batteryMa);
+    row("BAT", b, s.batteryCharging || s.batteryFull ? kCyan : s.batteryLevel <= 25 ? kRed : kWhite);
+  } else if (s.batteryValid) {
     snprintf(b, sizeof(b), "%d%%%s", s.batteryLevel, s.batteryFull ? " FULL" : s.batteryCharging ? " CHARGING" : "");
     row("BAT", b, s.batteryCharging || s.batteryFull ? kCyan : s.batteryLevel <= 25 ? kRed : kWhite);
   }

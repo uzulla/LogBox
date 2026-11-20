@@ -606,7 +606,7 @@ bool storeCalib(const MagCal* cal) {
   return err == ESP_OK;
 }
 
-// ---- Battery (IP5306 power IC of the M5Stack Gray) ----
+// ---- Battery: the Dual 16340 Battery Base (INA226) if stacked, else the Gray's IP5306 (if it has I2C) ----
 
 namespace ip5306 {
 constexpr uint8_t kAddr = 0x75;
@@ -614,13 +614,38 @@ constexpr uint32_t kSclHz = 100000;  // the IC is specified for 100 kHz (it runs
 constexpr uint8_t kRegRead0 = 0x70;  // bit 3: charging
 constexpr uint8_t kRegRead1 = 0x71;  // bit 3: charge full
 constexpr uint8_t kRegLevel = 0x78;  // bits 7..4: level, inverted thermometer code
-constexpr TickType_t kPeriod = pdMS_TO_TICKS(5000);
 }  // namespace ip5306
 
+// INA226 of the M5Stack Base Dual 16340 (two 16340 cells in parallel): bus voltage = the pack's BAT output,
+// current through a 20 mOhm shunt. On the M-Bus internal I2C (G21 / G22) at 0x45.
+namespace ina226 {
+constexpr uint8_t kAddr = 0x45;
+constexpr uint32_t kSclHz = 400000;
+constexpr uint8_t kRegConfig = 0x00, kRegShunt = 0x01, kRegBus = 0x02, kRegMfg = 0xFE;
+constexpr uint16_t kMfgTi = 0x5449;  // "TI"
+// Average of 16, 1.1 ms bus and shunt conversions, continuous shunt + bus: a new value every ~35 ms.
+constexpr uint16_t kConfig = 0x4000 | (2 << 9) | (4 << 6) | (4 << 3) | 7;
+constexpr float kShuntOhm = 0.02f;
+constexpr float kBusLsbV = 1.25e-3f, kShuntLsbV = 2.5e-6f;
+// Positive current = into the pack (charging). Measured on the unit: on USB the shunt reading is negative.
+constexpr float kChargeSign = -1.0f;
+constexpr float kChargingMa = 30;   // more than this into the pack: charging
+constexpr float kFullV = 4.10f;     // on USB with (almost) no current at this voltage: full
+// The pack's internal resistance (measured: ~0.45 Ohm). The current swings between ~130 and ~250 mA (Wi-Fi), so
+// the voltage is referred to 200 mA before looking up the level, then smoothed.
+constexpr float kPackOhm = 0.45f;
+constexpr float kRefA = 0.2f;
+constexpr float kSmooth = 0.2f;  // per read (every 2 s): about 10 s
+}  // namespace ina226
+
+constexpr TickType_t kBatPeriod = pdMS_TO_TICKS(2000);
+
+enum class BatSource : uint8_t { Unknown, None, Ina226, Ip5306 };
+BatSource gBatSource;
 i2c_master_dev_handle_t gBatDev;
-bool gBatProbed;
 Battery gBattery;
 TickType_t gBatAt;
+bool gBatRead;  // read at least once
 
 uint8_t levelPercent(uint8_t reg) {
   switch (reg & 0xF0) {
@@ -632,35 +657,128 @@ uint8_t levelPercent(uint8_t reg) {
   }
 }
 
-void readBattery() {
-  if (!gBatProbed) {
-    // Only "no ACK" (ESP_ERR_NOT_FOUND) means there is no I2C power IC; a timeout or a failed registration is
-    // tried again at the next period.
-    const esp_err_t err = i2c_master_probe(gBus, ip5306::kAddr, kTimeoutMs);
-    if (err == ESP_OK) {
-      i2c_device_config_t cfg = {};
-      cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-      cfg.device_address = ip5306::kAddr;
-      cfg.scl_speed_hz = ip5306::kSclHz;
-      if (i2c_master_bus_add_device(gBus, &cfg, &gBatDev) != ESP_OK) gBatDev = nullptr;
-      gBatProbed = gBatDev != nullptr;
-    } else {
-      gBatProbed = err == ESP_ERR_NOT_FOUND;
+// Remaining charge of the Dual 16340 base under the logger's load, from the pack voltage referred to 200 mA (see
+// readIna226). Measured on 2026-11-20 (full to empty at ~208 mA: 7 h 08 min, ~1480 mAh, stopped at ~3.0 V):
+// 0 % is 3.30 V, about 20 minutes before the logger stops (a reserve); 100 % is cut at 3.92 V, so a full pack
+// shows 100 % for the first half hour or so; in between, the share of the running time left until 3.30 V (the
+// upper half is less certain: one cell had a poor contact for the first 2.5 h of that run).
+uint8_t packPercent(float v) {
+  static const float kV[] = {3.30f, 3.36f, 3.39f, 3.45f, 3.50f, 3.535f, 3.58f, 3.63f,
+                             3.65f, 3.70f, 3.75f, 3.80f, 3.86f, 3.92f};
+  static const uint8_t kP[] = {0, 4, 7, 14, 22, 29, 36, 43, 51, 58, 66, 74, 86, 100};
+  constexpr int n = sizeof(kV) / sizeof(kV[0]);
+  if (v <= kV[0]) return 0;
+  if (v >= kV[n - 1]) return 100;
+  int i = 1;
+  while (v > kV[i]) i++;
+  return static_cast<uint8_t>(kP[i - 1] + (kP[i] - kP[i - 1]) * (v - kV[i - 1]) / (kV[i] - kV[i - 1]) + 0.5f);
+}
+
+bool readReg16(i2c_master_dev_handle_t dev, uint8_t reg, uint16_t* val) {
+  uint8_t b[2];
+  if (!readRegs(dev, reg, b, 2)) return false;
+  *val = static_cast<uint16_t>(b[0] << 8 | b[1]);
+  return true;
+}
+
+bool writeReg16(i2c_master_dev_handle_t dev, uint8_t reg, uint16_t val) {
+  const uint8_t b[3] = {reg, static_cast<uint8_t>(val >> 8), static_cast<uint8_t>(val)};
+  return i2c_master_transmit(dev, b, sizeof(b), kTimeoutMs) == ESP_OK;
+}
+
+// ESP_OK: registered in *dev. ESP_ERR_NOT_FOUND: nothing answers at addr.
+esp_err_t probeBat(uint8_t addr, uint32_t hz, i2c_master_dev_handle_t* dev) {
+  const esp_err_t err = i2c_master_probe(gBus, addr, kTimeoutMs);
+  if (err != ESP_OK) return err;
+  i2c_device_config_t cfg = {};
+  cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+  cfg.device_address = addr;
+  cfg.scl_speed_hz = hz;
+  return i2c_master_bus_add_device(gBus, &cfg, dev);
+}
+
+// Finds the battery source. Only "no ACK" (ESP_ERR_NOT_FOUND) counts as absent; a timeout or a failed
+// registration is tried again at the next period. With none found (None) it is called again every period too, so
+// a battery base switched on after boot (logger on USB) is picked up without a reboot; it logs only the first time.
+void findBattery() {
+  const bool quiet = gBatSource == BatSource::None;
+  esp_err_t err = probeBat(ina226::kAddr, ina226::kSclHz, &gBatDev);
+  if (err == ESP_OK) {
+    uint16_t mfg = 0;
+    const bool read = readReg16(gBatDev, ina226::kRegMfg, &mfg);
+    if (read && mfg == ina226::kMfgTi) {
+      gBatSource = BatSource::Ina226;
+      ESP_LOGI(TAG, "battery: Dual 16340 base (INA226 at 0x%02x)", ina226::kAddr);
+      return;
     }
-    if (gBatProbed) ESP_LOGI(TAG, "power IC (IP5306, I2C): %s", gBatDev ? "found" : "not found, no battery level");
-    else ESP_LOGW(TAG, "power IC (IP5306): probe failed (%s), trying again", esp_err_to_name(err));
+    i2c_master_bus_rm_device(gBatDev);
+    gBatDev = nullptr;
+    if (!read) {  // it answered the probe: a failed read is tried again, not taken as "some other device"
+      ESP_LOGW(TAG, "battery: INA226 id read failed, trying again");
+      return;
+    }
+    if (!quiet) ESP_LOGW(TAG, "battery: device at 0x%02x is not an INA226 (id 0x%04x)", ina226::kAddr, mfg);
+  } else if (err != ESP_ERR_NOT_FOUND) {
+    ESP_LOGW(TAG, "battery: INA226 probe failed (%s), trying again", esp_err_to_name(err));
+    return;
   }
-  if (!gBatDev) return;
+  err = probeBat(ip5306::kAddr, ip5306::kSclHz, &gBatDev);
+  if (err == ESP_OK) {
+    gBatSource = BatSource::Ip5306;
+    ESP_LOGI(TAG, "battery: power IC (IP5306, I2C)");
+  } else if (err == ESP_ERR_NOT_FOUND) {
+    if (!quiet) ESP_LOGI(TAG, "battery: no battery base, no I2C power IC: no battery level");
+    gBatSource = BatSource::None;
+  } else {
+    ESP_LOGW(TAG, "battery: IP5306 probe failed (%s), trying again", esp_err_to_name(err));
+  }
+}
+
+bool readIna226(Battery* b) {
+  uint16_t cfg, shunt, bus;
+  if (!readReg16(gBatDev, ina226::kRegConfig, &cfg)) return false;
+  // The config is lost when the base loses power (switched off with the logger on USB): set it again.
+  if ((cfg & 0x7FFF) != (ina226::kConfig & 0x7FFF) && !writeReg16(gBatDev, ina226::kRegConfig, ina226::kConfig)) {
+    return false;
+  }
+  if (!readReg16(gBatDev, ina226::kRegShunt, &shunt) || !readReg16(gBatDev, ina226::kRegBus, &bus)) return false;
+  const float v = bus * ina226::kBusLsbV;
+  const float ma = ina226::kChargeSign * static_cast<int16_t>(shunt) * ina226::kShuntLsbV / ina226::kShuntOhm * 1000;
+  b->voltageMv = static_cast<uint16_t>(v * 1000 + 0.5f);
+  b->currentMa = static_cast<int16_t>(ma >= 0 ? ma + 0.5f : ma - 0.5f);
+  b->charging = ma > ina226::kChargingMa;
+  b->full = !b->charging && ma > -ina226::kChargingMa && v >= ina226::kFullV;
+  static float vRef;  // smoothed, referred to 200 mA; 0 = start again (on USB, or the first read)
+  if (b->charging || b->full) {
+    vRef = 0;
+    b->level = 100;  // shown as charging / full, not as a level
+  } else {
+    const float now = v + (-ma / 1000 - ina226::kRefA) * ina226::kPackOhm;
+    vRef = vRef ? vRef + (now - vRef) * ina226::kSmooth : now;
+    b->level = packPercent(vRef);
+  }
+  b->hasVoltage = true;
+  return true;
+}
+
+bool readIp5306(Battery* b) {
   uint8_t r0, r1, lv;
   if (!readRegs(gBatDev, ip5306::kRegRead0, &r0, 1) || !readRegs(gBatDev, ip5306::kRegRead1, &r1, 1) ||
       !readRegs(gBatDev, ip5306::kRegLevel, &lv, 1)) {
-    gBattery.valid = false;
-    return;
+    return false;
   }
-  gBattery.valid = true;
-  gBattery.full = r1 & 0x08;
-  gBattery.charging = (r0 & 0x08) && !gBattery.full;
-  gBattery.level = levelPercent(lv);
+  b->full = r1 & 0x08;
+  b->charging = (r0 & 0x08) && !b->full;
+  b->level = levelPercent(lv);
+  return true;
+}
+
+void readBattery() {
+  if (gBatSource == BatSource::Unknown || gBatSource == BatSource::None) findBattery();
+  Battery b = {};
+  if (gBatSource == BatSource::Ina226) b.valid = readIna226(&b);
+  else if (gBatSource == BatSource::Ip5306) b.valid = readIp5306(&b);
+  gBattery = b;
 }
 
 }  // namespace
@@ -821,9 +939,12 @@ Battery battery() {
   if (!gBus || !gBatMutex) return {};
   xSemaphoreTake(gBatMutex, portMAX_DELAY);
   const TickType_t now = xTaskGetTickCount();
-  if (!gBatProbed || now - gBatAt >= ip5306::kPeriod) {
+  // Every kBatPeriod, also while the source is still unknown: a stuck bus must not cost an I2C probe for every
+  // record (emitRecord calls this at the GNSS rate).
+  if (!gBatRead || now - gBatAt >= kBatPeriod) {
     readBattery();
     gBatAt = now;
+    gBatRead = true;
   }
   const Battery b = gBattery;
   xSemaphoreGive(gBatMutex);

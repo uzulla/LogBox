@@ -44,8 +44,8 @@ std::vector<std::string> split(const std::string& s) {
 }
 
 std::string headerRow() {
-  char buf[1024];
-  const size_t n = record::csvHeader(buf, sizeof(buf), 12, 1);
+  char buf[record::kMaxCsvHeader];
+  const size_t n = record::csvHeader(buf, sizeof(buf), 12, 1, 3);
   TEST_ASSERT_GREATER_THAN(0, n);
   std::string h(buf, n);
   const size_t at = h.find("t_ms,");
@@ -59,6 +59,12 @@ void test_csv_header_keeps_racebox_columns() {
   const std::string h = headerRow();
   TEST_ASSERT_EQUAL(0, h.rfind("t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,"
                                "gyro_x,gyro_y,gyro_z,batt,charging,", 0));
+}
+
+void test_csv_header_fits() {
+  // sdlog writes the header from a kMaxCsvHeader buffer: a longer header means no log file at all.
+  char buf[record::kMaxCsvHeader];
+  TEST_ASSERT_GREATER_THAN(0, record::csvHeader(buf, sizeof(buf), 9999, 99, 999));
 }
 
 void test_csv_row() {
@@ -76,7 +82,9 @@ void test_csv_row() {
   TEST_ASSERT_EQUAL_STRING("100.00", f[7].c_str());  // 27.778 m/s
   TEST_ASSERT_EQUAL_STRING("0.980", f[12].c_str());
   TEST_ASSERT_EQUAL_STRING("30.25", f[15].c_str());
-  TEST_ASSERT_EQUAL_STRING("", f[16].c_str());  // batt
+  TEST_ASSERT_EQUAL_STRING("", f[16].c_str());  // batt: no battery source
+  TEST_ASSERT_EQUAL_STRING("", f[17].c_str());  // charging
+  TEST_ASSERT_EQUAL_STRING("", f[26].c_str());  // batt_v
   TEST_ASSERT_EQUAL_STRING("1013.25", f[21].c_str());
   TEST_ASSERT_EQUAL_STRING("1", f[23].c_str());  // mag_cal
   TEST_ASSERT_EQUAL_STRING("1.23", f[24].c_str());  // head_acc_deg
@@ -98,6 +106,26 @@ void test_csv_row_without_gnss_and_sensors() {
   TEST_ASSERT_EQUAL_STRING("", f[24].c_str());  // no GNSS
 }
 
+void test_csv_row_battery() {
+  record::Record r = sample();
+  r.battery = {true, 87, true, false, true, 4056, 120};
+  char buf[512];
+  const size_t n = record::csvRow(r, 234'567, buf, sizeof(buf));
+  TEST_ASSERT_GREATER_THAN(0, n);
+  const auto f = split(std::string(buf, n - 1));
+  TEST_ASSERT_EQUAL(split(headerRow()).size(), f.size());
+  TEST_ASSERT_EQUAL_STRING("87", f[16].c_str());
+  TEST_ASSERT_EQUAL_STRING("1", f[17].c_str());
+  TEST_ASSERT_EQUAL_STRING("1013.25", f[21].c_str());
+  TEST_ASSERT_EQUAL_STRING("4.056", f[26].c_str());
+  // The power IC only: no voltage
+  r.battery = {true, 75, false, false, false, 0, 0};
+  const auto g = split(std::string(buf, record::csvRow(r, 234'567, buf, sizeof(buf)) - 1));
+  TEST_ASSERT_EQUAL_STRING("75", g[16].c_str());
+  TEST_ASSERT_EQUAL_STRING("0", g[17].c_str());
+  TEST_ASSERT_EQUAL_STRING("", g[26].c_str());
+}
+
 void test_json_fits_and_fields() {
   char buf[record::kMaxUdpPayload + 1];
   record::Record r = sample();
@@ -116,6 +144,11 @@ void test_json_fits_and_fields() {
   TEST_ASSERT_TRUE(strstr(buf, "\"g\":{\"x\":-0.300,\"y\":0.250,\"z\":0.980},\"gyro_dps\":{\"x\":1.00,\"y\":2.00,\"z\":-15.50}") != nullptr);
   TEST_ASSERT_TRUE(strstr(buf, "\"gnss\":true,\"vel_ned_mps\":{") != nullptr);
   TEST_ASSERT_TRUE(strstr(buf, "\"g_sensor\":{\"x\":0.100,") != nullptr);
+  TEST_ASSERT_TRUE(strstr(buf, "\"pdop\":") != nullptr && strstr(buf, "\"battery\":null,") != nullptr);
+  r.battery = {true, 89, false, false, true, 4000, -150};
+  TEST_ASSERT_GREATER_THAN(0, record::toJson(r, 7, "logbo-06FA", buf, sizeof(buf)));
+  TEST_ASSERT_TRUE(strstr(buf, "\"battery\":{\"percent\":89,\"charging\":false},") != nullptr);
+  r.battery = {};
   // Car axes unknown yet: null (osd-feed hides the ball)
   r.carValid = false;
   TEST_ASSERT_GREATER_THAN(0, record::toJson(r, 7, "logbo-06FA", buf, sizeof(buf)));
@@ -156,7 +189,9 @@ void test_json_fits_and_fields() {
 
 void runRecordTests() {
   RUN_TEST(test_csv_header_keeps_racebox_columns);
+  RUN_TEST(test_csv_header_fits);
   RUN_TEST(test_csv_row);
   RUN_TEST(test_csv_row_without_gnss_and_sensors);
+  RUN_TEST(test_csv_row_battery);
   RUN_TEST(test_json_fits_and_fields);
 }

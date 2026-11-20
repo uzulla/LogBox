@@ -1,6 +1,7 @@
 #include "sdlog.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -32,6 +33,9 @@ constexpr int kBusMaxTransfer = 320 * 48 * 2;  // one LCD band (the display draw
 constexpr const char* kMount = "/sdcard";
 constexpr int kQueueLen = 64;  // about 2.5 s at 25 Hz
 constexpr int64_t kFlushUs = 1000000;
+// A new file every 5 minutes: a power cut or a card error can then only damage the file being written.
+constexpr int64_t kPartUs = 5LL * 60 * 1000000;
+constexpr unsigned kMaxPart = 999;
 
 using Item = record::Record;
 
@@ -40,9 +44,13 @@ std::atomic<bool> gStop{false};
 QueueHandle_t gQueue;
 sdmmc_card_t* gCard;
 FILE* gFile;
-char gPath[40];
+// The current path, double buffered: fileName() is read by other tasks while the log task names the next
+// part, so the new name goes to the other buffer and is published by switching gPathIdx.
+char gPaths[2][40];
+std::atomic<int> gPathIdx{0};
 uint32_t gSession;
 uint32_t gSeq;
+uint32_t gPart;
 std::atomic<bool> gStarting{false};
 uint32_t gDropped;
 
@@ -132,7 +140,7 @@ uint32_t pickSession() {
     char path[48];
     for (int tries = 0; tries < 1000; tries++) {
       sess = sess % 9999 + 1;
-      snprintf(path, sizeof(path), "%s/log_%04u_01.csv", kMount, static_cast<unsigned>(sess));
+      snprintf(path, sizeof(path), "%s/log_%04u_01_001.csv", kMount, static_cast<unsigned>(sess));
       struct stat st;
       if (stat(path, &st) != 0) break;
     }
@@ -143,21 +151,69 @@ uint32_t pickSession() {
   return sess ? sess : 1;
 }
 
-bool openLog() {
-  // Like gmeter: the file name is log_<session>_<seq>; seq counts up each time recording is restarted.
-  struct stat st;
-  do {
-    gSeq++;
-    snprintf(gPath, sizeof(gPath), "%s/log_%04u_%02u.csv", kMount, static_cast<unsigned>(gSession),
-             static_cast<unsigned>(gSeq));
-  } while (stat(gPath, &st) == 0 && gSeq < 99);
-  gFile = fopen(gPath, "w");
-  if (!gFile) return false;
+const char* curPath() { return gPaths[gPathIdx.load()]; }
+
+// Opens log_<session>_<seq>_<part>.csv (part counts the 5-minute files of one recording) and writes the header.
+bool openPart(unsigned part) {
+  char* path = gPaths[gPathIdx.load() ^ 1];
+  snprintf(path, sizeof(gPaths[0]), "%s/log_%04u_%02u_%03u.csv", kMount, static_cast<unsigned>(gSession),
+           static_cast<unsigned>(gSeq), part);
+  gPart = part;
+  // Never over an existing file (O_EXCL): e.g. after NVS was erased, a session and seq whose _001 is gone may
+  // still have later parts on the card. errno EEXIST then.
+  const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+  gFile = fd >= 0 ? fdopen(fd, "w") : nullptr;
+  if (!gFile) {
+    const int e = errno;
+    if (fd >= 0) close(fd);
+    ESP_LOGE(TAG, "cannot create %s (errno %d)", path, e);
+    errno = e;
+    return false;  // fileName() keeps the last file that was really written
+  }
+  gPathIdx.store(gPathIdx.load() ^ 1);
   static char buf[4096];
   setvbuf(gFile, buf, _IOFBF, sizeof(buf));
-  char head[768];
-  const size_t n = record::csvHeader(head, sizeof(head), gSession, gSeq);
-  return n && fwrite(head, 1, n, gFile) == n;
+  static char head[record::kMaxCsvHeader];  // the log task / the start task, never both at once
+  const size_t n = record::csvHeader(head, sizeof(head), gSession, gSeq, part);
+  if (!n) {
+    ESP_LOGE(TAG, "CSV header does not fit");
+    errno = EINVAL;
+    return false;
+  }
+  return fwrite(head, 1, n, gFile) == n;
+}
+
+bool openLog() {
+  // Like gmeter: the file name is log_<session>_<seq>; seq counts up each time recording is restarted.
+  char path[40];
+  struct stat st;
+  // seq is two digits: past 99 nothing is overwritten, recording stops (the next boot has a new session).
+  for (;;) {
+    if (gSeq >= 99) {
+      ESP_LOGE(TAG, "no free seq left in session %u", static_cast<unsigned>(gSession));
+      return false;
+    }
+    gSeq++;
+    snprintf(path, sizeof(path), "%s/log_%04u_%02u_001.csv", kMount, static_cast<unsigned>(gSession),
+             static_cast<unsigned>(gSeq));
+    if (stat(path, &st) == 0) continue;
+    if (openPart(1)) return true;
+    if (errno != EEXIST) return false;
+  }
+}
+
+// Closes the current part and continues in the next one. t_ms keeps counting from the start of the recording.
+bool nextPart() {
+  const bool closed = fclose(gFile) == 0;
+  gFile = nullptr;
+  if (!closed) return false;
+  if (gPart >= kMaxPart) {
+    // Out of part numbers: continue in a new recording (seq) rather than stop.
+    return openLog();
+  }
+  if (openPart(gPart + 1)) return true;
+  // That part already exists (left from an earlier recording with the same name): continue in a new seq.
+  return errno == EEXIST && openLog();
 }
 
 // Returns false on a write error (disk full, card removed, ...).
@@ -179,7 +235,7 @@ void closeAndUnmount() {
 
 void logTask(void*) {
   const int64_t startUs = esp_timer_get_time();
-  int64_t flushedAt = startUs;
+  int64_t flushedAt = startUs, partAt = startUs;
   bool failed = false;
   Item it;
   while (!gStop) {
@@ -199,6 +255,15 @@ void logTask(void*) {
         failed = true;
         break;
       }
+      if (now - partAt >= kPartUs) {
+        partAt = now;
+        if (!nextPart()) {
+          ESP_LOGE(TAG, "cannot start the next part after %s, recording stopped", curPath());
+          failed = true;
+          break;
+        }
+        ESP_LOGI(TAG, "recording to %s", curPath());
+      }
     }
   }
   if (failed) {
@@ -212,14 +277,14 @@ void logTask(void*) {
   }
   closeAndUnmount();
   if (!failed) gState = State::Safe;
-  ESP_LOGI(TAG, "%s %s (%lu dropped)", failed ? "failed:" : "saved", gPath, static_cast<unsigned long>(gDropped));
+  ESP_LOGI(TAG, "%s %s (%lu dropped)", failed ? "failed:" : "saved", curPath(), static_cast<unsigned long>(gDropped));
   vTaskDelete(nullptr);
 }
 
 // Creates the next log file on the mounted card and starts the writer task.
 bool startLogging() {
   if (!openLog()) {
-    ESP_LOGE(TAG, "cannot create %s", gPath);
+    ESP_LOGE(TAG, "cannot start recording");
     closeAndUnmount();
     gState = State::Failed;
     return false;
@@ -229,7 +294,7 @@ bool startLogging() {
   while (xQueueReceive(gQueue, &stale, 0) == pdTRUE) {}
   gState = State::Rec;
   xTaskCreate(logTask, "sdlog", 6144, nullptr, 4, nullptr);
-  ESP_LOGI(TAG, "recording to %s", gPath);
+  ESP_LOGI(TAG, "recording to %s", curPath());
   return true;
 }
 
@@ -289,8 +354,9 @@ void event(const char* line) {
 }
 
 const char* fileName() {
-  const char* slash = strrchr(gPath, '/');
-  return slash ? slash + 1 : gPath;
+  const char* path = curPath();
+  const char* slash = strrchr(path, '/');
+  return slash ? slash + 1 : path;
 }
 
 }  // namespace sdlog

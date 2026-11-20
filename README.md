@@ -18,8 +18,14 @@ IMU   BMI270 (+ BMM150 on its aux bus), BMP280  --I2C-->  (mean over the epoch) 
 | I2C (G21/G22) | BMI270 0x69, BMP280 0x76, BMM150 behind the BMI270 (aux I2C) |
 | LCD ILI9342C 320x240 + TF slot | share VSPI (SCLK 18, MOSI 23, MISO 19); CS LCD 14, TF 4; LCD DC 27, RST 33, BL 32 |
 | Buttons | A G39, B G38, C G37 |
+| Base Dual 16340 (optional, under the Gray) | 2 × 16340 cells in parallel; INA226 (I2C 0x45, 20 mΩ shunt) reports the pack voltage and current |
 
-The battery gauge (IP5306) of this unit does not answer on I2C, so `batt` / `charging` stay empty.
+Battery: with the Dual 16340 base stacked, the level is estimated from its pack voltage, referred to a 200 mA load
+(0.45 Ω internal resistance) and smoothed, on a curve measured on this unit: a full pack ran the logger for 7 h 08 min
+at ~208 mA (~1480 mAh) and it stopped at ~3.0 V. 0 % is 3.30 V, about 20 minutes before it stops (a reserve); 100 % lasts for the first half hour or so. Charging /
+full come from the current (on USB the icon shows a bolt instead of the level). Without it the Gray's own
+IP5306 is used if it answers on I2C (this unit's does not); with neither, `batt` / `charging` / `batt_v` stay empty and
+no battery icon is shown.
 
 ## Firmware (`firmware/`, ESP-IDF v6.1, target esp32)
 
@@ -28,7 +34,7 @@ The battery gauge (IP5306) of this unit does not answer on I2C, so `batt` / `cha
 | `gnss` | finds the receiver's baud, configures it with UBX-CFG-VALSET (115200, UBX only, NAV-PVT every epoch, `LOGBO_GNSS_RATE_HZ` = 25 Hz, automotive model), recovers by itself after a receiver reset; falls back to 10 Hz if 25 Hz is rejected or not sustained |
 | `imu` | BMI270 FIFO at 200 Hz (±8 g, ±2000 dps), BMM150 at 25 Hz through the BMI270 aux interface (Bosch compensation, then hard / soft iron calibration from NVS), BMP280 at ~26 Hz |
 | `record` | one record = NAV-PVT + IMU mean over the epoch; CSV row and UDP JSON formatting (host-tested) |
-| `sdlog` | writes the records to `log_<session>_<seq>.csv` on the card |
+| `sdlog` | writes the records to `log_<session>_<seq>_<part>.csv` on the card (a new part every 5 minutes) |
 | `display` | LCD UI and buttons |
 | `main` | wiring, Wi-Fi (STA + soft AP), UDP, BLE config service, serial console |
 
@@ -78,18 +84,22 @@ changing the stack (another base, battery, module). Serial console: `mag-cal`, `
 ### SD log
 
 A FAT32 microSD card present at boot is recorded to at once. The session number counts up per boot (NVS) and skips
-numbers already on the card; flushed every second. No card, an unreadable card, a full card or a write error: no
+numbers already on the card; flushed every second. Files are `log_<session>_<seq>_<part>.csv` (`log_0123_01_001.csv`):
+seq counts the recordings of one boot (stop / start with B), part a new file every 5 minutes, so a power cut or a
+card error can only damage the file being written. `t_ms` counts from the start of the recording and continues across
+the parts, so the parts of one recording can simply be joined in name order. No card, an unreadable card, a full card or a write error: no
 recording, and nothing is retried by itself (hold B).
 
 ```
-t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c,mag_cal,head_acc_deg,speed_acc_kmh
+t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c,mag_cal,head_acc_deg,speed_acc_kmh,batt_v
 ```
 
 The columns up to `charging` are those of the RaceBox logs, so [`log-viewer/`](log-viewer/README.md) reads both. acc is
 in G and gyro in deg/s, BMI270 axes (mean over the epoch); mag in uT (BMM150 axes; calibrated when `mag_cal` is 1, raw
 with the base magnets' offset when 0, see above); press in hPa, temp in °C (BMP280, warmed by the stack);
 head_acc / speed_acc: the receiver's accuracy estimates of heading (deg) and speed (km/h), used by log-viewer to pick the
-stretches it trusts for the body heading / slip angle.
+stretches it trusts for the body heading / slip angle. batt in % (integer, like the RaceBox Mini), charging 1 / 0,
+batt_v the pack voltage in V (battery base only), handy for battery-life tests.
 
 ### Soft AP
 
@@ -148,7 +158,7 @@ uv run tools/ble-config.py ctrl rec=0  # a command (see the ctrl characteristic 
 | Characteristic | UUID | |
 |---|---|---|
 | service | `9b3c0001-4e5f-4a2b-8c6d-2f1e0a7b5c3d` | |
-| status | `9b3c0002-…` | read: `{"device":"logbo-CD0E","uptime_s":120,"free_heap":45000,"gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01.csv","records":3000,"imu":true,"mag":true,"baro":true,"wifi_ssid":"…","wifi_connected":true,"wifi_networks":2,"ip":"192.168.11.38","rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0}` (`rec`: off / rec / saving / safe / failed; `fix` 0 when no fix or no GNSS for 2 s; `wifi_ssid`: the network being tried or joined, `wifi_networks`: how many are saved) |
+| status | `9b3c0002-…` | read: `{"device":"logbo-CD0E","uptime_s":120,"free_heap":45000,"gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01_001.csv","records":3000,"imu":true,"mag":true,"baro":true,"wifi_ssid":"…","wifi_connected":true,"wifi_networks":2,"ip":"192.168.11.38","rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0}` (`rec`: off / rec / saving / safe / failed; `fix` 0 when no fix or no GNSS for 2 s; `wifi_ssid`: the network being tried or joined, `wifi_networks`: how many are saved) |
 | wifi | `9b3c0003-…` | read: `{"networks":[{"ssid":"HomeAP","prio":10,"secured":true},...],"total":3,"next":null,"gen":7}` (no passwords), in pages that fit the 512-byte attribute limit: when `next` is a number, write `list=<next>&gen=<gen>` and read again. Each client has its own position. `gen` changes with every change of the list: a request with an old `gen` is refused (ATT error 0x83) and a later page with a different `gen` means start over from `list=0`. write with response: `ssid=HomeAP&pass=secret&prio=10` (URL-encoded; adds, or updates the same SSID; `pass` may be left out for an open network) or `ssid=HomeAP&del=1`; the older `<ssid>\t<password>` adds with priority 0. Refused with ATT error 0x80 (invalid: SSID 1–32 bytes, password ≤ 64), 0x81 (8 networks already), 0x82 (no such network) |
 | ctrl | `9b3c0004-…` | read: `{"magcal":{…},"radio":{"ap":true,"sta":true,"active":{"ap":true,"sta":true}}}` (radio: saved switches, and those of this boot), magcal = `{"calibrated":true,"field":34.4,"collecting":false,"session":3,"samples":0,"coverage":[0.00,0.00,0.00],"complete":false,"result":1}` (`result` 0 none yet, 1 ok, 2 too short, 3 not rotated, 4 bad fit, 5 not running, 6 not saved). write with response, one command: `rec=1` / `rec=0` (as holding B), `mag=start` / `mag=done` / `mag=cancel` / `mag=clear`, `wifi=clear` (all networks), `ap=0` / `ap=1` / `sta=0` / `sta=1` (next boot), `reboot=1`; an unknown command or a failed `mag=done` gets ATT error 0x13 |
 
@@ -180,7 +190,7 @@ logbo's extras follow `gyro_dps`.
  "fix":3,"fix_ok":true,"sats":14,"lat":35.6812360,"lon":139.7671250,"latlon_valid":true,
  "alt_wgs_m":79.761,"alt_msl_m":40.500,"h_acc_m":1.200,"v_acc_m":1.836,
  "speed_mps":27.778,"speed_acc_mps":0.208,"heading_deg":90.00000,"heading_acc_deg":0.50000,"heading_valid":true,
- "pdop":1.20,"battery":null,
+ "pdop":1.20,"battery":{"percent":89,"charging":false},
  "g":{"x":-0.300,"y":0.250,"z":0.980},"gyro_dps":{"x":1.00,"y":2.00,"z":-15.50},
  "gnss":true,"vel_ned_mps":{"n":0.000,"e":27.778,"d":0.000},
  "g_sensor":{"x":0.100,"y":-0.250,"z":0.980},"gyro_sensor":{"x":1.50,"y":-2.00,"z":30.25},
@@ -196,7 +206,7 @@ logbo's extras follow `gyro_dps`.
 - `g_sensor` / `gyro_sensor`: the raw BMI270 axes (what the CSV logs).
 - `gnss` is false for IMU-only records (receiver silent); `time` is `null` unless date, time and "fully resolved" are
   valid (nanoseconds, as the bridge); `time_confirmed`: the receiver also confirmed date and time.
-- `heading_valid`: fix OK and moving faster than 0.5 m/s. `battery` is always `null` (not measured).
+- `heading_valid`: fix OK and moving faster than 0.5 m/s. `battery` is `{"percent":89,"charging":false}` (as the bridge for a RaceBox Mini), `null` without a battery source.
   `g_sensor` / `mag_ut` / `press_hpa` are `null` when the sensor is missing.
 - `seq` increments per datagram and restarts from 0 on reboot; gaps mean lost datagrams.
 

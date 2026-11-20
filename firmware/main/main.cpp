@@ -484,24 +484,28 @@ static constexpr ble_uuid128_t kConfigCtrl = uuid128(
 static uint8_t ownAddrType;
 static std::atomic<bool> configWindowOpen{true};
 
-// {"level":75,"charging":false,"full":false}, or null without the I2C power IC.
-static void batteryJson(char* buf, size_t size) {
+// {"level":75,"charging":false,"full":false,"mv":3912,"ma":-180} (mv / ma only with the battery base and when
+// asked for), or null without a battery source.
+static void batteryJson(char* buf, size_t size, bool withVi) {
   const imu::Battery b = imu::battery();
   if (!b.valid) {
     snprintf(buf, size, "null");
     return;
   }
-  snprintf(buf, size, "{\"level\":%u,\"charging\":%s,\"full\":%s}", b.level, b.charging ? "true" : "false",
-           b.full ? "true" : "false");
+  char vi[40] = "";
+  if (withVi && b.hasVoltage) snprintf(vi, sizeof(vi), ",\"mv\":%u,\"ma\":%d", b.voltageMv, b.currentMa);
+  snprintf(buf, size, "{\"level\":%u,\"charging\":%s,\"full\":%s%s}", b.level, b.charging ? "true" : "false",
+           b.full ? "true" : "false", vi);
 }
 
 // {"device":"logbo-CD0E","uptime_s":120,"free_heap":45000,
-//  "gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01.csv",
+//  "gnss":{"configured":true,"messages":1234,"baud":115200,"fix":3,"sats":14},"rec":"rec","log":"log_0012_01_001.csv",
 //  "records":3000,"imu":true,"mag":true,"baro":true,"wifi_ssid":"...","wifi_connected":true,"ip":"192.168.11.38",
 //  "rssi":-40,"ap_ssid":"LOGBO-XXXXXX","ap_clients":0,"battery":{"level":75,"charging":false,"full":false}}
-// "battery" is null without the I2C power IC (level: 0/25/50/75/100, the IC's 4 steps).
-// The earlier members keep their names and meaning (tools/ble-config.py). At most ~490 bytes even with an
-// SSID of 32 characters that all need escaping, below the 512 bytes an attribute may have.
+// "battery" is null without a battery source (level 0..100; the IP5306 only reports 0/25/50/75/100).
+// The earlier members keep their names and meaning (tools/ble-config.py). At most ~505 bytes even with an
+// SSID of 32 characters that all need escaping, below the 512 bytes an attribute may have: so no "mv" / "ma"
+// here (the UDP status has them).
 static size_t statusJson(char* buf, size_t size) {
   static const char* const kRec[] = {"off", "rec", "saving", "safe", "failed"};
   char target[33];
@@ -520,8 +524,8 @@ static size_t statusJson(char* buf, size_t size) {
   const bool fresh = lastPvtUs && esp_timer_get_time() - lastPvtUs < 2000000;
   const char* t = "true";
   const char* f = "false";
-  char bat[48];
-  batteryJson(bat, sizeof(bat));
+  char bat[96];
+  batteryJson(bat, sizeof(bat), false);
   const imu::Status imuStatus = imu::status();
   const int n = snprintf(
       buf, size,
@@ -907,6 +911,8 @@ static void publishStatus(const record::Record* r) {
     ds.batteryLevel = copy.batteryLevel = bat.level;
     ds.batteryCharging = copy.batteryCharging = bat.charging;
     ds.batteryFull = copy.batteryFull = bat.full;
+    ds.batteryMv = copy.batteryMv = bat.hasVoltage ? bat.voltageMv : 0;
+    ds.batteryMa = copy.batteryMa = bat.currentMa;
     ds.rssi = copy.rssi;
     memcpy(ds.ip, copy.ip, sizeof(ds.ip));
     memcpy(ds.ssid, copy.ssid, sizeof(ds.ssid));
@@ -926,6 +932,7 @@ static void emitRecord(const gnss::Pvt* pvt) {
   r.hasPvt = pvt != nullptr;
   if (pvt) r.pvt = *pvt;
   imu::takeAverage(r.imu);
+  r.battery = imu::battery();
   // Car axes (gravity learnt while standing still): for the UDP "g" / "gyro_dps" and the display's G circle
   static carframe::Estimator car;
   if (r.imu.n) {
@@ -1049,8 +1056,8 @@ static void sendStatus() {
   esp_netif_ip_info_t ip = {};
   staIpInfo(&ip);
 
-  char bat[48];
-  batteryJson(bat, sizeof(bat));
+  char bat[96];
+  batteryJson(bat, sizeof(bat), true);
   char json[record::kMaxUdpPayload + 1];
   const int n = snprintf(
       json, sizeof(json),

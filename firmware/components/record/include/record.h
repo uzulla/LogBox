@@ -23,6 +23,7 @@ struct Record {
   // Only once the gravity reference is known (standing still for ~1 s); until then the JSON has null.
   bool carValid;
   float carG[3], carGyro[3];
+  imu::Battery battery;  // as imu::battery() when the record was made (valid false: no battery source)
 };
 
 // UTC of the PVT as microseconds since the Unix epoch (nano field applied), 0 if not valid.
@@ -30,7 +31,9 @@ int64_t unixMicros(const gnss::Pvt& p);
 
 // CSV: `#` comment lines and the header row (ends with '\n'), then one row per record.
 // The columns up to `charging` are the same as the RaceBox bridge logs, so log-viewer reads both.
-size_t csvHeader(char* buf, size_t size, unsigned session, unsigned seq);
+// Returns the length written, 0 if it did not fit (kMaxCsvHeader always does; a host test checks it).
+constexpr size_t kMaxCsvHeader = 1024;
+size_t csvHeader(char* buf, size_t size, unsigned session, unsigned seq, unsigned part);
 // Returns the length written (row ends with '\n'), 0 if it did not fit.
 size_t csvRow(const Record& r, int64_t startUs, char* buf, size_t size);
 
