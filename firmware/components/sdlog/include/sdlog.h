@@ -18,7 +18,7 @@ enum class State : uint8_t {
   Rec,     // recording
   Saving,  // stop requested, flushing; do not remove the card
   Safe,    // stopped and unmounted; the card may be removed
-  Failed,  // disk full or write error; recording stopped
+  Failed,  // disk full or write error, and mounting the card again did not help; recording stopped
 };
 
 // Initialises the SPI bus (shared with the LCD, so call it before logger::displayStart()), mounts the
@@ -34,6 +34,11 @@ void requestStart();
 State state();
 // Name of the current / last log file ("log_0012_01_001.csv"), "" if none yet.
 const char* fileName();
+// The last write error ("flush errno=5 log_0148_01_011.csv"); returns how many there were so far (0: none).
+// After one, recording goes on in the next part if the card can be mounted again (a few tries), else Failed.
+uint32_t lastFailure(char* buf, size_t size);
+// Write errors since recording was last started (by init or requestStart); the display shows REC in amber.
+uint32_t recErrors();
 
 // Appends one CSV line (without the newline) to boot_log.csv on the card: the history of boots, resets and
 // sensor trouble, kept apart from the log files. Columns: see kEventHeader in sdlog.cpp. The card is only

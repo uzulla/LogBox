@@ -33,6 +33,13 @@ constexpr int kBusMaxTransfer = 320 * 48 * 2;  // one LCD band (the display draw
 constexpr const char* kMount = "/sdcard";
 constexpr int kQueueLen = 64;  // about 2.5 s at 25 Hz
 constexpr int64_t kFlushUs = 1000000;
+// After a write error (a card that lost contact for a moment, e.g. from vibration) the card is mounted again and
+// recording goes on in the next part of the same seq, so the parts still join into one file (t_ms shows the gap):
+// up to kResumeTries attempts, kResumeFirstMs apart and doubling; the count starts over once recording has run for
+// kResumeResetUs.
+constexpr int kResumeTries = 7;
+constexpr int kResumeFirstMs = 250;  // 0.25, 0.5, 1, 2, 4, 8, 16 s: ~32 s in all
+constexpr int64_t kResumeResetUs = 60000000;
 // A new file every 5 minutes: a power cut or a card error can then only damage the file being written.
 constexpr int64_t kPartUs = 5LL * 60 * 1000000;
 constexpr unsigned kMaxPart = 999;
@@ -52,6 +59,26 @@ uint32_t gSession;
 uint32_t gSeq;
 uint32_t gPart;
 std::atomic<bool> gStarting{false};
+// The last write error, for boot_log.csv (main notes a new one): "flush errno=5 log_0148_01_011.csv"
+char gFailure[64];
+uint32_t gFailures;
+std::atomic<uint32_t> gRecErrors{0};  // write errors since recording was started (resumed after each)
+int gFailureErrno;  // the log task only
+portMUX_TYPE gFailureLock = portMUX_INITIALIZER_UNLOCKED;
+
+void noteFailure(const char* what, int err) {
+  char s[sizeof(gFailure)];
+  const char* path = gPaths[gPathIdx.load()];
+  const char* slash = strrchr(path, '/');
+  snprintf(s, sizeof(s), "%s errno=%d %s", what, err, slash ? slash + 1 : path);
+  ESP_LOGE(TAG, "%s", s);
+  gFailureErrno = err;
+  taskENTER_CRITICAL(&gFailureLock);
+  memcpy(gFailure, s, sizeof(s));
+  gFailures++;
+  gRecErrors++;
+  taskEXIT_CRITICAL(&gFailureLock);
+}
 uint32_t gDropped;
 
 // boot_log.csv: lines from event(), written by the log task (the only one that touches the card).
@@ -202,11 +229,8 @@ bool openLog() {
   }
 }
 
-// Closes the current part and continues in the next one. t_ms keeps counting from the start of the recording.
-bool nextPart() {
-  const bool closed = fclose(gFile) == 0;
-  gFile = nullptr;
-  if (!closed) return false;
+// Opens the next part of this recording (after the 5-minute rotation, or a resume after a write error).
+bool openNextPart() {
   if (gPart >= kMaxPart) {
     // Out of part numbers: continue in a new recording (seq) rather than stop.
     return openLog();
@@ -214,6 +238,13 @@ bool nextPart() {
   if (openPart(gPart + 1)) return true;
   // That part already exists (left from an earlier recording with the same name): continue in a new seq.
   return errno == EEXIST && openLog();
+}
+
+// Closes the current part and continues in the next one. t_ms keeps counting from the start of the recording.
+bool nextPart() {
+  const bool closed = fclose(gFile) == 0;
+  gFile = nullptr;
+  return closed && openNextPart();
 }
 
 // Returns false on a write error (disk full, card removed, ...).
@@ -233,51 +264,95 @@ void closeAndUnmount() {
   unmountCard();
 }
 
-void logTask(void*) {
-  const int64_t startUs = esp_timer_get_time();
-  int64_t flushedAt = startUs, partAt = startUs;
-  bool failed = false;
-  Item it;
+// Writes rows until a stop request (returns true) or a write error (false, noted).
+bool record(int64_t startUs) {
+  int64_t flushedAt = esp_timer_get_time(), partAt = flushedAt;
+  static Item it;  // the log task only; kept off its stack, which also has to mount the card on a resume
   while (!gStop) {
-    if (xQueueReceive(gQueue, &it, pdMS_TO_TICKS(200)) == pdTRUE) {
-      if (!writeRow(it, startUs)) {
-        ESP_LOGE(TAG, "write failed (errno %d), recording stopped", errno);
-        failed = true;
-        break;
-      }
+    if (xQueueReceive(gQueue, &it, pdMS_TO_TICKS(200)) == pdTRUE && !writeRow(it, startUs)) {
+      noteFailure("write", errno);
+      return false;
     }
     const int64_t now = esp_timer_get_time();
     if (now - flushedAt >= kFlushUs) {
       flushedAt = now;
       if (!writeEvents()) ESP_LOGW(TAG, "cannot write %s (errno %d)", kEventFile, errno);
       if (!flushFile()) {
-        ESP_LOGE(TAG, "flush failed (errno %d), recording stopped", errno);
-        failed = true;
-        break;
+        noteFailure("flush", errno);
+        return false;
       }
       if (now - partAt >= kPartUs) {
         partAt = now;
         if (!nextPart()) {
-          ESP_LOGE(TAG, "cannot start the next part after %s, recording stopped", curPath());
-          failed = true;
-          break;
+          noteFailure("next part", errno);
+          return false;
         }
         ESP_LOGI(TAG, "recording to %s", curPath());
       }
     }
   }
-  if (failed) {
-    gState = State::Failed;
-  } else {
-    while (xQueueReceive(gQueue, &it, 0) == pdTRUE) {  // what was queued before the stop
-      if (!writeRow(it, startUs)) break;
-    }
-    flushFile();
-    writeEvents();
-  }
+  return true;
+}
+
+// After a write error: mounts the card again and continues in the next part. False if it gave up (or a stop
+// was requested meanwhile). State stays Rec (records keep queueing; beyond the queue they are dropped).
+// The card is left unmounted then, so boot_log.csv (the rec_error line) is written here whenever the card mounts:
+// otherwise the reason of a recording that ended this way would only be kept in RAM.
+bool resume(int* tries) {
   closeAndUnmount();
-  if (!failed) gState = State::Safe;
-  ESP_LOGI(TAG, "%s %s (%lu dropped)", failed ? "failed:" : "saved", curPath(), static_cast<unsigned long>(gDropped));
+  for (int delayMs = kResumeFirstMs << *tries; *tries < kResumeTries; delayMs *= 2) {
+    ++*tries;
+    for (int waited = 0; waited < delayMs && !gStop; waited += 50) vTaskDelay(pdMS_TO_TICKS(50));
+    if (gStop) {
+      if (mountCard()) {
+        if (!writeEvents()) ESP_LOGW(TAG, "cannot write %s (errno %d)", kEventFile, errno);
+        unmountCard();
+      }
+      return false;
+    }
+    if (mountCard()) {
+      if (!writeEvents()) ESP_LOGW(TAG, "cannot write %s (errno %d)", kEventFile, errno);
+      if (openNextPart()) {
+        ESP_LOGW(TAG, "resumed in %s (attempt %d, stack left %u bytes)", curPath(), *tries,
+                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+        return true;
+      }
+      closeAndUnmount();
+    }
+  }
+  ESP_LOGE(TAG, "card not usable after %d attempts, recording stopped", *tries);
+  return false;
+}
+
+void logTask(void*) {
+  // t_ms counts from here, across the 5-minute parts and the parts after a resume
+  const int64_t startUs = esp_timer_get_time();
+  int tries = 0;
+  bool failed = false;
+  for (;;) {
+    const int64_t since = esp_timer_get_time();
+    if (record(startUs)) break;
+    if (esp_timer_get_time() - since >= kResumeResetUs) tries = 0;  // it had been fine for a while
+    // a full card stays full: no point in mounting it again
+    if (gFailureErrno == ENOSPC || !resume(&tries)) {
+      if (gFailureErrno == ENOSPC) closeAndUnmount();
+      failed = !gStop;  // a stop requested while waiting: just stopped (the card is already unmounted)
+      if (failed) gState = State::Failed;
+      else gState = State::Safe;
+      ESP_LOGI(TAG, "%s (%lu dropped)", failed ? "failed" : "stopped", static_cast<unsigned long>(gDropped));
+      vTaskDelete(nullptr);
+      return;
+    }
+  }
+  static Item it;  // the log task only; kept off its stack, which also has to mount the card on a resume
+  while (xQueueReceive(gQueue, &it, 0) == pdTRUE) {  // what was queued before the stop
+    if (!writeRow(it, startUs)) break;
+  }
+  flushFile();
+  writeEvents();
+  closeAndUnmount();
+  gState = State::Safe;
+  ESP_LOGI(TAG, "saved %s (%lu dropped)", curPath(), static_cast<unsigned long>(gDropped));
   vTaskDelete(nullptr);
 }
 
@@ -290,6 +365,7 @@ bool startLogging() {
     return false;
   }
   gStop = false;
+  gRecErrors = 0;
   Item stale;
   while (xQueueReceive(gQueue, &stale, 0) == pdTRUE) {}
   gState = State::Rec;
@@ -351,6 +427,16 @@ void event(const char* line) {
   strlcpy(slot, line, kEventLen);
   gEventCount++;
   taskEXIT_CRITICAL(&gEventLock);
+}
+
+uint32_t recErrors() { return gRecErrors; }
+
+uint32_t lastFailure(char* buf, size_t size) {
+  taskENTER_CRITICAL(&gFailureLock);
+  const uint32_t n = gFailures;
+  if (size) strlcpy(buf, gFailure, size);
+  taskEXIT_CRITICAL(&gFailureLock);
+  return n;
 }
 
 const char* fileName() {

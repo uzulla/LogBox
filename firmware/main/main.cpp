@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include <atomic>
@@ -857,6 +858,10 @@ static void publishStatus(const record::Record* r) {
   ds.apClients = apClients;
   ds.udpErrors = udpErrors;
   ds.rec = static_cast<uint8_t>(sdlog::state());
+  {
+    const uint32_t e = sdlog::recErrors();
+    ds.recErrors = e > 255 ? 255 : static_cast<uint8_t>(e);
+  }
   ds.imuOk = imuStatus.bmi270;
   ds.magOk = imuStatus.bmm150;
   ds.baroOk = imuStatus.bmp280;
@@ -956,9 +961,23 @@ static void emitRecord(const gnss::Pvt* pvt) {
   xSemaphoreGive(recordMutex);
 }
 
+// The system clock from the GNSS time (fully resolved), at once and then every 10 minutes: FatFs stamps the log
+// files with it (created / modified; without it they get 1980-01-01).
+static void syncClock(int64_t unixUs) {
+  static int64_t setAtUs = 0;
+  const int64_t now = esp_timer_get_time();
+  if (setAtUs && now - setAtUs < 600000000) return;
+  setAtUs = now;
+  const timeval tv = {static_cast<time_t>(unixUs / 1000000), static_cast<suseconds_t>(unixUs % 1000000)};
+  settimeofday(&tv, nullptr);
+}
+
 static void onPvt(const gnss::Pvt& p) {
   lastPvtUs = esp_timer_get_time();
-  if (const int64_t unixUs = record::unixMicros(p)) clockOffsetUs = unixUs - lastPvtUs.load();
+  if (const int64_t unixUs = record::unixMicros(p)) {
+    clockOffsetUs = unixUs - lastPvtUs.load();
+    syncClock(unixUs);
+  }
   pvtCount++;
   lastFix = p.fixOk() ? p.fixType : 0;
   lastSats = p.numSV;
@@ -1037,6 +1056,21 @@ static void watchEvents() {
   if (!clockNoted && clockOffsetUs) {
     clockNoted = true;
     bootEvent("clock", "gnss");
+  }
+  // A write error on the card: written to boot_log.csv once the card works again (after a resume, or the next
+  // recording).
+  // Checked once a second: of several in that second only the last is described, with how many there were.
+  static uint32_t failures = 0;
+  char failure[64];
+  if (const uint32_t n = sdlog::lastFailure(failure, sizeof(failure)); n != failures) {
+    char detail[96];
+    if (n - failures > 1) {
+      snprintf(detail, sizeof(detail), "%s (+%lu more)", failure, static_cast<unsigned long>(n - failures - 1));
+    } else {
+      snprintf(detail, sizeof(detail), "%s", failure);
+    }
+    failures = n;
+    bootEvent("rec_error", detail);
   }
   static char lastFile[24] = "";
   const char* file = sdlog::fileName();
@@ -1245,6 +1279,9 @@ static void initConsole() {
 // ---------------------------------------------------------------------------
 
 extern "C" void app_main() {
+  // FAT time stamps have no time zone and PCs show them as local time: write them in JST (as the display shows).
+  setenv("TZ", "JST-9", 1);
+  tzset();
   gpio_set_direction(kSpeaker, GPIO_MODE_OUTPUT);
   gpio_set_level(kSpeaker, 0);
   gpio_set_direction(kLcdCs, GPIO_MODE_OUTPUT);
