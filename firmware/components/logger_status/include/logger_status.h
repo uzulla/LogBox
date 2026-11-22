@@ -23,6 +23,7 @@ struct Status {
   int apClients;         // stations joined to our soft AP
   uint32_t udpErrors;
   uint8_t rec;           // SD log: 0 none, 1 recording, 2 saving (do not remove), 3 safe to remove, 4 failed
+  uint8_t recErrors;     // write errors in this recording (resumed in the next part), capped at 255
   char logName[24];      // current / last log file, e.g. "log_0012_01_001.csv"
 
   // Sensors

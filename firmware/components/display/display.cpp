@@ -207,13 +207,15 @@ void drawSignal(int x, int y, int bars, uint16_t on) {  // 4 bars, 3 px wide, up
   }
 }
 
-// SD state word with a dot; the dot blinks at 1 Hz while recording.
-void drawRec(int x, int y, int rec, int scale, int64_t now) {
+// SD state word with a dot; the dot blinks at 1 Hz while recording. REC is amber once this recording has had a
+// write error (it went on in the next part): data around it may be missing, and the card may be loose.
+void drawRec(int x, int y, int rec, bool errors, int scale, int64_t now) {
   static const struct { const char* word; uint16_t col; } kRec[] = {
       {"NO SD", kDim}, {"REC", kRed}, {"SAVING", kAmber}, {"SAFE", kGreen}, {"SD ERR", kRed}};
   if (rec > 4) rec = 0;
-  if (rec != 1 || (now / 500000) % 2 == 0) disc(x + 3 * scale, y + 3 * scale + scale / 2, 3 * scale, kRec[rec].col);
-  text(x + 8 * scale, y, kRec[rec].word, scale, kRec[rec].col);
+  const uint16_t col = rec == 1 && errors ? kAmber : kRec[rec].col;
+  if (rec != 1 || (now / 500000) % 2 == 0) disc(x + 3 * scale, y + 3 * scale + scale / 2, 3 * scale, col);
+  text(x + 8 * scale, y, kRec[rec].word, scale, col);
 }
 
 bool gnssFresh(const Status& s, int64_t now) { return s.gnssAtUs && now - s.gnssAtUs < 2000000; }
@@ -243,7 +245,7 @@ void drawTopBar(const Status& s, int64_t now) {
   if (bandY >= 22) return;
   fillRect(0, 0, W, 21, kBar);
   fillRect(0, 21, W, 1, kCyan);
-  drawRec(4, 4, s.rec, 2, now);
+  drawRec(4, 4, s.rec, s.recErrors, 2, now);
 
   char b[24];
   const bool fresh = gnssFresh(s, now);
@@ -462,7 +464,7 @@ void drawStatusPage(const Status& s, int64_t now, int rate) {
   if (!strncmp(name, "log_", 4)) name += 4;
   const char* dot = strrchr(name, '.');
   snprintf(b, sizeof(b), "%s %.*s", kRec[s.rec < 5 ? s.rec : 0], dot ? static_cast<int>(dot - name) : 15, name);
-  row("SD", b, s.rec == 1 ? kGreen : s.rec == 4 ? kRed : s.rec == 3 ? kCyan : kAmber);
+  row("SD", b, s.rec == 1 ? (s.recErrors ? kAmber : kGreen) : s.rec == 4 ? kRed : s.rec == 3 ? kCyan : kAmber);
 
   // Wi-Fi
   if (!s.staOn) {

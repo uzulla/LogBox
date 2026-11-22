@@ -858,6 +858,10 @@ static void publishStatus(const record::Record* r) {
   ds.apClients = apClients;
   ds.udpErrors = udpErrors;
   ds.rec = static_cast<uint8_t>(sdlog::state());
+  {
+    const uint32_t e = sdlog::recErrors();
+    ds.recErrors = e > 255 ? 255 : static_cast<uint8_t>(e);
+  }
   ds.imuOk = imuStatus.bmi270;
   ds.magOk = imuStatus.bmm150;
   ds.baroOk = imuStatus.bmp280;
@@ -1052,6 +1056,14 @@ static void watchEvents() {
   if (!clockNoted && clockOffsetUs) {
     clockNoted = true;
     bootEvent("clock", "gnss");
+  }
+  // A write error on the card: written to boot_log.csv once the card works again (after a resume, or the next
+  // recording).
+  static uint32_t failures = 0;
+  char failure[64];
+  if (const uint32_t n = sdlog::lastFailure(failure, sizeof(failure)); n != failures) {
+    failures = n;
+    bootEvent("rec_error", failure);
   }
   static char lastFile[24] = "";
   const char* file = sdlog::fileName();
