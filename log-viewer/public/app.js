@@ -913,7 +913,15 @@ function lapMenu(latlng) {
   const marks = savedSectors(D.name);
   const pt = map.latLngToContainerPoint(latlng);
   const near = marks.findIndex((m) => map.latLngToContainerPoint([m.lat, m.lon]).distanceTo(pt) < 30);
-  if (near >= 0) add('このセクターの区切りを消す', () => { marks.splice(near, 1); storeSectors(D.name, marks); computeSectors(D); applyLapChange(); });
+  if (near >= 0) {
+    add('このセクターの区切りを消す', () => {
+      // 10 m 以内に重なって保存された区切り(以前の版で置けた)は 1 つとして表示しているので、まとめて消す
+      const m0 = marks[near];
+      storeSectors(D.name, marks.filter((m) => haversine(m.lat, m.lon, m0.lat, m0.lon) >= SECTOR_MIN_DIST));
+      computeSectors(D);
+      applyLapChange();
+    });
+  }
   if (marks.length) add('セクターの区切りをすべて消す', () => { storeSectors(D.name, []); computeSectors(D); applyLapChange(); });
   // 長押しを離したときのクリックで閉じないよう、地図のクリックでは閉じない(× か別の場所の長押しで閉じる)
   L.popup({ closeOnClick: false, autoClose: true, className: 'mapmenu-popup' }).setLatLng(latlng).setContent(box).openOn(map);
@@ -928,7 +936,7 @@ function setManualGate(latlng) {
     }
     storeSet(gateKey(D.name), JSON.stringify({ lat: r.gate.lat, lon: r.gate.lon }));
     detectLaps(D);
-    if (!D.lap || !D.lap.gate.manual) { D.lap = lapStats(r); computeSectors(D); } // localStorage が使えないとき(セクターも新しいラップで)
+    if (!D.lap || !D.lap.gate.manual) { D.lap = lapStats(r); computeSectors(D); } // 念のため(保存はメモリにも落ちるので、普段はここに来ない。セクターも新しいラップで)
   } else {
     storeDel(gateKey(D.name));
     detectLaps(D);
