@@ -1059,11 +1059,18 @@ static void watchEvents() {
   }
   // A write error on the card: written to boot_log.csv once the card works again (after a resume, or the next
   // recording).
+  // Checked once a second: of several in that second only the last is described, with how many there were.
   static uint32_t failures = 0;
   char failure[64];
   if (const uint32_t n = sdlog::lastFailure(failure, sizeof(failure)); n != failures) {
+    char detail[96];
+    if (n - failures > 1) {
+      snprintf(detail, sizeof(detail), "%s (+%lu more)", failure, static_cast<unsigned long>(n - failures - 1));
+    } else {
+      snprintf(detail, sizeof(detail), "%s", failure);
+    }
     failures = n;
-    bootEvent("rec_error", failure);
+    bootEvent("rec_error", detail);
   }
   static char lastFile[24] = "";
   const char* file = sdlog::fileName();

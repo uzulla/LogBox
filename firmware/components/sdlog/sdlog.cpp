@@ -267,7 +267,7 @@ void closeAndUnmount() {
 // Writes rows until a stop request (returns true) or a write error (false, noted).
 bool record(int64_t startUs) {
   int64_t flushedAt = esp_timer_get_time(), partAt = flushedAt;
-  Item it;
+  static Item it;  // the log task only; kept off its stack, which also has to mount the card on a resume
   while (!gStop) {
     if (xQueueReceive(gQueue, &it, pdMS_TO_TICKS(200)) == pdTRUE && !writeRow(it, startUs)) {
       noteFailure("write", errno);
@@ -296,15 +296,25 @@ bool record(int64_t startUs) {
 
 // After a write error: mounts the card again and continues in the next part. False if it gave up (or a stop
 // was requested meanwhile). State stays Rec (records keep queueing; beyond the queue they are dropped).
+// The card is left unmounted then, so boot_log.csv (the rec_error line) is written here whenever the card mounts:
+// otherwise the reason of a recording that ended this way would only be kept in RAM.
 bool resume(int* tries) {
   closeAndUnmount();
   for (int delayMs = kResumeFirstMs << *tries; *tries < kResumeTries; delayMs *= 2) {
     ++*tries;
     for (int waited = 0; waited < delayMs && !gStop; waited += 50) vTaskDelay(pdMS_TO_TICKS(50));
-    if (gStop) return false;
+    if (gStop) {
+      if (mountCard()) {
+        if (!writeEvents()) ESP_LOGW(TAG, "cannot write %s (errno %d)", kEventFile, errno);
+        unmountCard();
+      }
+      return false;
+    }
     if (mountCard()) {
+      if (!writeEvents()) ESP_LOGW(TAG, "cannot write %s (errno %d)", kEventFile, errno);
       if (openNextPart()) {
-        ESP_LOGW(TAG, "resumed in %s (attempt %d)", curPath(), *tries);
+        ESP_LOGW(TAG, "resumed in %s (attempt %d, stack left %u bytes)", curPath(), *tries,
+                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
         return true;
       }
       closeAndUnmount();
@@ -334,7 +344,7 @@ void logTask(void*) {
       return;
     }
   }
-  Item it;
+  static Item it;  // the log task only; kept off its stack, which also has to mount the card on a resume
   while (xQueueReceive(gQueue, &it, 0) == pdTRUE) {  // what was queued before the stop
     if (!writeRow(it, startUs)) break;
   }
