@@ -88,7 +88,8 @@ numbers already on the card; flushed every second. Files are `log_<session>_<seq
 seq counts the recordings of one boot (stop / start with B), part a new file every 5 minutes, so a power cut or a
 card error can only damage the file being written. `t_ms` counts from the start of the recording and continues across
 the parts, so the parts of one recording can simply be joined in name order. `python3 tools/join-logs.py "/Volumes/NO NAME"` does that: one `log_<session>_<seq>.csv` per recording, next to the parts. No card, an unreadable card, a full card or a write error: no
-recording, and nothing is retried by itself (hold B).
+recording, and nothing is retried by itself (hold B). The files are dated from the GNSS time in JST (FAT has no time
+zone); a file created before the receiver knows the time gets its date at the next write after that.
 
 ```
 t_ms,utc,fix,sats,lat,lon,alt_m,speed_kmh,heading_deg,hacc_m,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,batt,charging,mag_x,mag_y,mag_z,press_hpa,temp_c,mag_cal,head_acc_deg,speed_acc_kmh,batt_v

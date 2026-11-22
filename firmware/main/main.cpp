@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include <atomic>
@@ -956,9 +957,23 @@ static void emitRecord(const gnss::Pvt* pvt) {
   xSemaphoreGive(recordMutex);
 }
 
+// The system clock from the GNSS time (fully resolved), at once and then every 10 minutes: FatFs stamps the log
+// files with it (created / modified; without it they get 1980-01-01).
+static void syncClock(int64_t unixUs) {
+  static int64_t setAtUs = 0;
+  const int64_t now = esp_timer_get_time();
+  if (setAtUs && now - setAtUs < 600000000) return;
+  setAtUs = now;
+  const timeval tv = {static_cast<time_t>(unixUs / 1000000), static_cast<suseconds_t>(unixUs % 1000000)};
+  settimeofday(&tv, nullptr);
+}
+
 static void onPvt(const gnss::Pvt& p) {
   lastPvtUs = esp_timer_get_time();
-  if (const int64_t unixUs = record::unixMicros(p)) clockOffsetUs = unixUs - lastPvtUs.load();
+  if (const int64_t unixUs = record::unixMicros(p)) {
+    clockOffsetUs = unixUs - lastPvtUs.load();
+    syncClock(unixUs);
+  }
   pvtCount++;
   lastFix = p.fixOk() ? p.fixType : 0;
   lastSats = p.numSV;
@@ -1245,6 +1260,9 @@ static void initConsole() {
 // ---------------------------------------------------------------------------
 
 extern "C" void app_main() {
+  // FAT time stamps have no time zone and PCs show them as local time: write them in JST (as the display shows).
+  setenv("TZ", "JST-9", 1);
+  tzset();
   gpio_set_direction(kSpeaker, GPIO_MODE_OUTPUT);
   gpio_set_level(kSpeaker, 0);
   gpio_set_direction(kLcdCs, GPIO_MODE_OUTPUT);
