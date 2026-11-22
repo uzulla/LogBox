@@ -909,15 +909,19 @@ function lapMenu(latlng) {
   add('ここを計測ラインにする', () => setManualGate(latlng));
   if (savedGate(D.name)) add('計測ラインを自動検出に戻す', () => setManualGate(null));
   add('ここにセクターの区切りを置く', () => addSector(latlng));
-  // 近くにある区切りは消せる(画面上で 30 px 以内)
+  // 近くにある区切りは消せる(画面上で 30 px 以内の、地図に出ている区切りのうち最も近いもの)
   const marks = savedSectors(D.name);
   const pt = map.latLngToContainerPoint(latlng);
-  const near = marks.findIndex((m) => map.latLngToContainerPoint([m.lat, m.lon]).distanceTo(pt) < 30);
-  if (near >= 0) {
+  let near = null, nearPx = 30;
+  for (const m of D.sectors ? D.sectors.marks : []) {
+    const px = map.latLngToContainerPoint([m.lat, m.lon]).distanceTo(pt);
+    if (px < nearPx) { near = m; nearPx = px; }
+  }
+  if (near) {
     add('このセクターの区切りを消す', () => {
-      // 10 m 以内に重なって保存された区切り(以前の版で置けた)は 1 つとして表示しているので、まとめて消す
-      const m0 = marks[near];
-      storeSectors(D.name, marks.filter((m) => haversine(m.lat, m.lon, m0.lat, m0.lon) >= SECTOR_MIN_DIST));
+      // 保存済みのうち、その区切りから 10 m 以内のもの(以前の版で重ねて置けた分)も一緒に消す。
+      // 地図に出ている区切り同士は 10 m 以上離れているので、ほかの区切りは消えない
+      storeSectors(D.name, marks.filter((m) => haversine(m.lat, m.lon, near.lat, near.lon) >= SECTOR_MIN_DIST));
       computeSectors(D);
       applyLapChange();
     });
